@@ -1,0 +1,4 @@
+target/
+.env
+.cargo/config.toml
+comrade-memory.json

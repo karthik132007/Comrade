@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Comrade</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div id="app">
+    <header>
+      <div class="head-left">
+        <img id="logo" src="logo.png" alt="Comrade logo" />
+        <button id="sidebar-btn" type="button" title="Chats">☰</button>
+        <div class="brand">COMRADE</div>
+      </div>
+      <div class="head-right">
+        <div id="status-pill" class="pill idle"><span class="dot"></span><span id="status-text">READY</span></div>
+        <button id="settings-btn" type="button" title="Settings & memory">⚙</button>
+      </div>
+    </header>
+
+    <main>
+      <section id="hero">
+        <div id="orb" class="orb idle"></div>
+        <h1 id="greeting">Hey, Comrade.</h1>
+        <p id="subtitle">How can I help you?</p>
+      </section>
+
+      <section id="task-panel" hidden>
+        <div class="panel-head">
+          <span>CURRENT TASK</span>
+          <button id="cancel-btn" type="button">Stop</button>
+        </div>
+        <div id="task-title"></div>
+        <ul id="steps"></ul>
+      </section>
+
+      <section id="chat"><div id="messages"></div></section>
+    </main>
+
+    <footer>
+      <form id="composer">
+        <input id="input" type="text" placeholder="Ask Comrade..." autocomplete="off" />
+        <button id="send-btn" type="submit">➤</button>
+        <button id="mic-btn" type="button" title="Hold to talk, release to send">🎙</button>
+      </form>
+      <div id="hint">Type, or hold the mic button to talk. Voice replies play automatically.</div>
+    </footer>
+  </div>
+
+  <div id="perm-modal" hidden>    <div class="perm-card">
+      <h2>Comrade wants to perform:</h2>
+      <pre id="perm-summary"></pre>
+      <div class="perm-actions">
+        <button id="perm-cancel" type="button">Cancel</button>
+        <button id="perm-allow" type="button">Allow</button>
+      </div>
+    </div>
+  </div>
+
+  <aside id="sidebar">
+    <div class="sidebar-head">
+      <span>CHATS</span>
+      <button id="new-chat-btn" type="button" title="New chat">＋</button>
+    </div>
+    <ul id="chat-list"></ul>
+  </aside>
+
+  <aside id="settings" hidden>
+    <div class="settings-head">
+      <span>SETTINGS</span>
+      <button id="settings-close" type="button">✕</button>
+    </div>
+    <div class="settings-body">
+      <h3>Brain</h3>
+      <div id="model-info" class="muted">loading...</div>
+      <h3>Add memory</h3>
+      <textarea id="mem-text" rows="4" placeholder="e.g. I prefer dark mode. My Co-Founder repo is at /home/..."></textarea>
+      <div class="row">
+        <select id="mem-kind">
+          <option value="fact">fact</option>
+          <option value="preference">preference</option>
+          <option value="note">note</option>
+          <option value="project">project (Name -&gt; /path)</option>
+        </select>
+        <button id="mem-save" type="button">Save</button>
+      </div>
+      <div id="mem-status" class="muted"></div>
+      <h3>Import from ChatGPT</h3>
+      <p class="muted">Export from ChatGPT Settings → Data controls → Export,
+        then pick the <code>conversations.json</code> file.</p>
+      <div class="row">
+        <input id="import-file" type="file" accept=".json,application/json" />
+        <button id="import-btn" type="button">Import</button>
+      </div>
+      <div id="import-status" class="muted"></div>
+      <h3>Memories</h3>
+      <div class="row">
+        <input id="mem-search" type="text" placeholder="Search memories..." />
+        <button id="mem-refresh" type="button" title="Refresh list">↻</button>
+      </div>
+      <div id="mem-count" class="muted"></div>
+      <ul id="mem-list"></ul>
+    </div>
+  </aside>
+
+  <script src="app.js"></script>
+</body>
+</html>
