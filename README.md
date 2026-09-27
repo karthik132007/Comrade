@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.webp" alt="Comrade logo" width="180" />
+</p>
+
 # Comrade — Desktop AI Agent (Rust + Tauri v2)
 
 Local-first personal AI desktop agent. Pure Rust backend (`core` library +
