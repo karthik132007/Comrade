@@ -8,13 +8,9 @@ pub struct ComradeConfig {
     pub deepseek_key: String,
     pub openrouter_key: String,
     pub llm_model: String,
-    pub stt_model: String,
-    pub tts_model: String,
-    pub tts_voice: String,
     pub embedding_model: String,
     pub embedding_dim: usize,
     pub profile_dir: String,
-    pub opencode_bin: String,
     pub max_steps: usize,
     pub timeout_ms: u64,
 }
@@ -80,18 +76,6 @@ pub fn load_config(root: &Path) -> ComradeConfig {
             let m = get("LLM_MODEL");
             if m.is_empty() { "deepseek-flash".into() } else { m }
         },
-        stt_model: {
-            let m = get("STT_MODEL");
-            if m.is_empty() { "openai/whisper-large-v3".into() } else { m }
-        },
-        tts_model: {
-            let m = get("TTS_MODEL");
-            if m.is_empty() { "mistralai/voxtral-mini-tts-2603".into() } else { m }
-        },
-        tts_voice: {
-            let m = get("TTS_VOICE");
-            if m.is_empty() { "en_paul_neutral".into() } else { m }
-        },
         embedding_model: {
             let m = get("EMBEDDING_MODEL");
             if m.is_empty() { "openai/text-embedding-3-small".into() } else { m }
@@ -105,10 +89,6 @@ pub fn load_config(root: &Path) -> ComradeConfig {
                 m
             }
         }),
-        opencode_bin: {
-            let m = get("OPENCODE_BIN");
-            if m.is_empty() { "opencode".into() } else { m }
-        },
         max_steps: agent_max_steps(&get("AGENT_MAX_STEPS")),
         timeout_ms: agent_timeout(&get("AGENT_TIMEOUT_MS")),
     }

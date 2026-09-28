@@ -1,6 +1,8 @@
 /** Comrade desktop shell (Tauri v2): window + commands + agent wiring. */
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,9 +15,15 @@ use comrade_core::logger::{log, Level};
 use comrade_core::history::{title_for, ChatMessageRow, ChatSession, HistoryStore};
 use comrade_core::memory::{import_chatgpt_json, import_text, migrate_legacy_json, MemoryItem, MemoryStore, ScoredMemory};
 use comrade_core::paths;
-use comrade_core::speech::{FallbackTts, OpenRouterStt, OpenRouterTts, SpeechToText, TextToSpeech};
+use comrade_core::prefs::{self, BrowserInfo, Prefs};
 use comrade_core::task_state::{TaskState, TaskStatus};
-use comrade_core::tools::{build_tools, opencode};
+use comrade_core::tools::{build_tools, coding};
+use comrade_core::voice::capture::{list_input_devices, list_output_devices, AudioDeviceInfo};
+use comrade_core::voice::manager::{
+    ensure_shared_engines, AgentOutcome, AgentRunner, SharedEngines,
+    VoiceController, VoiceEvent, VoiceHooks, VoiceState,
+};
+use comrade_core::voice::models::models_dir;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
 
@@ -29,8 +37,9 @@ struct AppState {
     provider: String,
     model: String,
     embedding_model: String,
-    stt: OpenRouterStt,
-    tts: FallbackTts,
+    voice_engines: std::sync::Mutex<Option<SharedEngines>>,
+    voice_session: std::sync::Mutex<Option<VoiceController>>,
+    model_download: AtomicBool,
     cancel: AtomicBool,
     task_lock: tokio::sync::Mutex<()>,
     pending: tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<bool>>>,
@@ -43,6 +52,79 @@ fn truncate_err(e: impl std::fmt::Display, n: usize) -> String {
 
 fn emit(app: &AppHandle, payload: serde_json::Value) {
     let _ = app.emit("agent-event", payload);
+}
+
+fn emit_voice(app: &AppHandle, event: VoiceEvent) {
+    match event {
+        VoiceEvent::AgentToken { token } => {
+            emit(app, serde_json::json!({ "type": "token", "token": token }));
+        }
+        VoiceEvent::StateChanged { state } => {
+            // The chat pill already knows thinking/executing/speaking.
+            let ui = match state {
+                VoiceState::Listening => "listening",
+                VoiceState::Processing => "thinking",
+                VoiceState::Speaking => "speaking",
+                VoiceState::Interrupted => "interrupted",
+                VoiceState::Idle => "idle",
+            };
+            emit(app, serde_json::json!({ "type": "state", "state": ui }));
+        }
+        VoiceEvent::Started => {
+            emit(app, serde_json::json!({ "type": "state", "state": "listening" }));
+        }
+        VoiceEvent::PartialTranscript { text } => {
+            emit(app, serde_json::json!({ "type": "voice-partial", "text": text }));
+        }
+        VoiceEvent::AudioLevel { level } => {
+            emit(app, serde_json::json!({ "type": "voice-level", "level": level }));
+        }
+        VoiceEvent::FinalTranscript { text } => {
+            emit(app, serde_json::json!({ "type": "transcript", "transcript": text }));
+        }
+        VoiceEvent::Stopped { .. } => {
+            emit(app, serde_json::json!({ "type": "state", "state": "idle" }));
+        }
+        VoiceEvent::Error { message } => {
+            emit(app, serde_json::json!({ "type": "done", "status": "failed", "error": message }));
+        }
+        VoiceEvent::ModelsStatus { ready, missing } => {
+            emit(app, serde_json::json!({ "type": "voice-models", "ready": ready, "missing": missing }));
+        }
+        VoiceEvent::ModelsDownloading { pack, file, downloaded, total } => {
+            emit(app, serde_json::json!({
+                "type": "voice-download", "pack": pack, "file": file,
+                "downloaded": downloaded, "total": total,
+            }));
+        }
+        VoiceEvent::ModelsReady => {
+            emit(app, serde_json::json!({ "type": "voice-models", "ready": true, "missing": [] }));
+        }
+        // TTS lifecycle is covered by Speaking state + metrics logs.
+        VoiceEvent::TtsStarted
+        | VoiceEvent::TtsChunk { .. }
+        | VoiceEvent::TtsFinished
+        | VoiceEvent::TtsInterrupted => {}
+    }
+}
+
+async fn request_approval(app: &AppHandle, shared: &Shared, summary: &str) -> bool {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let n = shared.perm_counter.fetch_add(1, Ordering::SeqCst);
+    let id = format!("perm-{}-{n}", now_ms());
+    shared.pending.lock().await.insert(id.clone(), tx);
+    let _ = app.emit(
+        "permission-request",
+        serde_json::json!({ "id": id, "summary": summary }),
+    );
+    match tokio::time::timeout(Duration::from_secs(30), rx).await {
+        Ok(Ok(approved)) => approved,
+        _ => {
+            // Timeout or sender dropped: default deny.
+            shared.pending.lock().await.remove(&id);
+            false
+        }
+    }
 }
 
 struct Callbacks {
@@ -71,22 +153,76 @@ impl AgentCallbacks for Callbacks {
     }
 
     async fn request_approval(&self, summary: &str) -> bool {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let n = self.shared.perm_counter.fetch_add(1, Ordering::SeqCst);
-        let id = format!("perm-{}-{n}", now_ms());
-        self.shared.pending.lock().await.insert(id.clone(), tx);
-        let _ = self.app.emit(
-            "permission-request",
-            serde_json::json!({ "id": id, "summary": summary }),
+        request_approval(&self.app, &self.shared, summary).await
+    }
+}
+
+/// Agent callbacks for voice turns: the manager owns UI state, steps stream
+/// to the task panel, and tokens feed the TTS chunker (the session also
+/// forwards them to the chat UI as AgentToken events).
+struct VoiceAgentCallbacks {
+    app: AppHandle,
+    shared: Shared,
+    chunk_feed: Arc<dyn Fn(String) + Send + Sync>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl AgentCallbacks for VoiceAgentCallbacks {
+    fn on_ui_state(&self, _state: &str) {}
+
+    fn on_step(&self, label: &str, status: &str, detail: Option<&str>) {
+        emit(
+            &self.app,
+            serde_json::json!({ "type": "step", "label": label, "status": status, "detail": detail }),
         );
-        match tokio::time::timeout(Duration::from_secs(30), rx).await {
-            Ok(Ok(approved)) => approved,
-            _ => {
-                // Timeout or sender dropped: default deny.
-                self.shared.pending.lock().await.remove(&id);
-                false
-            }
-        }
+    }
+
+    fn on_token(&self, token: &str) {
+        (self.chunk_feed)(token.to_string());
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::SeqCst) || self.shared.cancel.load(Ordering::SeqCst)
+    }
+
+    async fn request_approval(&self, summary: &str) -> bool {
+        request_approval(&self.app, &self.shared, summary).await
+    }
+}
+
+/// Bridges voice sessions to the Comrade agent (history + task state shared
+/// with text chat).
+struct VoiceAgentRunner {
+    app: AppHandle,
+    shared: Shared,
+    session: Arc<std::sync::Mutex<Option<String>>>,
+}
+
+impl AgentRunner for VoiceAgentRunner {
+    fn run<'a>(
+        &'a self,
+        transcript: String,
+        hooks: &'a VoiceHooks,
+    ) -> Pin<Box<dyn Future<Output = AgentOutcome> + Send + 'a>> {
+        Box::pin(async move {
+            let sid = self.session.lock().unwrap().clone();
+            let cb = VoiceAgentCallbacks {
+                app: self.app.clone(),
+                shared: self.shared.clone(),
+                chunk_feed: hooks.on_token.clone(),
+                cancel: hooks.cancel.clone(),
+            };
+            let (task, new_sid) =
+                execute_task(&self.app, &self.shared, &transcript, sid, &cb).await;
+            *self.session.lock().unwrap() = Some(new_sid);
+            let ok = task.status == TaskStatus::Done;
+            let text = task
+                .result
+                .clone()
+                .or_else(|| task.error.clone())
+                .unwrap_or_default();
+            AgentOutcome { text, ok }
+        })
     }
 }
 
@@ -172,11 +308,12 @@ async fn persist_turn(shared: &Shared, sid: &str, user_text: &str, task: &TaskSt
     let _ = h.touch(sid);
 }
 
-async fn execute_task(
+async fn execute_task<C: AgentCallbacks>(
     app: &AppHandle,
     shared: &Shared,
     text: &str,
     session_id: Option<String>,
+    cb: &C,
 ) -> (TaskState, String) {
     log(Level::Info, "USER", &text.chars().take(300).collect::<String>(), None);
     // Resolve the chat session, creating one for the first message.
@@ -192,8 +329,7 @@ async fn execute_task(
         }
         None => create_session(shared, text),
     };
-    let cb = Callbacks { app: app.clone(), shared: shared.clone() };
-    let task = shared.agent.run_task(text, &cb).await;
+    let task = shared.agent.run_task(text, cb).await;
     emit(app, serde_json::json!({ "type": "state", "state": "idle" }));
     emit(
         app,
@@ -241,7 +377,8 @@ async fn send_message(
         .try_lock()
         .map_err(|_| "A task is already running. Cancel it first.".to_string())?;
     shared.cancel.store(false, Ordering::SeqCst);
-    let (task, sid) = execute_task(&app, &shared, &text, session_id).await;
+    let cb = Callbacks { app: app.clone(), shared: shared.clone() };
+    let (task, sid) = execute_task(&app, &shared, &text, session_id, &cb).await;
     Ok(TaskSummary {
         status: task.status.as_str().to_string(),
         result: task.result,
@@ -250,92 +387,200 @@ async fn send_message(
     })
 }
 
-#[derive(Serialize)]
-struct VoiceResult {
-    status: String,
-    session_id: String,
-    transcript: Option<String>,
-    result: Option<String>,
-    error: Option<String>,
-    audio_base64: Option<String>,
-    mime_type: Option<String>,
-    tts_error: Option<String>,
+/// Begin a local voice session. `one_shot` ends after the first reply
+/// (push-to-talk); otherwise the conversation loops until stopped.
+#[tauri::command]
+async fn start_voice_input(
+    app: AppHandle,
+    state: State<'_, Shared>,
+    one_shot: bool,
+    session_id: Option<String>,
+) -> Result<String, String> {
+    use comrade_core::voice::manager::{EngineBuildConfig, VoiceController, VoiceRuntimeConfig};
+    use comrade_core::voice::models as vm;
+    let shared = state.inner().clone();
+    let live = shared.voice_session.lock().unwrap().clone();
+    if let Some(c) = live {
+        if c.state() != VoiceState::Idle {
+            return Err("Voice session already active.".into());
+        }
+    }
+    let prefs = prefs::load();
+    if !prefs.voice.enabled {
+        return Err("Voice is disabled in Settings.".into());
+    }
+    let base = models_dir();
+    if !vm::all_ready(&base) {
+        let missing: Vec<String> = vm::required_packs()
+            .iter()
+            .flat_map(|p| {
+                vm::missing_files(&base, p).into_iter().map(|f| format!("{}/{}", p.id, f))
+            })
+            .collect();
+        emit(&app, serde_json::json!({ "type": "voice-models", "ready": false, "missing": missing }));
+        return Err("Voice models missing — open Settings → Download.".into());
+    }
+    let engines = ensure_shared_engines(&shared.voice_engines, EngineBuildConfig {
+        models_base: base,
+        vad_threshold: prefs.voice.vad.threshold,
+        vad_silence_ms: prefs.voice.vad.silence_ms,
+        vad_min_speech_ms: prefs.voice.vad.min_speech_ms,
+        tts_voice: prefs.voice.tts.voice.clone(),
+        tts_speed: prefs.voice.tts.speed,
+        num_threads: 2,
+    })
+    .await
+    .map_err(|e| truncate_err(e, 300))?;
+    let runner = Arc::new(VoiceAgentRunner {
+        app: app.clone(),
+        shared: shared.clone(),
+        session: Arc::new(std::sync::Mutex::new(session_id)),
+    });
+    let controller = VoiceController::new(move |e| emit_voice(&app, e), runner);
+    controller.set_microphone(&prefs.voice.mic);
+    controller
+        .start_session(
+            engines,
+            VoiceRuntimeConfig {
+                silence_ms: prefs.voice.vad.silence_ms,
+                min_speech_ms: prefs.voice.vad.min_speech_ms,
+                vad_threshold: prefs.voice.vad.threshold,
+                tts_voice: prefs.voice.tts.voice.clone(),
+                tts_speed: prefs.voice.tts.speed,
+                speak: prefs.voice.autoplay,
+                ..VoiceRuntimeConfig::default()
+            },
+            one_shot,
+        )
+        .await
+        .map_err(|e| truncate_err(e, 300))?;
+    *shared.voice_session.lock().unwrap() = Some(controller);
+    Ok("started".into())
+}
+
+
+/// Push-to-talk release (or conversation stop): finalize the current
+/// utterance when `finalize` is set, else end the session immediately.
+#[tauri::command]
+async fn stop_voice_input(state: State<'_, Shared>, finalize: bool) -> Result<String, String> {
+    let shared = state.inner().clone();
+    let controller = shared.voice_session.lock().unwrap().clone();
+    match controller {
+        Some(c) => {
+            if finalize {
+                c.finish_turn().await;
+            } else {
+                c.stop_session("stopped").await;
+            }
+            Ok("ok".into())
+        }
+        None => Err("No voice session active.".into()),
+    }
 }
 
 #[tauri::command]
-async fn voice_input(
-    app: AppHandle,
-    state: State<'_, Shared>,
-    audio_base64: String,
-    format: String,
-    session_id: Option<String>,
-) -> Result<VoiceResult, String> {
+async fn cancel_voice_input(state: State<'_, Shared>) -> Result<String, String> {
     let shared = state.inner().clone();
-    let _guard = shared
-        .task_lock
-        .try_lock()
-        .map_err(|_| "A task is already running. Cancel it first.".to_string())?;
-    if audio_base64.is_empty() {
-        return Err("No audio received.".into());
+    let controller = shared.voice_session.lock().unwrap().clone();
+    if let Some(c) = controller {
+        c.cancel_session().await;
     }
-    shared.cancel.store(false, Ordering::SeqCst);
-    emit(&app, serde_json::json!({ "type": "state", "state": "thinking" }));
+    shared.cancel.store(true, Ordering::SeqCst);
+    Ok("ok".into())
+}
 
-    let decoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &audio_base64)
-        .map_err(|e| truncate_err(format!("Invalid audio encoding: {e}"), 200))?;
-    let format = match format.as_str() {
-        "wav" | "mp3" | "flac" | "m4a" | "ogg" | "webm" | "aac" => format,
-        _ => "webm".to_string(),
-    };
-    let transcript = shared
-        .stt
-        .transcribe(&decoded, None, &format)
-        .await
-        .map_err(|e| truncate_err(e, 500))?;
-    log(
-        Level::Info,
-        "STT",
-        "transcribed voice input",
-        Some(&serde_json::json!({ "transcript": transcript.chars().take(200).collect::<String>() })),
-    );
-    if transcript.trim().is_empty() {
-        emit(&app, serde_json::json!({ "type": "state", "state": "idle" }));
-        return Err("I could not hear anything. Try again.".into());
-    }
-    emit(&app, serde_json::json!({ "type": "transcript", "transcript": transcript }));
+#[tauri::command]
+async fn set_microphone_device(device: String) -> Result<String, String> {    let mut prefs = prefs::load();
+    prefs.voice.mic = device.trim().to_string();
+    prefs::save(&prefs).map_err(|e| truncate_err(e, 300))?;
+    Ok("ok".into())
+}
 
-    let (task, sid) = execute_task(&app, &shared, &transcript, session_id).await;
-    let spoken = task.result.clone().or_else(|| task.error.clone()).unwrap_or_default();
-    let mut audio_out = None;
-    let mut mime_out = None;
-    let mut tts_error = None;
-    if task.status == TaskStatus::Done && !spoken.trim().is_empty() {
-        match shared.tts.synthesize(&spoken, None).await {
-            Ok(speech) => {
-                audio_out = Some(base64::Engine::encode(
-                    &base64::engine::general_purpose::STANDARD,
-                    &speech.audio,
-                ));
-                mime_out = Some(speech.mime_type);
-            }
-            Err(e) => {
-                tts_error = Some(truncate_err(e, 200));
-                log(Level::Warn, "TTS", "speech synthesis failed, returning text only", None);
-            }
-        }
-    }
-    let status = task.status.as_str().to_string();
-    Ok(VoiceResult {
-        status,
-        session_id: sid,
-        transcript: Some(transcript),
-        result: task.result,
-        error: task.error,
-        audio_base64: audio_out,
-        mime_type: mime_out,
-        tts_error,
+#[derive(Serialize)]
+struct AudioDevicesDto {
+    inputs: Vec<AudioDeviceInfo>,
+    outputs: Vec<AudioDeviceInfo>,
+}
+
+#[derive(Serialize)]
+struct PackStatusDto {
+    id: String,
+    ready: bool,
+    missing: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct VoiceModelsStatus {
+    ready: bool,
+    missing: Vec<String>,
+    packs: Vec<PackStatusDto>,
+}
+
+#[tauri::command]
+async fn get_audio_devices() -> Result<AudioDevicesDto, String> {
+    Ok(AudioDevicesDto {
+        inputs: list_input_devices(),
+        outputs: list_output_devices(),
     })
 }
+
+#[tauri::command]
+async fn voice_models_status() -> Result<VoiceModelsStatus, String> {
+    use comrade_core::voice::models as vm;
+    let base = models_dir();
+    let mut packs = Vec::new();
+    let mut all_missing = Vec::new();
+    for pack in vm::required_packs() {
+        let missing = vm::missing_files(&base, &pack);
+        if !missing.is_empty() {
+            all_missing.extend(missing.iter().map(|f| format!("{}/{}", pack.id, f)));
+        }
+        packs.push(PackStatusDto {
+            id: pack.id.to_string(),
+            ready: missing.is_empty(),
+            missing,
+        });
+    }
+    Ok(VoiceModelsStatus { ready: all_missing.is_empty(), packs, missing: all_missing })
+}
+
+#[tauri::command]
+async fn voice_download_models(app: AppHandle, state: State<'_, Shared>) -> Result<String, String> {
+    use comrade_core::voice::models as vm;
+    let shared = state.inner().clone();
+    if shared.model_download.swap(true, Ordering::SeqCst) {
+        return Err("Model download already running.".into());
+    }
+    let base = models_dir();
+    tauri::async_runtime::spawn(async move {
+        let out = vm::ensure_models(&base, &|p| {
+            app.emit(
+                "voice-event",
+                serde_json::json!({
+                    "type": "voice-download",
+                    "pack": p.pack, "file": p.file,
+                    "downloaded": p.downloaded, "total": p.total,
+                }),
+            )
+            .ok();
+        })
+        .await;
+        shared.model_download.store(false, Ordering::SeqCst);
+        match out {
+            Ok(_) => {
+                app.emit("voice-event", serde_json::json!({ "type": "voice-models", "ready": true, "missing": [] })).ok();
+                log(Level::Info, "VOICE", "models ready", None);
+            }
+            Err(e) => {
+                let msg: String = format!("{e}").chars().take(300).collect();
+                app.emit("voice-event", serde_json::json!({ "type": "voice-error", "message": msg })).ok();
+                log(Level::Warn, "VOICE", "model download failed", Some(&serde_json::json!({ "error": msg })));
+            }
+        }
+    });
+    Ok("downloading".into())
+}
+
 
 #[tauri::command]
 async fn cancel_task(app: AppHandle, state: State<'_, Shared>) -> Result<(), String> {
@@ -358,6 +603,7 @@ struct AppInfo {
     provider: String,
     model: String,
     embedding_model: String,
+    onboarded: bool,
     memory_count: i64,
     memory_kinds: Vec<(String, i64)>,
 }
@@ -369,9 +615,34 @@ async fn app_info(state: State<'_, Shared>) -> Result<AppInfo, String> {
         provider: state.provider.clone(),
         model: state.model.clone(),
         embedding_model: state.embedding_model.clone(),
+        onboarded: prefs::load().onboarded(),
         memory_count: mem.count(),
         memory_kinds: mem.kinds(),
     })
+}
+
+/// Coding agents installed on this machine (for onboarding + Settings).
+#[tauri::command]
+async fn system_coding_agents() -> Result<Vec<comrade_core::prefs::CodingAgentInfo>, String> {
+    Ok(comrade_core::prefs::detect_coding_agents())
+}
+
+/// Browsers installed on this machine (for onboarding + Settings).
+#[tauri::command]
+async fn system_browsers() -> Result<Vec<BrowserInfo>, String> {
+    Ok(prefs::detect_browsers())
+}
+
+#[tauri::command]
+async fn get_prefs() -> Result<Prefs, String> {
+    Ok(prefs::load())
+}
+
+/// Save preferences to comrade.conf (validated). Returns what was stored.
+#[tauri::command]
+async fn save_prefs(prefs: Prefs) -> Result<Prefs, String> {
+    prefs::save(&prefs).map_err(|e| truncate_err(e, 300))?;
+    Ok(prefs::load())
 }
 
 #[derive(Serialize)]
@@ -521,6 +792,37 @@ fn main() {
                     }
                 }
             }
+            // One-time cleanup of the pre-consolidation app-data dir: it only ever
+            // held Comrade's own webview caches. DB/JSON backups are left alone.
+            let sentinel = home.join(".legacy-cleaned");
+            if !sentinel.exists() {
+                let legacy_dir = paths::legacy_db_path()
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_default();
+                if !legacy_dir.as_os_str().is_empty() && legacy_dir != home && legacy_dir.exists() {
+                    let mut removed = 0usize;
+                    if let Ok(entries) = std::fs::read_dir(&legacy_dir) {
+                        for entry in entries.flatten() {
+                            let name = entry.file_name().to_string_lossy().to_string();
+                            if name == "comrade-memory.db" || name == "comrade-memory.json" {
+                                continue; // cold backups stay.
+                            }
+                            let path = entry.path();
+                            let ok = if path.is_dir() {
+                                std::fs::remove_dir_all(&path).is_ok()
+                            } else {
+                                std::fs::remove_file(&path).is_ok()
+                            };
+                            if ok {
+                                removed += 1;
+                            }
+                        }
+                    }
+                    log(Level::Info, "BOOT", "cleaned pre-consolidation residue", Some(&serde_json::json!({ "removed": removed })));
+                }
+                let _ = std::fs::write(&sentinel, "1");
+            }
             let memory: Arc<std::sync::Mutex<MemoryStore>> = Arc::new(std::sync::Mutex::new(
                 MemoryStore::open(&db_path, cfg.embedding_dim)
                     .expect("failed to open memory database"),
@@ -557,23 +859,7 @@ fn main() {
                 embedding_key(&cfg),
                 cfg.embedding_model.clone(),
             ));
-            let stt = OpenRouterStt::new(cfg.openrouter_key.clone(), cfg.stt_model.clone());
-            let tts = FallbackTts::new(
-                OpenRouterTts::new(
-                    cfg.openrouter_key.clone(),
-                    cfg.tts_model.clone(),
-                    cfg.tts_voice.clone(),
-                ),
-                Some(Box::new(|reason: String| {
-                    log(
-                        Level::Warn,
-                        "TTS",
-                        "primary TTS failed, using local fallback",
-                        Some(&serde_json::json!({ "reason": reason })),
-                    );
-                })),
-            );
-            let tools = build_tools(&cfg.opencode_bin);
+            let tools = build_tools();
             let cwd = app
                 .path()
                 .home_dir()
@@ -597,8 +883,9 @@ fn main() {
                 provider: cfg.llm_provider.clone(),
                 model: cfg.llm_model.clone(),
                 embedding_model: cfg.embedding_model.clone(),
-                stt,
-                tts,
+                voice_engines: std::sync::Mutex::new(None),
+                voice_session: std::sync::Mutex::new(None),
+                model_download: AtomicBool::new(false),
                 cancel: AtomicBool::new(false),
                 task_lock: tokio::sync::Mutex::new(()),
                 pending: tokio::sync::Mutex::new(HashMap::new()),
@@ -619,7 +906,7 @@ fn main() {
                 });
             }
 
-            let bin = cfg.opencode_bin.clone();
+            let coding_prefs = prefs::load().coding;
             let webview_data = home.join("webview");
             if let Err(e) = WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
                 .title("Comrade")
@@ -630,19 +917,29 @@ fn main() {
                 eprintln!("Comrade: failed to create main window: {e}");
             }
             tauri::async_runtime::spawn(async move {
-                let (available, version) = opencode::is_opencode_available(&bin).await;
+                let detected = comrade_core::prefs::detect_coding_agents();
+                let ids: Vec<&str> = detected.iter().map(|d| d.id.as_str()).collect();
+                let default = coding::resolve_agent(&coding_prefs.agents, &coding_prefs.default, &detected, None)
+                    .map(|a| format!("{} ({})", a.name, a.bin))
+                    .unwrap_or_else(|e| e);
                 log(
                     Level::Info,
                     "BOOT",
-                    "OpenCode availability",
-                    Some(&serde_json::json!({ "available": available, "version": version })),
+                    "coding agents",
+                    Some(&serde_json::json!({ "detected": ids, "default": default })),
                 );
             });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             send_message,
-            voice_input,
+            start_voice_input,
+            stop_voice_input,
+            cancel_voice_input,
+            set_microphone_device,
+            get_audio_devices,
+            voice_models_status,
+            voice_download_models,
             cancel_task,
             permission_response,
             app_info,
@@ -654,7 +951,11 @@ fn main() {
             history_list,
             history_get,
             history_delete,
-            history_rename
+            history_rename,
+            system_browsers,
+            system_coding_agents,
+            get_prefs,
+            save_prefs
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Comrade");

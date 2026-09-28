@@ -19,7 +19,7 @@ const SYSTEM_PROMPT: &str = "You are Comrade, a local-first desktop AI agent. Yo
 
 Rules:
 - Use tools for actions. Never claim you did something you did not call a tool for.
-- CODING tasks (modify/create/debug source code) MUST go through opencode.executeTask — never edit code with filesystem.write directly.
+- CODING tasks (modify/create/debug source code) MUST go through coding.executeTask (it routes to the enabled coding agent) — never edit code with filesystem.write directly.
 - BROWSER_* tools read/navigate sites only; they cannot change code.
 - After each action, verify: re-read, re-list, check output, then report what actually happened.
 - Keep responses short and factual. No emojis.
@@ -27,7 +27,7 @@ Rules:
 - If a tool fails, retry at most once with a fix, then report the error honestly.";
 
 #[allow(async_fn_in_trait)]
-pub trait AgentCallbacks: Send {
+pub trait AgentCallbacks: Send + Sync {
     fn on_ui_state(&self, state: &str);
     fn on_step(&self, label: &str, status: &str, detail: Option<&str>);
     fn on_token(&self, token: &str);
@@ -207,7 +207,10 @@ impl<P: LlmProvider, E: Embedder> Agent<P, E> {
             steps += 1;
             cb.on_ui_state("thinking");
 
-            let response = match self.deps.llm.chat(&messages, &opts).await {
+            // Streamed: tokens forward live to the UI; tool calls accumulate
+            // from SSE deltas exactly like the non-streaming path.
+            let mut forward = |tok: String| cb.on_token(&tok);
+            let response = match self.deps.llm.stream(&messages, &opts, &mut forward).await {
                 Ok(r) => r,
                 Err(e) => {
                     task.status = TaskStatus::Failed;
@@ -222,7 +225,7 @@ impl<P: LlmProvider, E: Embedder> Agent<P, E> {
                 task.status = TaskStatus::Done;
                 let result = if response.content.is_empty() { "(empty response)".to_string() } else { response.content };
                 cb.on_ui_state("speaking");
-                cb.on_token(&result);
+                // Already displayed token-by-token via the stream above.
                 task.result = Some(result.clone());
                 // Learn durable facts only — never store raw chat. history.db
                 // keeps the transcript; vector memory keeps distilled knowledge.

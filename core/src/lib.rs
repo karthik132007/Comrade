@@ -8,6 +8,7 @@ pub mod logger;
 pub mod memory;
 pub mod paths;
 pub mod permissions;
-pub mod speech;
+pub mod prefs;
 pub mod task_state;
 pub mod tools;
+pub mod voice;

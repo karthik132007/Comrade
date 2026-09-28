@@ -36,10 +36,11 @@ Linux/macOS:  $COMRADE_HOME, else $XDG_CONFIG_HOME/comrade-agent, else ~/.config
 Windows:      %APPDATA%/comrade-agent
 
 comrade-agent/
+  comrade.conf          preferences (browser, voice, coding agents)
   comrade-memory.db   SQLite vector memory (auto-moved from the old
                       ~/.local/share/com.comrade.desktop/ on first run)
   history.db          chat sessions + transcripts (☰ sidebar: browse, reopen, delete)
-  brave-profile/      persistent browser profile (override: COMRADE_PROFILE_DIR)
+  browser-profile/    single shared profile for the selected browser (override: COMRADE_PROFILE_DIR)
   webview/            webview cache/storage (was ~/.local/share/com.comrade.desktop/)
   sysroot/ + shim/    vendored webkit (rootless Linux dev only)
 ```
@@ -54,7 +55,7 @@ raise a modal approval; deny-by-default on 30s timeout.
 ## Setup
 
 ```bash
-cp .env.example .env   # fill in DEEPSEEK_API_KEY (+ OPENROUTER_API_KEY for voice/embeddings)
+cp .env.example .env   # DEEPSEEK_API_KEY + OPENROUTER_API_KEY (memory embeddings)
 ./scripts/setup-linux.sh   # webkit2gtk-4.1 (pacman, or vendored into the comrade-agent home w/o sudo)
 cargo test -p comrade-core
 cargo run -p comrade-desktop
@@ -72,8 +73,19 @@ Useful commands: `cargo check --workspace`, `cargo clippy --workspace`,
 
 ## Notes
 
-- TTS defaults to `mistralai/voxtral-mini-tts-2603` (mp3) with local
-  `espeak-ng` fallback; STT uses `openai/whisper-large-v3`. Override via `.env`.
+- First launch shows onboarding: pick the browser Comrade drives from the ones
+  detected on your machine (Brave/Chrome/Chromium/Edge/Opera/Vivaldi, incl.
+  flatpak), and tick which coding agents it may use (all enabled by default).
+  Everything lives in `comrade.conf` and can be changed in
+  Settings → Preferences. Nothing is Brave-specific anymore.
+- Coding tasks route to your default enabled agent (`coding.executeTask`):
+  opencode, Claude Code, Codex, Copilot CLI, Qwen Code have real adapters;
+  others appear for tracking until their CLIs support non-interactive runs.
+- Voice is 100% local (sherpa-onnx runtime: streaming Zipformer-int8 STT,
+  Silero VAD, Kokoro-82M-int8 TTS; cpal mic/speakers). Models download once to
+  `<comrade-agent>/models/` (~185 MB), then work offline. Hold 🎙 to talk,
+  ⟳ for hands-free conversation, talk over Comrade to interrupt. See
+  `docs/VOICE.md` for architecture, models, tests, and troubleshooting.
 - DeepSeek validates function names strictly (`^[a-zA-Z0-9_-]+$`), so dotted
   tool names go on the wire as `namespace_tool` and are decoded back.
 - Browser tools are honest stubs until the automation phase.

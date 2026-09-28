@@ -79,6 +79,6 @@ pub trait LlmProvider: Send + Sync {
         &self,
         messages: &[ChatMessage],
         opts: &ChatOptions,
-        on_token: &mut dyn FnMut(String),
+        on_token: &mut (dyn FnMut(String) + Send),
     ) -> anyhow::Result<LlmResponse>;
 }

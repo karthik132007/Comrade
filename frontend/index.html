@@ -22,7 +22,15 @@
 
     <main>
       <section id="hero">
-        <div id="orb" class="orb idle"></div>
+        <div id="orb" class="orb idle">
+          <div class="ring r1"></div>
+          <div class="ring r2"></div>
+          <div class="ring r3"></div>
+          <div class="pulse p1"></div>
+          <div class="pulse p2"></div>
+          <div class="core"></div>
+        </div>
+        <div id="wave" aria-hidden="true"></div>
         <h1 id="greeting">Hey, Comrade.</h1>
         <p id="subtitle">How can I help you?</p>
       </section>
@@ -44,9 +52,31 @@
         <input id="input" type="text" placeholder="Ask Comrade..." autocomplete="off" />
         <button id="send-btn" type="submit">➤</button>
         <button id="mic-btn" type="button" title="Hold to talk, release to send">🎙</button>
+        <button id="conv-btn" type="button" title="Hands-free conversation">⟳</button>
       </form>
-      <div id="hint">Type, or hold the mic button to talk. Voice replies play automatically.</div>
+      <div id="hint">Type, hold 🎙 to talk, or ⟳ for hands-free conversation.</div>
     </footer>
+  </div>
+
+  <div id="onboarding" hidden>
+    <div class="onboard-card">
+      <img src="logo.png" alt="Comrade logo" />
+      <h1>Welcome to Comrade.</h1>
+      <p class="muted">Choose the browser Comrade will drive. With your own
+        profile it opens your tabs and logins — Gmail and all.</p>
+      <div id="browser-list"></div>
+      <div class="row checks">
+        <label class="check"><input type="radio" name="ob-profile" value="user" checked /> Use my profile (logged in)</label>
+        <label class="check"><input type="radio" name="ob-profile" value="comrade" /> Isolated Comrade profile</label>
+      </div>
+      <label class="check"><input id="ob-headless" type="checkbox" /> Run browser hidden (headless)</label>
+      <h2 class="ob-section">Coding agents</h2>
+      <p class="muted">Comrade delegates code tasks to these. All enabled by default.</p>
+      <div id="agent-list"></div>
+      <div class="row"><label class="muted" for="ob-default">Default agent</label><select id="ob-default"></select></div>
+      <button id="ob-continue" type="button">Start using Comrade</button>
+      <div id="ob-status" class="muted"></div>
+    </div>
   </div>
 
   <div id="perm-modal" hidden>    <div class="perm-card">
@@ -73,6 +103,46 @@
       <button id="settings-close" type="button">✕</button>
     </div>
     <div class="settings-body">
+      <h3>Preferences</h3>
+      <label class="muted" for="pref-browser">Browser</label>
+      <select id="pref-browser"></select>
+      <div class="row">
+        <label class="muted" for="pref-profile">Profile</label>
+        <select id="pref-profile">
+          <option value="user">My profile (logged in)</option>
+          <option value="comrade">Isolated Comrade profile</option>
+        </select>
+        <label class="muted" for="pref-debugport">Debug port</label>
+        <input id="pref-debugport" type="number" min="0" max="65535" step="1" title="Attach here first when your browser runs with --remote-debugging-port (0 = off)" />
+      </div>
+      <div class="row checks">
+        <label class="check"><input id="pref-headless" type="checkbox" /> Headless</label>
+        <label class="check"><input id="pref-autoplay" type="checkbox" /> Voice autoplay</label>
+        <button id="pref-save" type="button">Save</button>
+      </div>
+      <div id="pref-status" class="muted"></div>
+      <div id="pref-file" class="muted"></div>
+      <h3>Voice (100% local)</h3>
+      <label class="muted" for="voice-mic">Microphone</label>
+      <select id="voice-mic"></select>
+      <div class="row">
+        <button id="voice-models-btn" type="button">Check models</button>
+        <button id="voice-dl-btn" type="button">Download</button>
+      </div>
+      <div id="model-status" class="muted"></div>
+      <div class="progress"><div id="model-progress"></div></div>
+      <div class="row vgrid">
+        <label class="muted">VAD threshold <input id="voice-vad-t" type="number" min="0.1" max="0.9" step="0.05" /></label>
+        <label class="muted">Silence ms <input id="voice-silence" type="number" min="200" max="3000" step="50" /></label>
+        <label class="muted">TTS voice <input id="voice-tts-voice" type="text" /></label>
+        <label class="muted">TTS speed <input id="voice-tts-speed" type="number" min="0.25" max="4" step="0.05" /></label>
+      </div>
+      <h3>Coding agents</h3>
+      <div id="code-agent-list"></div>
+      <div class="row">
+        <label class="muted" for="code-default">Default</label>
+        <select id="code-default"></select>
+      </div>
       <h3>Brain</h3>
       <div id="model-info" class="muted">loading...</div>
       <h3>Add memory</h3>

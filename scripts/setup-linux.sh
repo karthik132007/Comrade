@@ -62,6 +62,7 @@ PKG_CONFIG_PATH = "$SYSROOT/usr/lib/pkgconfig"
 rustflags = [
     "-C", "link-arg=-L$SYSROOT/usr/lib",
     "-C", "link-arg=-Wl,-rpath,$SYSROOT/usr/lib",
+    "-C", "link-arg=-Wl,-rpath,\$ORIGIN",
 ]
 EOF
 

@@ -43,7 +43,7 @@ const ALWAYS_DANGEROUS_TOOLS: &[&str] = &[
     "browser.press",
     "filesystem.write",
     "filesystem.create",
-    "opencode.executeTask",
+    "coding.executeTask",
 ];
 
 pub fn tool_risk(tool_name: &str, args: &serde_json::Value) -> Risk {

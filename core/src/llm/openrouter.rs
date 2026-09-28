@@ -160,7 +160,7 @@ impl LlmProvider for OpenRouterProvider {
         &self,
         messages: &[ChatMessage],
         opts: &ChatOptions,
-        on_token: &mut dyn FnMut(String),
+        on_token: &mut (dyn FnMut(String) + Send),
     ) -> anyhow::Result<LlmResponse> {
         self.ensure_key()?;
         let res = self

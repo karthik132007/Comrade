@@ -1,7 +1,8 @@
 pub mod browser;
+pub mod browser_driver;
+pub mod coding;
 pub mod computer;
 pub mod filesystem;
-pub mod opencode;
 pub mod terminal;
 pub mod types;
 
@@ -10,7 +11,7 @@ use std::sync::Arc;
 pub use types::{Risk, Tool, ToolContext, ToolResult};
 
 /// Full tool registry handed to the agent loop.
-pub fn build_tools(opencode_bin: &str) -> Vec<Arc<dyn Tool>> {
+pub fn build_tools() -> Vec<Arc<dyn Tool>> {
     let mut tools: Vec<Arc<dyn Tool>> = vec![
         Arc::new(terminal::TerminalTool),
         Arc::new(filesystem::ListTool),
@@ -19,13 +20,13 @@ pub fn build_tools(opencode_bin: &str) -> Vec<Arc<dyn Tool>> {
         Arc::new(filesystem::ExistsTool),
         Arc::new(filesystem::SearchTool),
         Arc::new(computer::OpenApplicationTool),
-        Arc::new(opencode::OpenCodeTool { bin: opencode_bin.to_string() }),
+        Arc::new(coding::CodingTool),
     ];
     for stub in computer::computer_stubs() {
         tools.push(Arc::new(stub));
     }
-    for stub in browser::browser_stubs() {
-        tools.push(Arc::new(stub));
+    for tool in browser::browser_tools() {
+        tools.push(tool);
     }
     tools
 }

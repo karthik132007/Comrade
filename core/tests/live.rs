@@ -3,7 +3,6 @@ use comrade_core::config::load_config;
 use comrade_core::config::find_project_root;
 use comrade_core::llm::{ChatMessage, ChatOptions, Embedder, LlmProvider, OpenRouterEmbedder, OpenRouterProvider};
 use comrade_core::llm::factory::create_configured;
-use comrade_core::speech::{OpenRouterStt, OpenRouterTts, SpeechToText, TextToSpeech};
 
 fn test_config() -> comrade_core::config::ComradeConfig {
     load_config(&find_project_root())
@@ -24,25 +23,6 @@ async fn live_chat_round_trip() {
         .await
         .expect("chat call failed");
     assert!(res.content.contains("COMRADE-OK"), "unexpected reply: {}", res.content);
-}
-
-#[tokio::test]
-#[ignore]
-async fn live_tts_stt_round_trip() {    let cfg = test_config();
-    let tts = OpenRouterTts::new(
-        cfg.openrouter_key.clone(),
-        cfg.tts_model.clone(),
-        cfg.tts_voice.clone(),
-    );
-    let stt = OpenRouterStt::new(cfg.openrouter_key.clone(), cfg.stt_model.clone());
-    let speech = tts
-        .synthesize("Hello Comrade, voice check complete.", None)
-        .await
-        .expect("tts call failed");
-    assert!(speech.mime_type.starts_with("audio/"));
-    assert!(!speech.audio.is_empty());
-    let text = stt.transcribe(&speech.audio, None, "mp3").await.expect("stt call failed");
-    assert!(text.to_lowercase().contains("comrade"), "unexpected transcript: {text}");
 }
 
 #[tokio::test]
@@ -90,4 +70,25 @@ async fn live_deepseek_tool_call_round_trip() {
     for call in &res.tool_calls {
         assert!(!call.name.contains('_'), "tool name not decoded: {}", call.name);
     }
+}
+
+/// Regression: agent loop must stream tokens live (SSE), not dump at the end.
+#[tokio::test]
+#[ignore]
+async fn live_stream_tokens() {
+    use comrade_core::llm::LlmProvider;
+    let cfg = test_config();
+    let llm = create_configured(&cfg);
+    let mut tokens: Vec<String> = Vec::new();
+    let res = llm
+        .stream(
+            &[ChatMessage::user("Reply with exactly: COMRADE-STREAM")],
+            &ChatOptions { max_tokens: 256, temperature: 0.0, ..ChatOptions::default() },
+            &mut |tok| tokens.push(tok),
+        )
+        .await
+        .expect("stream call failed");
+    assert!(!tokens.is_empty(), "no tokens streamed");
+    assert_eq!(tokens.concat(), res.content, "streamed tokens must equal final content");
+    assert!(res.content.contains("COMRADE-STREAM"), "unexpected reply: {}", res.content);
 }

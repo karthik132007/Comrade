@@ -61,7 +61,8 @@ pub fn memory_db_path() -> PathBuf {
 }
 
 pub fn profile_dir_default() -> PathBuf {
-    comrade_home().join("brave-profile")
+    // One shared dir for the selected browser — never per-browser duplicates.
+    comrade_home().join("browser-profile")
 }
 
 /// Previous DB location (Tauri app_data_dir, pre-consolidation) for one-time move.
@@ -132,6 +133,6 @@ mod tests {
         std::env::remove_var("COMRADE_HOME");
         assert!(comrade_home().ends_with(APP_DIR_NAME));
         assert!(memory_db_path().ends_with("comrade-agent/comrade-memory.db"));
-        assert!(profile_dir_default().ends_with("comrade-agent/brave-profile"));
+        assert!(profile_dir_default().ends_with("comrade-agent/browser-profile"));
     }
 }
