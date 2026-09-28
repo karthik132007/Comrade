@@ -95,7 +95,8 @@ async fn local_vad_flags_speech_in_test_wav() {
     let (pcm, _) = read_test_wav(&base);
     let mut speech_frames = 0usize;
     let mut total = 0usize;
-    for frame in pcm.chunks_exact(512) {
+    let frame_samples = comrade_core::voice::audio::FRAME_SAMPLES;
+    for frame in pcm.chunks_exact(frame_samples) {
         total += 1;
         if vad.is_speech(frame) {
             speech_frames += 1;

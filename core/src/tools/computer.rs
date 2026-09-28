@@ -43,7 +43,9 @@ fn spawn_detached(program: &str, args: &[&str]) -> bool {
 async fn on_path(bin: &str) -> bool {
     tokio::process::Command::new("sh")
         .arg("-c")
-        .arg(format!("command -v {bin}"))
+        .arg("command -v -- \"$1\"")
+        .arg("sh")
+        .arg(bin)
         .output()
         .await
         .map(|o| o.status.success() && !o.stdout.is_empty())
@@ -52,6 +54,25 @@ async fn on_path(bin: &str) -> bool {
 
 async fn launch_app(name: &str) -> Option<String> {
     let target = name.trim().to_lowercase();
+    if cfg!(target_os = "macos") {
+        let application = match target.as_str() {
+            "brave" => "Brave Browser",
+            "chrome" => "Google Chrome",
+            "firefox" => "Firefox",
+            "vs code" | "vscode" | "code" => "Visual Studio Code",
+            "terminal" => "Terminal",
+            _ => name.trim(),
+        };
+        let launched = tokio::process::Command::new("open")
+            .args(["-a", application])
+            .output()
+            .await
+            .map(|output| output.status.success())
+            .unwrap_or(false);
+        if launched {
+            return Some(format!("application:{application}"));
+        }
+    }
     let mut candidates = binaries_for(target.as_str());
     if candidates.is_empty() {
         // Unknown app: try the literal name as a binary (may contain spaces — skip).
@@ -64,9 +85,11 @@ async fn launch_app(name: &str) -> Option<String> {
             return Some(format!("binary:{bin}"));
         }
     }
-    for id in desktop_ids_for(target.as_str()) {
-        if spawn_detached("gtk-launch", &[id]) {
-            return Some(format!("desktop:{id}"));
+    if cfg!(target_os = "linux") {
+        for id in desktop_ids_for(target.as_str()) {
+            if spawn_detached("gtk-launch", &[id]) {
+                return Some(format!("desktop:{id}"));
+            }
         }
     }
     None

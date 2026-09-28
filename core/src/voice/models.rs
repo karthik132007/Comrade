@@ -150,7 +150,14 @@ pub fn load_manifest(base: &Path) -> Manifest {
 
 fn save_manifest(base: &Path, manifest: &Manifest) -> anyhow::Result<()> {
     std::fs::create_dir_all(base)?;
-    std::fs::write(manifest_path(base), serde_json::to_string_pretty(manifest)?)?;
+    let path = manifest_path(base);
+    let pending = base.join("manifest.json.part");
+    std::fs::write(&pending, serde_json::to_string_pretty(manifest)?)?;
+    #[cfg(target_os = "windows")]
+    if path.exists() {
+        std::fs::remove_file(&path)?;
+    }
+    std::fs::rename(&pending, &path)?;
     Ok(())
 }
 
@@ -160,6 +167,12 @@ pub struct DownloadProgress {
     pub file: String,
     pub downloaded: u64,
     pub total: Option<u64>,
+}
+
+fn partial_download_path(dest: &Path) -> PathBuf {
+    let mut path = dest.as_os_str().to_owned();
+    path.push(".part");
+    PathBuf::from(path)
 }
 
 /// Download one file with progress. Returns (bytes, sha256).
@@ -173,6 +186,10 @@ async fn download_file(
     if let Some(parent) = dest.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
+    let pending = partial_download_path(dest);
+    // A killed process may leave an incomplete temporary file behind. Never
+    // expose it under the final model filename and always restart it cleanly.
+    let _ = tokio::fs::remove_file(&pending).await;
     let res = client.get(file.url).send().await.map_err(|e| {
         anyhow::anyhow!("model download failed for {}: {e}", file.path)
     })?;
@@ -181,7 +198,7 @@ async fn download_file(
     }
     let total = res.content_length();
     let mut hasher = sha2::Sha256::new();
-    let mut out = tokio::fs::File::create(dest).await?;
+    let mut out = tokio::fs::File::create(&pending).await?;
     let mut downloaded = 0u64;
     let mut stream = res.bytes_stream();
     use futures_util::StreamExt;
@@ -199,14 +216,22 @@ async fn download_file(
         });
     }
     out.flush().await?;
+    drop(out);
     if let Some(expected) = total {
         if downloaded != expected {
+            let _ = tokio::fs::remove_file(&pending).await;
             anyhow::bail!(
                 "model download incomplete for {}: got {downloaded}, want {expected}",
                 file.path
             );
         }
     }
+    // A completed download becomes visible atomically, so model checks never
+    // mistake a partial file for a usable model.
+    if dest.is_file() {
+        tokio::fs::remove_file(dest).await?;
+    }
+    tokio::fs::rename(&pending, dest).await?;
     Ok((downloaded, format!("{:x}", hasher.finalize())))
 }
 
@@ -242,12 +267,16 @@ pub async fn ensure_models(
                 {
                     Ok((bytes, sha256)) => {
                         manifest.files.insert(key.clone(), FileRecord { bytes, sha256 });
+                        // Checkpoint completed files so a later pack failure does
+                        // not make the next attempt download them all again.
+                        save_manifest(base, &manifest)?;
                         last_err.clear();
                         break;
                     }
                     Err(e) => {
                         last_err = format!("{e}");
                         let _ = std::fs::remove_file(&dest); // never keep partials
+                        let _ = std::fs::remove_file(partial_download_path(&dest));
                         crate::logger::log(
                             crate::logger::Level::Warn,
                             "VOICE",
@@ -295,7 +324,7 @@ async fn extract_tts_archive(
         return Ok(());
     }
     let dest = dir.join(archive.path);
-    if dest.is_file() {
+    if !dest.is_file() {
         let client =
             reqwest::Client::builder().user_agent("Comrade voice-model-manager").build()?;
         let mut last_err = String::new();
@@ -313,6 +342,7 @@ async fn extract_tts_archive(
                 Err(e) => {
                     last_err = format!("{e}");
                     let _ = std::fs::remove_file(&dest);
+                    let _ = std::fs::remove_file(partial_download_path(&dest));
                     tokio::time::sleep(std::time::Duration::from_secs(2 * attempt as u64)).await;
                 }
             }
@@ -320,27 +350,33 @@ async fn extract_tts_archive(
         if !last_err.is_empty() {
             anyhow::bail!("model download failed for {} after 3 tries: {last_err}", archive.path);
         }
-        progress(DownloadProgress {
-            pack: pack.id.to_string(),
-            file: "extracting".to_string(),
-            downloaded: 0,
-            total: None,
-        });
-        // Decompress off the async executor: bzip2 + tar are blocking.
-        let dir_clone = dir.clone();
-        let dest_clone = dest.clone();
-        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            let raw = std::fs::read(&dest_clone)?;
-            let cursor = std::io::Cursor::new(raw);
-            let bz = bzip2::read::BzDecoder::new(cursor);
-            let mut ar = tar::Archive::new(bz);
-            ar.unpack(&dir_clone)?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("tts extract task failed: {e}"))??;
-        let _ = std::fs::remove_file(&dest);
     }
+    progress(DownloadProgress {
+        pack: pack.id.to_string(),
+        file: "extracting".to_string(),
+        downloaded: 0,
+        total: None,
+    });
+    // Decompress off the async executor and stream from disk instead of
+    // holding the entire archive in memory.
+    let dir_clone = dir.clone();
+    let dest_clone = dest.clone();
+    let extracted = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let raw = std::fs::File::open(&dest_clone)?;
+        let bz = bzip2::read::BzDecoder::new(raw);
+        let mut ar = tar::Archive::new(bz);
+        ar.unpack(&dir_clone)?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("tts extract task failed: {e}"))?;
+    if let Err(e) = extracted {
+        // Force a clean re-download on the next attempt if a cached archive is
+        // corrupt or was produced by an older interrupted version.
+        let _ = std::fs::remove_file(&dest);
+        return Err(e);
+    }
+    let _ = std::fs::remove_file(&dest);
     // Normalize layout even when the archive is long gone (repairs old installs).
     flatten_single_subdir(&dir)?;
     for name in tts_expected_files() {
@@ -410,6 +446,24 @@ fn flatten_single_subdir(dir: &Path) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    fn fixture_tts_archive() -> Vec<u8> {
+        let encoder = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::fast());
+        let mut archive = tar::Builder::new(encoder);
+        for (path, contents) in [
+            ("kokoro-fixture/model.onnx", b"model".as_slice()),
+            ("kokoro-fixture/voices.bin", b"voices".as_slice()),
+            ("kokoro-fixture/tokens.txt", b"tokens".as_slice()),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_mode(0o644);
+            header.set_size(contents.len() as u64);
+            header.set_cksum();
+            archive.append_data(&mut header, path, contents).unwrap();
+        }
+        let encoder = archive.into_inner().unwrap();
+        encoder.finish().unwrap()
+    }
+
     #[test]
     fn status_reflects_missing_files() {
         let dir = std::env::temp_dir().join("comrade-models-test");
@@ -432,8 +486,11 @@ mod tests {
         let mut m = Manifest::default();
         m.files.insert("stt/tokens.txt".into(), FileRecord { bytes: 10, sha256: "abc".into() });
         save_manifest(&dir, &m).unwrap();
+        m.files.get_mut("stt/tokens.txt").unwrap().bytes = 11;
+        save_manifest(&dir, &m).unwrap();
         let back = load_manifest(&dir);
-        assert_eq!(back.files["stt/tokens.txt"].bytes, 10);
+        assert_eq!(back.files["stt/tokens.txt"].bytes, 11);
+        assert!(!dir.join("manifest.json.part").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -446,6 +503,68 @@ mod tests {
         std::fs::write(sub.join("kokoro-v1_0.onnx"), "x").unwrap();
         flatten_single_subdir(&dir).unwrap();
         assert!(dir.join("model.onnx").is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn fresh_tts_pack_downloads_and_extracts_archive() {
+        use std::io::{Read, Write};
+
+        let payload = fixture_tts_archive();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut request = [0u8; 2048];
+            let _ = socket.read(&mut request);
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                payload.len()
+            );
+            socket.write_all(headers.as_bytes()).unwrap();
+            socket.write_all(&payload).unwrap();
+        });
+
+        let dir = std::env::temp_dir().join(format!(
+            "comrade-tts-download-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let url: &'static str =
+            Box::leak(format!("http://{address}/fixture.tar.bz2").into_boxed_str());
+        let pack = ModelPack {
+            id: "tts",
+            dir: "tts",
+            files: &[],
+            archive: Some(ModelFile { path: "fixture.tar.bz2", url }),
+        };
+        let events = std::sync::Mutex::new(Vec::new());
+
+        extract_tts_archive(
+            &dir,
+            &pack,
+            pack.archive.as_ref().unwrap(),
+            &|event| events.lock().unwrap().push(event),
+        )
+        .await
+        .unwrap();
+        server.join().unwrap();
+
+        let tts_dir = dir.join("tts");
+        assert!(tts_dir.join("model.onnx").is_file());
+        assert!(tts_dir.join("voices.bin").is_file());
+        assert!(tts_dir.join("tokens.txt").is_file());
+        assert!(tts_dir.join(".extracted").is_file());
+        assert!(!tts_dir.join("fixture.tar.bz2").exists());
+        assert!(!tts_dir.join("fixture.tar.bz2.part").exists());
+        assert!(missing_files(&dir, &pack).is_empty());
+
+        let events = events.into_inner().unwrap();
+        assert!(events.iter().any(|event| event.file == "fixture.tar.bz2"));
+        assert!(events.iter().any(|event| event.file == "extracting"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

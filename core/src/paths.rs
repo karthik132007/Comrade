@@ -5,7 +5,7 @@
  * - Windows: `%APPDATA%/comrade-agent`
  *
  * Layout:
- * ```
+ * ```text
  * comrade-agent/
  *   comrade-memory.db      SQLite vector memory
  *   comrade-memory.json    legacy memory (one-time migration source)

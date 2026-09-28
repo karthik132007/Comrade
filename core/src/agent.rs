@@ -21,6 +21,8 @@ Rules:
 - Use tools for actions. Never claim you did something you did not call a tool for.
 - CODING tasks (modify/create/debug source code) MUST go through coding.executeTask (it routes to the enabled coding agent) — never edit code with filesystem.write directly.
 - BROWSER_* tools read/navigate sites only; they cannot change code.
+- For website actions, use browser.* tools with the browser selected in Settings. browser.open navigates the same tab; reuse it throughout the task.
+- Never work around a browser connection/setup failure by launching another browser, running open/xdg-open/start in the terminal, or using computer.openApplication. Report the setup error and the Settings change needed.
 - After each action, verify: re-read, re-list, check output, then report what actually happened.
 - Keep responses short and factual. No emojis.
 - Never print secrets, keys, tokens, or cookies.
@@ -169,8 +171,9 @@ impl<P: LlmProvider, E: Embedder> Agent<P, E> {
         let mut messages = vec![
             ChatMessage::system(SYSTEM_PROMPT),
             ChatMessage::system(format!(
-                "Environment:\n{}\nKnown projects:\n{}\nRelevant memories:\n{}\nIntent: {}",
+                "Environment:\n{}\nSelected browser settings: {}\nKnown projects:\n{}\nRelevant memories:\n{}\nIntent: {}",
                 environment_prompt(&env),
+                serde_json::to_string(&crate::prefs::load().browser).unwrap_or_default(),
                 if projects.is_empty() { "(none)".to_string() } else { projects },
                 format_memories(&remembered),
                 intent.as_str()
@@ -333,6 +336,15 @@ impl<P: LlmProvider, E: Embedder> Agent<P, E> {
                     crate::tools::types::ToolResult::Err(e) => {
                         finish_step(&mut task, step_index, StepStatus::Failed, Some(e.message.clone()));
                         cb.on_step(&summary, "failed", Some(&e.message));
+                        // Setup failures require a preference or browser change.
+                        // Returning here also stops calls already queued in this
+                        // response from opening the system-default browser.
+                        if browser_setup_failed(&call.name, &e.code) {
+                            task.status = TaskStatus::Failed;
+                            task.error = Some(e.message.clone());
+                            cb.on_ui_state("error");
+                            return task;
+                        }
                     }
                 }
             }
@@ -340,9 +352,99 @@ impl<P: LlmProvider, E: Embedder> Agent<P, E> {
     }
 }
 
+fn browser_setup_failed(tool: &str, code: &str) -> bool {
+    tool.starts_with("browser.")
+        && matches!(code,
+            "NO_BROWSER" | "BROWSER_NOT_FOUND" | "FIREFOX_UNSUPPORTED"
+            | "FLATPAK_UNSUPPORTED" | "PROFILE_IN_USE" | "PROFILE_FAILED"
+            | "LAUNCH_FAILED" | "PORT_FAILED" | "DEBUG_BROWSER_MISMATCH"
+            | "DEBUG_BROWSER_UNVERIFIED" | "DEFAULT_PROFILE_UNSUPPORTED"
+            | "PROFILE_DEBUGGING_UNAVAILABLE")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::parse_memories;
+    use super::*;
+    use crate::llm::{LlmResponse, ToolCallRequest};
+    use crate::tools::types::ToolResult;
+
+    struct BrowserFailureBrain;
+
+    impl LlmProvider for BrowserFailureBrain {
+        async fn chat(&self, _: &[ChatMessage], _: &ChatOptions) -> anyhow::Result<LlmResponse> {
+            Ok(LlmResponse { content: "BROWSER".into(), ..Default::default() })
+        }
+
+        async fn stream(
+            &self,
+            _: &[ChatMessage],
+            _: &ChatOptions,
+            _: &mut (dyn FnMut(String) + Send),
+        ) -> anyhow::Result<LlmResponse> {
+            Ok(LlmResponse {
+                content: String::new(),
+                tool_calls: vec![
+                    ToolCallRequest {
+                        id: "browser".into(), name: "browser.open".into(),
+                        arguments: serde_json::json!({"url": "https://example.com"}),
+                    },
+                    ToolCallRequest {
+                        id: "fallback".into(), name: "terminal.execute".into(),
+                        arguments: serde_json::json!({"command": "open https://example.com"}),
+                    },
+                ],
+            })
+        }
+    }
+
+    struct NoEmbeddings;
+    impl Embedder for NoEmbeddings {
+        async fn embed(&self, _: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+            Ok(vec![vec![1.0]])
+        }
+    }
+
+    struct SetupFailureTool;
+    impl Tool for SetupFailureTool {
+        fn name(&self) -> &'static str { "browser.open" }
+        fn description(&self) -> &'static str { "Test browser setup failure" }
+        fn parameters(&self) -> serde_json::Value { serde_json::json!({}) }
+        fn risk(&self, _: &serde_json::Value) -> Risk { Risk::Safe }
+        fn execute<'a>(
+            &'a self,
+            _: &'a serde_json::Value,
+            _: &'a ToolContext,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolResult> + Send + 'a>> {
+            Box::pin(async { ToolResult::fail("PROFILE_IN_USE", "Choose a supported profile in Settings.") })
+        }
+    }
+
+    struct NoopCallbacks;
+    impl AgentCallbacks for NoopCallbacks {
+        fn on_ui_state(&self, _: &str) {}
+        fn on_step(&self, _: &str, _: &str, _: Option<&str>) {}
+        fn on_token(&self, _: &str) {}
+        fn is_cancelled(&self) -> bool { false }
+        async fn request_approval(&self, _: &str) -> bool { true }
+    }
+
+    #[tokio::test]
+    async fn browser_setup_failure_stops_before_queued_fallbacks() {
+        let agent = Agent::new(AgentDeps {
+            llm: Arc::new(BrowserFailureBrain),
+            embedder: Arc::new(NoEmbeddings),
+            tools: vec![Arc::new(SetupFailureTool)],
+            memory: Arc::new(std::sync::Mutex::new(MemoryStore::open_in_memory(1).unwrap())),
+            cwd: std::env::temp_dir(),
+            model: None,
+            max_steps: 3,
+            timeout_ms: 10000,
+        });
+        let task = agent.run_task("Open example.com", &NoopCallbacks).await;
+        assert_eq!(task.status, TaskStatus::Failed);
+        assert_eq!(task.tool_calls.len(), 1);
+        assert_eq!(task.error.as_deref(), Some("Choose a supported profile in Settings."));
+    }
 
     #[test]
     fn extractor_output_parses() {

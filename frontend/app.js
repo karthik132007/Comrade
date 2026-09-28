@@ -53,6 +53,8 @@
 
   var currentResponseEl = null;
   var pendingPermId = null;
+  var taskStartVersion = 0;
+  var messageStarting = false;
 
   // --- chat history sidebar (history.db sessions) ---
   var sidebarEl = document.getElementById('sidebar');
@@ -141,23 +143,32 @@
   form.addEventListener('submit', function (ev) {
     ev.preventDefault();
     var text = input.value.trim();
-    if (!text) return;
-    input.value = '';
-    addMessage('user', text);
-    resetTaskPanel(text);
-    currentResponseEl = null;
-    invoke('send_message', { text: text, sessionId: currentSessionId }).then(function (res) {
+    if (!text || messageStarting) return;
+    messageStarting = true;
+    var startVersion = taskStartVersion;
+    waitForBrowserPrefs().then(function () {
+      messageStarting = false;
+      if (startVersion !== taskStartVersion) return null;
+      if (input.value.trim() === text) input.value = '';
+      addMessage('user', text);
+      resetTaskPanel(text);
+      currentResponseEl = null;
+      return invoke('send_message', { text: text, sessionId: currentSessionId });
+    }).then(function (res) {
+      if (!res) return;
       if (res.session_id) { setSession(res.session_id); refreshChatList(); }
       if (res.status === 'done' || res.status === 'running') return;
       setState('idle');
       if (res.error) addMessage('comrade', 'Error: ' + res.error);
     }).catch(function (err) {
+      messageStarting = false;
       setState('error');
       addMessage('comrade', 'Error: ' + (err && err.message ? err.message : err));
     });
   });
 
   cancelBtn.addEventListener('click', function () {
+    taskStartVersion++;
     invoke('cancel_voice_input', {}).catch(function () { /* noop */ });
     voiceActive = false;
     convMode = false;
@@ -172,18 +183,31 @@
 
   // --- local voice sessions (backend mic/VAD/STT/TTS; no audio in the UI) ---
   var voiceActive = false;
+  var voiceStartPending = false;
+  var voiceStartVersion = 0;
   var convMode = false;
 
   function startVoice(oneShot) {
     if (voiceActive) return;
     voiceActive = true;
+    voiceStartPending = true;
+    var startVersion = ++voiceStartVersion;
+    var taskVersion = taskStartVersion;
     micBtn.classList.add('live');
     currentResponseEl = null;
-    invoke('start_voice_input', { oneShot: oneShot, sessionId: currentSessionId }).then(function (res) {
+    waitForBrowserPrefs().then(function () {
+      if (!voiceActive || startVersion !== voiceStartVersion || taskVersion !== taskStartVersion) return null;
+      voiceStartPending = false;
+      return invoke('start_voice_input', { oneShot: oneShot, sessionId: currentSessionId });
+    }).then(function (res) {
+      if (startVersion !== voiceStartVersion) return;
+      voiceStartPending = false;
       if (res === 'started') return;
       voiceActive = false;
       micBtn.classList.remove('live');
     }).catch(function (err) {
+      if (startVersion !== voiceStartVersion) return;
+      voiceStartPending = false;
       voiceActive = false;
       micBtn.classList.remove('live');
       convMode = false;
@@ -198,6 +222,12 @@
     // Push-to-talk release: finalize the utterance, hear the reply, end.
     if (!voiceActive) return;
     micBtn.classList.remove('live');
+    if (voiceStartPending) {
+      voiceActive = false;
+      voiceStartPending = false;
+      voiceStartVersion++;
+      return;
+    }
     invoke('stop_voice_input', { finalize: true }).catch(function () { /* session ends on its own */ });
   }
 
@@ -232,12 +262,30 @@
       modelStatus.textContent = ev.ready
         ? 'models ready (offline)'
         : 'missing: ' + (ev.missing || []).join(', ');
+      if (ev.ready) {
+        modelProgress.style.width = '100%';
+        setModelDownloadActive(false);
+      } else if (!modelDownloadActive) {
+        modelProgress.style.width = '0';
+      }
       if (!ev.ready) addMessage('comrade', 'Voice models missing — open Settings → Download.');
     } else if (ev.type === 'voice-download') {
+      setModelDownloadActive(true);
+      if (ev.file === 'extracting') {
+        modelStatus.textContent = 'extracting ' + ev.pack + ' model...';
+        modelProgress.style.width = '0';
+        return;
+      }
       var total = ev.total ? ' / ' + Math.round(ev.total / 1024) + 'KB' : '';
-      modelStatus.textContent = 'downloading ' + ev.file + ': ' + Math.round(ev.downloaded / 1024) + 'KB' + total;
+      var pack = ev.pack ? ev.pack + ' · ' : '';
+      modelStatus.textContent = 'downloading ' + pack + ev.file + ': ' + Math.round(ev.downloaded / 1024) + 'KB' + total;
       var pct = ev.total ? Math.round(100 * ev.downloaded / ev.total) : 0;
       modelProgress.style.width = pct + '%';
+    } else if (ev.type === 'voice-download-error') {
+      modelStatus.textContent = 'download failed: ' + (ev.message || 'unknown error');
+      modelProgress.style.width = '0';
+      setModelDownloadActive(false);
+      addMessage('comrade', 'Voice model download failed: ' + (ev.message || 'unknown error'));
     } else if (ev.type === 'voice-level') {
       waveLevel = Math.max(0, Math.min(1, ev.level || 0));
     } else if (ev.type === 'voice-error') {
@@ -318,6 +366,7 @@
   var voiceTtsSpeed = document.getElementById('voice-tts-speed');
   var modelStatus = document.getElementById('model-status');
   var modelProgress = document.getElementById('model-progress');
+  var modelDownloadActive = false;
   var currentVoicePrefs = null;
   var memSearch = document.getElementById('mem-search');
   var memRefresh = document.getElementById('mem-refresh');
@@ -327,6 +376,13 @@
 
   function errMsg(err) {
     return (err && err.message ? err.message : String(err)).slice(0, 200);
+  }
+
+  function setModelDownloadActive(active) {
+    modelDownloadActive = !!active;
+    voiceDlBtn.disabled = modelDownloadActive;
+    voiceModelsBtn.disabled = modelDownloadActive;
+    voiceDlBtn.textContent = modelDownloadActive ? 'Downloading...' : 'Download';
   }
 
   function openSettings() {
@@ -524,12 +580,92 @@
   var prefSave = document.getElementById('pref-save');
   var prefStatus = document.getElementById('pref-status');
   var prefFile = document.getElementById('pref-file');
+  var browserHelp = document.getElementById('browser-help');
   var detectedBrowsers = [];
+  var prefsWriteQueue = Promise.resolve();
+  var browserPrefsError = null;
+  var browserEditRevision = 0;
+  var settingsLoadRevision = 0;
+
+  // Preference writes are ordered, including a full Save after an auto-save.
+  // Tasks wait for the latest write so a selected browser is already active.
+  function queuePrefsSave(command, args) {
+    var revision = ++browserEditRevision;
+    var request = prefsWriteQueue.then(function () { return invoke(command, args); });
+    prefsWriteQueue = request.then(function (prefs) {
+      if (revision === browserEditRevision) browserPrefsError = null;
+      return prefs;
+    }, function (err) {
+      if (revision === browserEditRevision) browserPrefsError = err;
+    });
+    return request;
+  }
+
+  function waitForBrowserPrefs() {
+    var pending = prefsWriteQueue;
+    return pending.then(function () {
+      if (pending !== prefsWriteQueue) return waitForBrowserPrefs();
+      if (browserPrefsError) {
+        throw new Error('Browser settings were not saved. Retry Save in Settings: ' + errMsg(browserPrefsError));
+      }
+    });
+  }
+
+  function browserPrefsFromSettings() {
+    var opt = prefBrowser.options[prefBrowser.selectedIndex];
+    if (!opt || !opt.value) throw new Error('Pick a browser first.');
+    var dp = prefDebugPort ? Number(prefDebugPort.value) : 9222;
+    if (!Number.isInteger(dp) || dp < 0 || dp > 65535) {
+      throw new Error('Debug port must be a whole number from 0 to 65535.');
+    }
+    return {
+      exe: opt.value,
+      kind: opt.dataset.kind || 'binary',
+      headless: prefHeadless.checked,
+      profile: (prefProfile && prefProfile.value === 'comrade') ? 'comrade' : 'user',
+      debug_port: dp,
+    };
+  }
+
+  function autoSaveBrowserPrefs() {
+    updateBrowserHelp();
+    var browser;
+    try { browser = browserPrefsFromSettings(); } catch (err) {
+      browserEditRevision++;
+      browserPrefsError = err;
+      prefStatus.textContent = 'Browser settings not saved: ' + errMsg(err);
+      return;
+    }
+    prefStatus.textContent = 'Saving browser settings...';
+    var request = queuePrefsSave('save_browser_prefs', { browser: browser });
+    var revision = browserEditRevision;
+    request.then(function () {
+      if (revision === browserEditRevision) prefStatus.textContent = 'Browser settings saved.';
+    }).catch(function (err) {
+      if (revision === browserEditRevision) prefStatus.textContent = 'Browser settings not saved: ' + errMsg(err);
+    });
+  }
+
+  [prefBrowser, prefProfile, prefDebugPort, prefHeadless].forEach(function (control) {
+    if (control) control.addEventListener('change', autoSaveBrowserPrefs);
+  });
 
   function browserLabel(b) {
     var label = b.name + (b.version ? ' — ' + b.version.split(' ').slice(0, 3).join(' ') : '');
     if (!b.automation_supported) label += ' · manual use only';
     return label;
+  }
+
+  function updateBrowserHelp() {
+    if (!browserHelp) return;
+    var browser = detectedBrowsers.filter(function (b) { return b.exe === prefBrowser.value; })[0];
+    var version = browser && (browser.version || '').match(/\b(\d+)\./);
+    var defaultProfileUnsupported = browser && browser.name === 'Chrome' && version &&
+      Number(version[1]) >= 136 && prefProfile && prefProfile.value === 'user';
+    browserHelp.hidden = !defaultProfileUnsupported;
+    browserHelp.textContent = defaultProfileUnsupported
+      ? 'This Chrome version cannot automate its default profile. Choose Isolated Comrade profile and sign in there.'
+      : '';
   }
 
   function fillBrowserControls(browsers, selectedExe) {
@@ -560,12 +696,21 @@
       if (selectedExe && b.exe === selectedExe) opt.selected = true;
       prefBrowser.appendChild(opt);
     });
+    if (selectedExe && !browsers.some(function (b) { return b.exe === selectedExe; })) {
+      var missing = document.createElement('option');
+      missing.value = selectedExe;
+      missing.textContent = selectedExe + ' (not detected)';
+      missing.selected = true;
+      prefBrowser.appendChild(missing);
+    }
     if (!browsers.length) {
       browserList.innerHTML = '<p class="muted">No Chromium-based browser found. Install Brave, Chrome or Chromium, then reopen Comrade.</p>';
-      var opt = document.createElement('option');
-      opt.value = '';
-      opt.textContent = '(none found)';
-      prefBrowser.appendChild(opt);
+      if (!selectedExe) {
+        var opt = document.createElement('option');
+        opt.value = '';
+        opt.textContent = '(none found)';
+        prefBrowser.appendChild(opt);
+      }
     }
   }
 
@@ -607,7 +752,7 @@
     var agents = checkedAgentIds(agentList);
     if (!agents.length) { obStatus.textContent = 'Enable at least one coding agent.'; return; }
     obStatus.textContent = 'saving...';
-    invoke('save_prefs', { prefs: {
+    queuePrefsSave('save_prefs', { prefs: {
       browser: browserPrefsForSave(b),
       voice: {
         autoplay: true, enabled: true, mic: '',
@@ -664,6 +809,7 @@
         modelStatus.textContent = 'missing: ' + (st.missing || []).join(', ');
         modelProgress.style.width = '0';
       }
+      setModelDownloadActive(false);
     }).catch(function (err) {
       modelStatus.textContent = 'status failed: ' + errMsg(err);
     });
@@ -672,11 +818,15 @@
   voiceModelsBtn.addEventListener('click', refreshModelStatus);
 
   voiceDlBtn.addEventListener('click', function () {
+    setModelDownloadActive(true);
     modelStatus.textContent = 'starting download...';
+    modelProgress.style.width = '0';
     invoke('voice_download_models', {}).then(function (r) {
-      modelStatus.textContent = r === 'downloading' ? 'downloading...' : r;
+      if (r !== 'downloading') modelStatus.textContent = r;
     }).catch(function (err) {
       modelStatus.textContent = 'failed: ' + errMsg(err);
+      modelProgress.style.width = '0';
+      setModelDownloadActive(false);
     });
   });
 
@@ -709,8 +859,16 @@
   }
 
   function loadPrefsIntoSettings() {
-    prefStatus.textContent = '';
-    invoke('get_prefs', {}).then(function (prefs) {
+    var loadRevision = ++settingsLoadRevision;
+    var editRevision = browserEditRevision;
+    waitForBrowserPrefs().then(function () {
+      return Promise.all([invoke('get_prefs', {}), invoke('system_browsers', {})]);
+    }).then(function (results) {
+      if (loadRevision !== settingsLoadRevision || editRevision !== browserEditRevision) return;
+      var prefs = results[0];
+      detectedBrowsers = results[1] || [];
+      fillBrowserControls(detectedBrowsers, prefs.browser && prefs.browser.exe);
+      prefStatus.textContent = '';
       var coding = prefs.coding || { agents: [], default: '' };
       loadAgents(coding.agents, coding.default);
       prefHeadless.checked = !!(prefs.browser && prefs.browser.headless);
@@ -724,14 +882,16 @@
         var dp = prefs.browser && prefs.browser.debug_port;
         prefDebugPort.value = (typeof dp === 'number' && dp >= 0) ? dp : 9222;
       }
+      updateBrowserHelp();
       prefAutoplay.checked = !(prefs.voice && prefs.voice.autoplay === false);
       currentVoicePrefs = prefs.voice || null;
       fillVoiceSettings(prefs.voice || {});
       refreshModelStatus();
-      prefFile.textContent = 'Stored in comrade.conf inside the comrade-agent home folder.';
-      return loadBrowsers(prefs.browser && prefs.browser.exe);
+      prefFile.textContent = 'Browser changes save automatically. Use Save for other settings. Stored in comrade.conf inside the comrade-agent home folder.';
     }).catch(function (err) {
-      prefStatus.textContent = 'failed: ' + errMsg(err);
+      if (loadRevision === settingsLoadRevision && editRevision === browserEditRevision) {
+        prefStatus.textContent = 'failed: ' + errMsg(err);
+      }
     });
   }
 
@@ -827,28 +987,25 @@
   }
 
   prefSave.addEventListener('click', function () {
-    var opt = prefBrowser.options[prefBrowser.selectedIndex];
-    if (!opt || !opt.value) { prefStatus.textContent = 'Pick a browser first.'; return; }
+    var browser;
+    try { browser = browserPrefsFromSettings(); } catch (err) {
+      prefStatus.textContent = errMsg(err);
+      return;
+    }
     var agents = checkedAgentIds(codeAgentList);
     if (!agents.length) { prefStatus.textContent = 'Enable at least one coding agent.'; return; }
     prefStatus.textContent = 'saving...';
-    var dp = prefDebugPort ? parseInt(prefDebugPort.value, 10) : 9222;
-    if (isNaN(dp) || dp < 0 || dp > 65535) dp = 9222;
-    invoke('save_prefs', { prefs: {
-      browser: {
-        exe: opt.value,
-        kind: opt.dataset.kind || 'binary',
-        headless: prefHeadless.checked,
-        profile: (prefProfile && prefProfile.value === 'comrade') ? 'comrade' : 'user',
-        debug_port: dp,
-      },
+    var request = queuePrefsSave('save_prefs', { prefs: {
+      browser: browser,
       voice: voicePrefsForSave(),
       coding: { agents: agents, default: codeDefault.value || agents[0] },
-    } }).then(function () {
-      prefStatus.textContent = 'saved to comrade.conf.';
+    } });
+    var revision = browserEditRevision;
+    request.then(function () {
+      if (revision === browserEditRevision) prefStatus.textContent = 'saved to comrade.conf.';
       refreshAppInfo();
     }).catch(function (err) {
-      prefStatus.textContent = 'failed: ' + errMsg(err);
+      if (revision === browserEditRevision) prefStatus.textContent = 'failed: ' + errMsg(err);
     });
   });
 
@@ -883,4 +1040,3 @@
 
   setState('idle');
 })();
-

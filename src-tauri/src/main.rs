@@ -15,7 +15,7 @@ use comrade_core::logger::{log, Level};
 use comrade_core::history::{title_for, ChatMessageRow, ChatSession, HistoryStore};
 use comrade_core::memory::{import_chatgpt_json, import_text, migrate_legacy_json, MemoryItem, MemoryStore, ScoredMemory};
 use comrade_core::paths;
-use comrade_core::prefs::{self, BrowserInfo, Prefs};
+use comrade_core::prefs::{self, BrowserInfo, BrowserPrefs, Prefs};
 use comrade_core::task_state::{TaskState, TaskStatus};
 use comrade_core::tools::{build_tools, coding};
 use comrade_core::voice::capture::{list_input_devices, list_output_devices, AudioDeviceInfo};
@@ -237,6 +237,7 @@ fn now_ms() -> u64 {
 /// processes. When that path is absent (no sudo to install it), re-exec under
 /// the LD_PRELOAD path shim + vendored sysroot so spawns/dlopens redirect.
 /// See shim/webkit-path-shim.c. No-op on systems with a real install.
+#[cfg(target_os = "linux")]
 fn ensure_webkit_paths() {
     const SYSTEM_HELPER: &str = "/usr/lib/webkit2gtk-4.1/WebKitNetworkProcess";
     if std::path::Path::new(SYSTEM_HELPER).exists() {
@@ -285,6 +286,9 @@ fn ensure_webkit_paths() {
         .exec();
     eprintln!("Comrade: re-exec failed: {err}");
 }
+
+#[cfg(not(target_os = "linux"))]
+fn ensure_webkit_paths() {}
 
 fn create_session(shared: &Shared, text: &str) -> String {
     shared
@@ -573,7 +577,7 @@ async fn voice_download_models(app: AppHandle, state: State<'_, Shared>) -> Resu
             }
             Err(e) => {
                 let msg: String = format!("{e}").chars().take(300).collect();
-                app.emit("voice-event", serde_json::json!({ "type": "voice-error", "message": msg })).ok();
+                app.emit("voice-event", serde_json::json!({ "type": "voice-download-error", "message": msg })).ok();
                 log(Level::Warn, "VOICE", "model download failed", Some(&serde_json::json!({ "error": msg })));
             }
         }
@@ -643,6 +647,15 @@ async fn get_prefs() -> Result<Prefs, String> {
 async fn save_prefs(prefs: Prefs) -> Result<Prefs, String> {
     prefs::save(&prefs).map_err(|e| truncate_err(e, 300))?;
     Ok(prefs::load())
+}
+
+/// Apply a browser choice immediately without saving unrelated settings.
+#[tauri::command]
+async fn save_browser_prefs(browser: BrowserPrefs) -> Result<Prefs, String> {
+    let mut prefs = prefs::load();
+    prefs.browser = browser;
+    prefs::save(&prefs).map_err(|e| truncate_err(e, 300))?;
+    Ok(prefs)
 }
 
 #[derive(Serialize)]
@@ -955,7 +968,8 @@ fn main() {
             system_browsers,
             system_coding_agents,
             get_prefs,
-            save_prefs
+            save_prefs,
+            save_browser_prefs
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Comrade");

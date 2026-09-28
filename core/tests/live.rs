@@ -1,7 +1,7 @@
 /** Live API checks. Ignored by default: `cargo test -p comrade-core -- --ignored`. */
 use comrade_core::config::load_config;
 use comrade_core::config::find_project_root;
-use comrade_core::llm::{ChatMessage, ChatOptions, Embedder, LlmProvider, OpenRouterEmbedder, OpenRouterProvider};
+use comrade_core::llm::{ChatMessage, ChatOptions, Embedder, LlmProvider, OpenRouterEmbedder};
 use comrade_core::llm::factory::create_configured;
 
 fn test_config() -> comrade_core::config::ComradeConfig {

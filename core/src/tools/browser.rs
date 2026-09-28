@@ -206,7 +206,7 @@ async fn run_close(args: &serde_json::Value) -> ToolResult {
     }
 }
 
-simple_tool!(OpenTool, "browser.open", "Open a URL in the persistent Comrade browser profile (any Chromium fork: Chrome, Brave, Edge, Opera, Vivaldi). Bare domains and search terms accepted.",
+simple_tool!(OpenTool, "browser.open", "Navigate the current Comrade tab in the browser selected in Settings. Reuses the same tab for successive URLs. Bare domains and search terms accepted. If browser setup fails, report the error; do not launch another browser or use a terminal URL opener.",
     serde_json::json!({"type":"object","properties":{"url":{"type":"string","description":"URL, domain, or search terms"}},"required":["url"]}), Risk::Safe, run_open);
 simple_tool!(BackTool, "browser.back", "Navigate back in history.",
     serde_json::json!({"type":"object","properties":{}}), Risk::Safe, run_back);

@@ -25,8 +25,6 @@ use std::sync::{
 };
 use std::time::Instant;
 
-use cpal::traits::HostTrait;
-
 use crate::logger::{log, Level};
 use crate::voice::chunk::SentenceBuffer;
 use crate::voice::stt::{StreamRecognizer, SherpaOnlineZipformer};
@@ -169,11 +167,9 @@ pub struct CpalPlayback {
 
 impl CpalPlayback {
     pub fn open_default(sample_rate: u32) -> anyhow::Result<Self> {
-        let host = cpal::default_host();
-        let device = host
-            .default_output_device()
-            .ok_or_else(|| anyhow::anyhow!("playback_unavailable: no default speaker"))?;
-        Ok(Self { player: crate::voice::playback::Player::open(&device, sample_rate)? })
+        Ok(Self {
+            player: crate::voice::playback::Player::open_default(sample_rate)?,
+        })
     }
 }
 
@@ -423,7 +419,7 @@ async fn run_turn(
     let mut diag_frames = 0usize;
     let mut diag_speech = 0usize;
     let mut diag_max_rms = 0.0f32;
-    let mut diag_reason: &str;
+    let diag_reason: &str;
 
     loop {
         tokio::select! {

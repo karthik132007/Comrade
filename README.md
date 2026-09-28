@@ -54,9 +54,24 @@ raise a modal approval; deny-by-default on 30s timeout.
 
 ## Setup
 
+Install the stable Rust toolchain first. On macOS, install Apple's command-line
+tools and CMake; Tauri uses the system WebKit framework, so the Linux setup
+script is not needed:
+
+```bash
+xcode-select --install  # skip if already installed
+brew install cmake      # or provide cmake another way
+cp .env.example .env
+cargo test -p comrade-core
+cargo run -p comrade-desktop
+```
+
+On Linux, install WebKitGTK and the native audio/build dependencies through the
+setup script, then build and run:
+
 ```bash
 cp .env.example .env   # DEEPSEEK_API_KEY + OPENROUTER_API_KEY (memory embeddings)
-./scripts/setup-linux.sh   # webkit2gtk-4.1 (pacman, or vendored into the comrade-agent home w/o sudo)
+./scripts/setup-linux.sh   # apt/dnf/pacman; rootless WebKit fallback on Arch
 cargo test -p comrade-core
 cargo run -p comrade-desktop
 ```
@@ -77,7 +92,8 @@ Useful commands: `cargo check --workspace`, `cargo clippy --workspace`,
   detected on your machine (Brave/Chrome/Chromium/Edge/Opera/Vivaldi, incl.
   flatpak), and tick which coding agents it may use (all enabled by default).
   Everything lives in `comrade.conf` and can be changed in
-  Settings → Preferences. Nothing is Brave-specific anymore.
+  Settings → Preferences. Browser, profile, headless mode, and debug-port changes
+  save automatically; the next task waits for that save to finish.
 - Coding tasks route to your default enabled agent (`coding.executeTask`):
   opencode, Claude Code, Codex, Copilot CLI, Qwen Code have real adapters;
   others appear for tracking until their CLIs support non-interactive runs.
@@ -88,5 +104,11 @@ Useful commands: `cargo check --workspace`, `cargo clippy --workspace`,
   `docs/VOICE.md` for architecture, models, tests, and troubleshooting.
 - DeepSeek validates function names strictly (`^[a-zA-Z0-9_-]+$`), so dotted
   tool names go on the wire as `namespace_tool` and are decoded back.
-- Browser tools are honest stubs until the automation phase.
+- Browser tools use the selected Chromium browser and reuse one tab across
+  navigation, reading, and clicking. A browser connection failure stops the task
+  with setup guidance instead of opening the system-default browser.
+- For Chrome 136+, select **Isolated Comrade profile** and sign into that Chrome
+  window as needed. [Chrome disables remote debugging of its normal profile](https://developer.chrome.com/blog/remote-debugging-port).
+  Existing debugging connections are used only when their process matches the
+  selected browser; ordinary personal browser windows are left running.
 - No system tray / wake-word yet — push-to-talk via the mic button.

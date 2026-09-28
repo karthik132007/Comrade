@@ -1,25 +1,70 @@
 #!/usr/bin/env bash
-# Comrade Linux setup: Tauri needs webkit2gtk-4.1 system libs.
-# - With sudo: installs from pacman (preferred).
+# Comrade Linux setup: Tauri needs WebKitGTK, ALSA, and native build tools.
+# - With sudo: installs them with pacman, apt, or dnf.
 # - Without sudo: vendors the Arch package into the comrade-agent home
 #   ($COMRADE_HOME, else ~/.config/comrade-agent) and wires .cargo/config.toml
 #   (PKG_CONFIG_PATH + linker search path + rpath).
 set -euo pipefail
+
+if [[ "$(uname -s)" != "Linux" ]]; then
+    echo "ERROR: scripts/setup-linux.sh is only for Linux; see README.md for macOS setup." >&2
+    exit 1
+fi
 
 MIRROR="https://mirror.rackspace.com/archlinux/extra/os/x86_64"
 COMRADE_HOME_DIR="${COMRADE_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/comrade-agent}"
 SYSROOT="$COMRADE_HOME_DIR/sysroot"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-if pkg-config --exists webkit2gtk-4.1 2>/dev/null; then
-    echo "webkit2gtk-4.1 already installed system-wide. Nothing to do."
+if pkg-config --exists webkit2gtk-4.1 alsa 2>/dev/null \
+    && command -v cc >/dev/null 2>&1 \
+    && command -v cmake >/dev/null 2>&1; then
+    echo "Linux native dependencies are already installed. Nothing to do."
     exit 0
 fi
 
-if sudo -n true 2>/dev/null; then
-    echo "Installing webkit2gtk-4.1 via pacman..."
-    sudo pacman -S --needed --noconfirm webkit2gtk-4.1
+CAN_SUDO=false
+if command -v sudo >/dev/null 2>&1; then
+    if sudo -n true 2>/dev/null; then
+        CAN_SUDO=true
+    elif [[ -t 0 ]] && sudo -v; then
+        CAN_SUDO=true
+    fi
+fi
+
+if [[ "$CAN_SUDO" == true ]]; then
+    if command -v pacman >/dev/null 2>&1; then
+        echo "Installing native dependencies via pacman..."
+        sudo pacman -S --needed --noconfirm base-devel pkgconf cmake clang webkit2gtk-4.1 alsa-lib
+    elif command -v apt-get >/dev/null 2>&1; then
+        echo "Installing native dependencies via apt..."
+        sudo apt-get update
+        sudo apt-get install -y build-essential pkg-config cmake clang libwebkit2gtk-4.1-dev libasound2-dev
+    elif command -v dnf >/dev/null 2>&1; then
+        echo "Installing native dependencies via dnf..."
+        sudo dnf install -y gcc gcc-c++ make pkgconf-pkg-config cmake clang webkit2gtk4.1-devel alsa-lib-devel
+    else
+        echo "ERROR: unsupported package manager. Install WebKitGTK 4.1, ALSA development headers, a C/C++ compiler, pkg-config, CMake, and Clang." >&2
+        exit 1
+    fi
     exit 0
+fi
+
+if ! command -v pacman >/dev/null 2>&1; then
+    echo "ERROR: rootless WebKit vendoring is supported only on Arch Linux." >&2
+    echo "Install WebKitGTK 4.1, ALSA development headers, a C/C++ compiler, pkg-config, CMake, and Clang, then rerun this script." >&2
+    exit 1
+fi
+
+for command_name in pkg-config cc cmake curl tar; do
+    if ! command -v "$command_name" >/dev/null 2>&1; then
+        echo "ERROR: missing required command: $command_name" >&2
+        exit 1
+    fi
+done
+if ! pkg-config --exists alsa 2>/dev/null; then
+    echo "ERROR: ALSA development files are missing (Arch package: alsa-lib)." >&2
+    exit 1
 fi
 
 # Consolidate a previous rootless install into the comrade-agent home.
