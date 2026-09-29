@@ -422,7 +422,10 @@ async fn start_voice_input(
             })
             .collect();
         emit(&app, serde_json::json!({ "type": "voice-models", "ready": false, "missing": missing }));
-        return Err("Voice models missing — open Settings → Download.".into());
+        return Err(format!(
+            "Voice models incomplete: {}. Open Settings → Download to resume.",
+            missing.join(", ")
+        ));
     }
     let engines = ensure_shared_engines(&shared.voice_engines, EngineBuildConfig {
         models_base: base,

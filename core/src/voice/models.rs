@@ -101,7 +101,17 @@ pub fn missing_files(base: &Path, pack: &ModelPack) -> Vec<String> {
             }
         }
         if !ok {
-            missing.push("<kokoro archive>".to_string());
+            let archive = pack.archive.as_ref().unwrap();
+            let partial = partial_download_path(&dir.join(archive.path));
+            let saved = std::fs::metadata(partial).map(|m| m.len()).unwrap_or(0);
+            if saved > 0 {
+                missing.push(format!(
+                    "Kokoro TTS incomplete ({:.1} MB saved; Download will resume)",
+                    saved as f64 / 1_048_576.0
+                ));
+            } else {
+                missing.push("Kokoro TTS not downloaded".to_string());
+            }
         }
     }
     missing
@@ -175,7 +185,18 @@ fn partial_download_path(dest: &Path) -> PathBuf {
     PathBuf::from(path)
 }
 
-/// Download one file with progress. Returns (bytes, sha256).
+fn partial_content_total(value: &str, expected_start: u64) -> Option<u64> {
+    let range = value.strip_prefix("bytes ")?;
+    let (span, total) = range.split_once('/')?;
+    let (start, end) = span.split_once('-')?;
+    let start = start.parse::<u64>().ok()?;
+    let end = end.parse::<u64>().ok()?;
+    let total = total.parse::<u64>().ok()?;
+    (start == expected_start && start <= end && end < total).then_some(total)
+}
+
+/// Download one file with progress. A partial transfer is kept separately and
+/// resumed with HTTP Range when the server supports it. Returns (bytes, sha256).
 async fn download_file(
     client: &reqwest::Client,
     file: &ModelFile,
@@ -187,19 +208,53 @@ async fn download_file(
         tokio::fs::create_dir_all(parent).await?;
     }
     let pending = partial_download_path(dest);
-    // A killed process may leave an incomplete temporary file behind. Never
-    // expose it under the final model filename and always restart it cleanly.
-    let _ = tokio::fs::remove_file(&pending).await;
-    let res = client.get(file.url).send().await.map_err(|e| {
+    let existing = tokio::fs::metadata(&pending).await.map(|m| m.len()).unwrap_or(0);
+    let mut request = client.get(file.url);
+    if existing > 0 {
+        request = request.header(reqwest::header::RANGE, format!("bytes={existing}-"));
+    }
+    let mut res = request.send().await.map_err(|e| {
         anyhow::anyhow!("model download failed for {}: {e}", file.path)
     })?;
+    if existing > 0 && res.status() == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+        tokio::fs::remove_file(&pending).await?;
+        res = client.get(file.url).send().await.map_err(|e| {
+            anyhow::anyhow!("model download failed for {}: {e}", file.path)
+        })?;
+    }
     if !res.status().is_success() {
         anyhow::bail!("model download failed for {}: HTTP {}", file.path, res.status());
     }
-    let total = res.content_length();
+    let resume_total = if existing > 0 && res.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+        res.headers().get(reqwest::header::CONTENT_RANGE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| partial_content_total(v, existing))
+    } else {
+        None
+    };
+    if existing > 0 && res.status() == reqwest::StatusCode::PARTIAL_CONTENT && resume_total.is_none() {
+        anyhow::bail!("model download returned an invalid Content-Range for {}", file.path);
+    }
+    let resumed = resume_total.is_some();
+    let total = if resumed { resume_total } else { res.content_length() };
     let mut hasher = sha2::Sha256::new();
-    let mut out = tokio::fs::File::create(&pending).await?;
-    let mut downloaded = 0u64;
+    let mut downloaded = if resumed { existing } else { 0 };
+    if resumed {
+        use tokio::io::AsyncReadExt;
+        let mut previous = tokio::fs::File::open(&pending).await?;
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            let n = previous.read(&mut buf).await?;
+            if n == 0 { break; }
+            hasher.update(&buf[..n]);
+        }
+        progress(DownloadProgress {
+            pack: String::new(), file: file.path.to_string(), downloaded, total,
+        });
+    }
+    let mut out = tokio::fs::OpenOptions::new()
+        .create(true).write(true).append(resumed).truncate(!resumed)
+        .open(&pending).await?;
     let mut stream = res.bytes_stream();
     use futures_util::StreamExt;
     use tokio::io::AsyncWriteExt;
@@ -219,7 +274,6 @@ async fn download_file(
     drop(out);
     if let Some(expected) = total {
         if downloaded != expected {
-            let _ = tokio::fs::remove_file(&pending).await;
             anyhow::bail!(
                 "model download incomplete for {}: got {downloaded}, want {expected}",
                 file.path
@@ -276,7 +330,6 @@ pub async fn ensure_models(
                     Err(e) => {
                         last_err = format!("{e}");
                         let _ = std::fs::remove_file(&dest); // never keep partials
-                        let _ = std::fs::remove_file(partial_download_path(&dest));
                         crate::logger::log(
                             crate::logger::Level::Warn,
                             "VOICE",
@@ -325,8 +378,11 @@ async fn extract_tts_archive(
     }
     let dest = dir.join(archive.path);
     if !dest.is_file() {
-        let client =
-            reqwest::Client::builder().user_agent("Comrade voice-model-manager").build()?;
+        let client = reqwest::Client::builder()
+            .user_agent("Comrade voice-model-manager")
+            .connect_timeout(std::time::Duration::from_secs(20))
+            .read_timeout(std::time::Duration::from_secs(60))
+            .build()?;
         let mut last_err = String::new();
         for attempt in 1..=3u32 {
             match download_file(&client, archive, &dest, &|mut p: DownloadProgress| {
@@ -342,7 +398,6 @@ async fn extract_tts_archive(
                 Err(e) => {
                     last_err = format!("{e}");
                     let _ = std::fs::remove_file(&dest);
-                    let _ = std::fs::remove_file(partial_download_path(&dest));
                     tokio::time::sleep(std::time::Duration::from_secs(2 * attempt as u64)).await;
                 }
             }
@@ -479,6 +534,24 @@ mod tests {
     }
 
     #[test]
+    fn status_identifies_an_interrupted_tts_download() {
+        let dir = std::env::temp_dir().join(format!(
+            "comrade-partial-status-test-{}", std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let pack = required_packs().into_iter().find(|p| p.id == "tts").unwrap();
+        let archive = dir.join("tts").join(pack.archive.as_ref().unwrap().path);
+        std::fs::create_dir_all(archive.parent().unwrap()).unwrap();
+        std::fs::write(partial_download_path(&archive), vec![0u8; 1024]).unwrap();
+
+        let missing = missing_files(&dir, &pack);
+        assert_eq!(missing.len(), 1);
+        assert!(missing[0].contains("incomplete"));
+        assert!(missing[0].contains("resume"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn manifest_round_trip() {
         let dir = std::env::temp_dir().join("comrade-manifest-test");
         let _ = std::fs::remove_dir_all(&dir);
@@ -565,6 +638,55 @@ mod tests {
         let events = events.into_inner().unwrap();
         assert!(events.iter().any(|event| event.file == "fixture.tar.bz2"));
         assert!(events.iter().any(|event| event.file == "extracting"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn interrupted_download_resumes_without_restarting() {
+        use sha2::Digest;
+        use std::io::{Read, Write};
+
+        let payload = fixture_tts_archive();
+        let split = 17usize;
+        let dir = std::env::temp_dir().join(format!(
+            "comrade-resume-test-{}", std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("fixture.tar.bz2");
+        std::fs::write(partial_download_path(&dest), &payload[..split]).unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            let mut request = [0u8; 2048];
+            let n = socket.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..n]).to_lowercase();
+            assert!(request.contains(&format!("range: bytes={split}-")), "{request}");
+            let remaining = &payload[split..];
+            let headers = format!(
+                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {split}-{}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                payload.len() - 1, payload.len(), remaining.len()
+            );
+            socket.write_all(headers.as_bytes()).unwrap();
+            socket.write_all(remaining).unwrap();
+            payload
+        });
+        let url: &'static str = Box::leak(format!("http://{address}/fixture.tar.bz2").into_boxed_str());
+        let file = ModelFile { path: "fixture.tar.bz2", url };
+        let events = std::sync::Mutex::new(Vec::new());
+        let client = reqwest::Client::new();
+        let (bytes, sha256) = download_file(&client, &file, &dest, &|event| {
+            events.lock().unwrap().push(event);
+        }).await.unwrap();
+        let full = server.join().unwrap();
+        assert_eq!(bytes, full.len() as u64);
+        assert_eq!(std::fs::read(&dest).unwrap(), full);
+        assert_eq!(sha256, format!("{:x}", sha2::Sha256::digest(&full)));
+        assert_eq!(events.lock().unwrap().first().unwrap().downloaded, split as u64);
+        assert!(!partial_download_path(&dest).exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

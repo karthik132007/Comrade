@@ -268,7 +268,6 @@
       } else if (!modelDownloadActive) {
         modelProgress.style.width = '0';
       }
-      if (!ev.ready) addMessage('comrade', 'Voice models missing — open Settings → Download.');
     } else if (ev.type === 'voice-download') {
       setModelDownloadActive(true);
       if (ev.file === 'extracting') {
