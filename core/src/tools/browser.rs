@@ -1,11 +1,11 @@
 /**
- * Browser tools — real Chromium-family automation over CDP.
+ * Browser tools — Comrade's own bundled Chromium, driven over CDP and shown
+ * only inside the app (resizable in-app pane, live screenshots).
  *
- * Any Chromium fork (Chrome, Brave, Edge, Opera, Vivaldi, Chromium) works:
- * the exe comes from Settings (`comrade.conf` [browser]), launched with
- * `--remote-debugging-port` against the persistent `browser-profile`.
- * Firefox-family browsers are detected and fail with FIREFOX_UNSUPPORTED
- * (WebDriver BiDi backend planned; same tool names will light up).
+ * There is no browser picker: the agent drives exactly one browser, the
+ * dedicated Chromium under `comrade-agent/browser/` with the isolated
+ * `browser-profile/`. It always runs headless, so nothing ever opens outside
+ * the app. `browser.open` navigates the single reused tab.
  */
 use std::future::Future;
 use std::pin::Pin;
@@ -206,7 +206,7 @@ async fn run_close(args: &serde_json::Value) -> ToolResult {
     }
 }
 
-simple_tool!(OpenTool, "browser.open", "Navigate the current Comrade tab in the browser selected in Settings. Reuses the same tab for successive URLs. Bare domains and search terms accepted. If browser setup fails, report the error; do not launch another browser or use a terminal URL opener.",
+simple_tool!(OpenTool, "browser.open", "Navigate Comrade's own in-app browser tab (bundled Chromium, shown in the resizable pane). Reuses the same tab for successive URLs. Bare domains and search terms accepted. If browser setup fails (bundled Chromium missing), report the error; do not launch another browser or use a terminal URL opener.",
     serde_json::json!({"type":"object","properties":{"url":{"type":"string","description":"URL, domain, or search terms"}},"required":["url"]}), Risk::Safe, run_open);
 simple_tool!(BackTool, "browser.back", "Navigate back in history.",
     serde_json::json!({"type":"object","properties":{}}), Risk::Safe, run_back);
@@ -230,7 +230,7 @@ simple_tool!(ShotTool, "browser.screenshot", "Capture a PNG screenshot to comrad
     serde_json::json!({"type":"object","properties":{}}), Risk::Safe, run_shot);
 simple_tool!(UrlTool, "browser.currentUrl", "Return the current URL.",
     serde_json::json!({"type":"object","properties":{}}), Risk::Safe, run_url);
-simple_tool!(CloseTool, "browser.close", "Close the managed browser.",
+simple_tool!(CloseTool, "browser.close", "Close Comrade's in-app browser (stops the bundled Chromium).",
     serde_json::json!({"type":"object","properties":{}}), Risk::Safe, run_close);
 
 /// Full registry handed to the agent loop.

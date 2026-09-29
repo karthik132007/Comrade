@@ -67,20 +67,42 @@ pub fn load_config(root: &Path) -> ComradeConfig {
     let get = |k: &str| -> String {
         std::env::var(k).ok().or_else(|| file_vars.get(k).cloned()).unwrap_or_default()
     };
+    // Non-secret knobs also live in comrade.conf for easy testing.
+    // Precedence: ENV > .env > comrade.conf > builtin default.
+    let conf = crate::prefs::load();
+    let conf_or = |env_val: String, conf_val: &str, fallback: &str| -> String {
+        if !env_val.is_empty() {
+            env_val
+        } else if !conf_val.trim().is_empty() {
+            conf_val.to_string()
+        } else {
+            fallback.to_string()
+        }
+    };
     let provider = get("LLM_PROVIDER").to_lowercase();
+    let provider = if !get("LLM_PROVIDER").is_empty() {
+        if provider == "openrouter" { "openrouter".into() } else { "deepseek".into() }
+    } else {
+        conf.llm.provider.clone()
+    };
     ComradeConfig {
         llm_provider: if provider == "openrouter" { "openrouter".into() } else { "deepseek".into() },
         deepseek_key: get("DEEPSEEK_API_KEY"),
         openrouter_key: get("OPENROUTER_API_KEY"),
-        llm_model: {
-            let m = get("LLM_MODEL");
-            if m.is_empty() { "deepseek-flash".into() } else { m }
+        llm_model: conf_or(get("LLM_MODEL"), &conf.llm.model, "deepseek-flash"),
+        embedding_model: conf_or(
+            get("EMBEDDING_MODEL"),
+            &conf.memory.embedding_model,
+            "openai/text-embedding-3-small",
+        ),
+        embedding_dim: {
+            let raw = get("EMBEDDING_DIM");
+            if !raw.is_empty() {
+                raw.parse().unwrap_or(conf.memory.embedding_dim)
+            } else {
+                conf.memory.embedding_dim
+            }
         },
-        embedding_model: {
-            let m = get("EMBEDDING_MODEL");
-            if m.is_empty() { "openai/text-embedding-3-small".into() } else { m }
-        },
-        embedding_dim: get("EMBEDDING_DIM").parse().unwrap_or(1536),
         profile_dir: expand_home(&{
             let m = get("COMRADE_PROFILE_DIR");
             if m.is_empty() {
@@ -89,8 +111,22 @@ pub fn load_config(root: &Path) -> ComradeConfig {
                 m
             }
         }),
-        max_steps: agent_max_steps(&get("AGENT_MAX_STEPS")),
-        timeout_ms: agent_timeout(&get("AGENT_TIMEOUT_MS")),
+        max_steps: {
+            let raw = get("AGENT_MAX_STEPS");
+            if !raw.is_empty() {
+                agent_max_steps(&raw)
+            } else {
+                conf.agent.max_steps
+            }
+        },
+        timeout_ms: {
+            let raw = get("AGENT_TIMEOUT_MS");
+            if !raw.is_empty() {
+                agent_timeout(&raw)
+            } else {
+                conf.agent.timeout_ms
+            }
+        },
     }
 }
 

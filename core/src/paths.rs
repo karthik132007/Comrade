@@ -61,8 +61,54 @@ pub fn memory_db_path() -> PathBuf {
 }
 
 pub fn profile_dir_default() -> PathBuf {
-    // One shared dir for the selected browser — never per-browser duplicates.
+    // Single isolated profile for Comrade's own bundled Chromium.
     comrade_home().join("browser-profile")
+}
+
+/// Directory holding Comrade's dedicated bundled Chromium
+/// (`comrade-agent/browser/chrome`). The agent drives only this binary —
+/// never any system browser — and it stays headless so the only visible
+/// window is the in-app browser pane.
+pub fn browser_dir() -> PathBuf {
+    comrade_home().join("browser")
+}
+
+/// Candidate executables for the bundled Chromium, in preference order.
+/// Overridable for tests via COMRADE_CHROMIUM_BIN. Covers both the minimal
+/// headless-shell build (Linux) and full `chrome` builds (macOS/Windows)
+/// as unpacked by the self-installer (see tools::provision).
+pub fn bundled_chromium_candidates() -> Vec<PathBuf> {
+    let dir = browser_dir();
+    let mut out = vec![
+        dir.join("chrome-headless-shell"),
+        dir.join("chrome"),
+        dir.join("chrome-linux64").join("chrome"),
+        dir.join("chrome-linux").join("chrome"),
+        dir.join("headless_shell"),
+    ];
+    if std::env::consts::OS == "windows" {
+        out.push(dir.join("chrome.exe"));
+        out.push(dir.join("chrome-win64").join("chrome.exe"));
+        out.push(dir.join("chrome-win").join("chrome.exe"));
+    }
+    if std::env::consts::OS == "macos" {
+        out.push(dir.join("chrome-mac-arm64").join("Google Chrome for Testing.app").join("Contents/MacOS/Google Chrome for Testing"));
+        out.push(dir.join("chrome-mac-x64").join("Google Chrome for Testing.app").join("Contents/MacOS/Google Chrome for Testing"));
+        out.push(dir.join("Google Chrome for Testing.app").join("Contents/MacOS/Google Chrome for Testing"));
+        out.push(dir.join("Chromium.app").join("Contents/MacOS/Chromium"));
+    }
+    out
+}
+
+/// Resolved bundled-Chromium executable, if provisioned.
+pub fn bundled_chromium_exe() -> Option<PathBuf> {
+    if let Ok(custom) = std::env::var("COMRADE_CHROMIUM_BIN") {
+        let p = PathBuf::from(custom.trim().to_string());
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    bundled_chromium_candidates().into_iter().find(|p| p.is_file())
 }
 
 /// Previous DB location (Tauri app_data_dir, pre-consolidation) for one-time move.
@@ -134,5 +180,14 @@ mod tests {
         assert!(comrade_home().ends_with(APP_DIR_NAME));
         assert!(memory_db_path().ends_with("comrade-agent/comrade-memory.db"));
         assert!(profile_dir_default().ends_with("comrade-agent/browser-profile"));
+        assert!(browser_dir().ends_with("comrade-agent/browser"));
+    }
+
+    #[test]
+    fn bundled_chromium_override_wins() {
+        let exe = std::env::current_exe().unwrap();
+        std::env::set_var("COMRADE_CHROMIUM_BIN", exe.to_string_lossy().to_string());
+        assert_eq!(bundled_chromium_exe(), Some(exe));
+        std::env::remove_var("COMRADE_CHROMIUM_BIN");
     }
 }

@@ -1,13 +1,15 @@
-//! Live Chromium CDP checks, ignored by default because they start a browser.
-//! Set COMRADE_HOME to a fresh scratch directory and optionally set
-//! COMRADE_TEST_BROWSER to an executable; otherwise native Chrome is detected.
+//! Live bundled-Chromium CDP checks, ignored by default because they start a browser.
+//! Set COMRADE_HOME to a fresh scratch directory and COMRADE_CHROMIUM_BIN to a
+//! Chromium executable (or pre-provision comrade-agent/browser/ and unset the override).
 //! Run with `cargo test -p comrade-core --test browser_cdp -- --ignored`.
+//! `live_self_install_*` needs network: it proves the first-run path — empty
+//! home, no binary, the app downloads and drives its own browser.
 //! All profiles and pages stay in the supplied scratch directory. Tests are
 //! serialized because the driver and COMRADE_HOME are process-wide.
 
-use comrade_core::tools::browser_driver;
+use comrade_core::tools::{browser_driver, provision};
 use serde_json::Value;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -16,7 +18,7 @@ static TEST_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 struct TestContext {
     home: PathBuf,
     original_home: std::ffi::OsString,
-    browser: PathBuf,
+    original_bin: Option<std::ffi::OsString>,
     _guard: tokio::sync::MutexGuard<'static, ()>,
 }
 
@@ -31,7 +33,7 @@ impl TestContext {
         );
         let root = PathBuf::from(&original_home);
         assert!(
-            !root.join("comrade.conf").exists() && !root.join("browser-profile").exists(),
+            !root.join("browser-profile").exists(),
             "COMRADE_HOME must be a scratch directory, not an existing Comrade home"
         );
         let stamp = SystemTime::now()
@@ -41,26 +43,17 @@ impl TestContext {
         let home = root.join(format!("{name}-{}-{stamp}", std::process::id()));
         std::fs::create_dir_all(&home).expect("create test scratch directory");
         let home = std::fs::canonicalize(home).unwrap();
-        let browser = test_browser();
+        // The bundled binary under test: explicit bin wins, else a provisioned
+        // browser/ dir under the scratch home.
+        let original_bin = std::env::var_os("COMRADE_CHROMIUM_BIN");
+        let exe = test_chromium_exe(&home);
         browser_driver::close_chromium().await;
         std::env::set_var("COMRADE_HOME", &home);
-        Self {
-            home,
-            original_home,
-            browser,
-            _guard: guard,
-        }
-    }
-
-    fn configure(&self, exe: &Path, profile: &str, debug_port: u16) {
-        std::fs::write(
-            self.home.join("comrade.conf"),
-            format!(
-                "[browser]\nexe = {}\nkind = binary\nheadless = true\nprofile = {profile}\ndebug_port = {debug_port}\n",
-                exe.display()
-            ),
-        )
-        .expect("write scratch browser settings");
+        std::env::set_var(
+            "COMRADE_CHROMIUM_BIN",
+            exe.to_string_lossy().to_string(),
+        );
+        Self { home, original_home, original_bin, _guard: guard }
     }
 
     fn page(&self, name: &str) -> String {
@@ -79,50 +72,26 @@ impl TestContext {
 impl Drop for TestContext {
     fn drop(&mut self) {
         std::env::set_var("COMRADE_HOME", &self.original_home);
+        match &self.original_bin {
+            Some(v) => std::env::set_var("COMRADE_CHROMIUM_BIN", v),
+            None => std::env::remove_var("COMRADE_CHROMIUM_BIN"),
+        }
     }
 }
 
-fn test_browser() -> PathBuf {
-    if let Some(exe) = std::env::var_os("COMRADE_TEST_BROWSER") {
+fn test_chromium_exe(home: &PathBuf) -> PathBuf {
+    if let Some(exe) = std::env::var_os("COMRADE_CHROMIUM_BIN") {
         let exe = PathBuf::from(exe);
-        assert!(
-            exe.is_file(),
-            "COMRADE_TEST_BROWSER is not an executable file: {}",
-            exe.display()
-        );
+        assert!(exe.is_file(), "COMRADE_CHROMIUM_BIN is not a file: {}", exe.display());
         return std::fs::canonicalize(exe).unwrap();
     }
-    let mut candidates = Vec::new();
-    if cfg!(target_os = "macos") {
-        candidates.extend([
-            PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
-            PathBuf::from("/Applications/Chromium.app/Contents/MacOS/Chromium"),
-        ]);
-    }
-    if cfg!(target_os = "windows") {
-        for base in ["PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"] {
-            if let Some(base) = std::env::var_os(base) {
-                candidates.push(PathBuf::from(base).join("Google/Chrome/Application/chrome.exe"));
-            }
+    for candidate in comrade_core::paths::bundled_chromium_candidates() {
+        if candidate.is_file() {
+            return std::fs::canonicalize(candidate).unwrap();
         }
     }
-    if let Some(path) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path) {
-            for name in [
-                "google-chrome-stable",
-                "google-chrome",
-                "chromium",
-                "chromium-browser",
-            ] {
-                candidates.push(dir.join(name));
-            }
-        }
-    }
-    candidates
-        .into_iter()
-        .find(|path| path.is_file())
-        .map(|path| std::fs::canonicalize(path).unwrap())
-        .expect("no native Chrome found; set COMRADE_TEST_BROWSER to its executable")
+    let _ = home;
+    panic!("no bundled Chromium found; set COMRADE_CHROMIUM_BIN or provision browser/ via scripts/fetch-chromium.sh");
 }
 
 fn client() -> reqwest::Client {
@@ -149,57 +118,13 @@ async fn page_targets(port: u16) -> Vec<Value> {
         .collect()
 }
 
-async fn debugger_alive(port: u16) -> bool {
-    client()
-        .get(format!("http://127.0.0.1:{port}/json/version"))
-        .send()
-        .await
-        .map(|response| response.status().is_success())
-        .unwrap_or(false)
-}
-
-async fn start_external_browser(context: &TestContext) -> (tokio::process::Child, u16) {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    let profile = context.home.join("attach-profile");
-    std::fs::create_dir_all(&profile).unwrap();
-    let child = tokio::process::Command::new(&context.browser)
-        .args([
-            format!("--remote-debugging-port={port}"),
-            "--remote-allow-origins=*".to_string(),
-            format!("--user-data-dir={}", profile.display()),
-            "--no-first-run".to_string(),
-            "--no-default-browser-check".to_string(),
-            "--disable-dev-shm-usage".to_string(),
-            "--no-sandbox".to_string(),
-            "--headless=new".to_string(),
-            "--disable-gpu".to_string(),
-            "about:blank".to_string(),
-        ])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .expect("start external browser with a scratch profile");
-    for _ in 0..60 {
-        if debugger_alive(port).await {
-            return (child, port);
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
-    panic!("external browser never exposed DevTools");
-}
-
 #[tokio::test]
 #[ignore]
-async fn live_chromium_reuses_one_tab_and_keeps_it_selected() {
+async fn live_bundled_chromium_reuses_one_tab_and_stays_headless() {
     let context = TestContext::new("navigation").await;
-    context.configure(&context.browser, "comrade", 0);
     let port = browser_driver::ensure_chromium()
         .await
-        .expect("launch Chromium");
+        .expect("launch bundled Chromium");
     let initial = page_targets(port).await;
     assert!(initial.len() <= 1, "a fresh browser must not create extra tabs");
     let first_url = context.page("initial");
@@ -244,6 +169,13 @@ async fn live_chromium_reuses_one_tab_and_keeps_it_selected() {
         "screenshot missing: {}",
         screenshot.display()
     );
+    let bytes = browser_driver::screenshot_bytes()
+        .await
+        .expect("live-view bytes for the in-app pane");
+    assert!(!bytes.is_empty(), "in-app pane screenshot must not be empty");
+
+    let snap = browser_driver::state_snapshot().await;
+    assert_eq!(snap["running"], true);
 
     // A tab opened separately must not steal subsequent reads/navigation.
     let unrelated: Value = client()
@@ -292,89 +224,65 @@ async fn live_chromium_reuses_one_tab_and_keeps_it_selected() {
         browser_driver::close_chromium().await,
         browser_driver::CloseOutcome::Closed
     );
+    let snap = browser_driver::state_snapshot().await;
+    assert_eq!(snap["running"], false);
 }
 
+/// First-run path: empty home, no binary, no override — the app must
+/// download its own browser and drive it. Needs network (≈100MB download).
 #[tokio::test]
 #[ignore]
-async fn live_attachment_honors_browser_and_profile_changes() {
-    let context = TestContext::new("attachment").await;
-    let (mut child, external_port) = start_external_browser(&context).await;
-    context.configure(&context.browser, "user", external_port);
+async fn live_self_install_provisions_and_drives_browser() {
+    let _guard = TEST_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+    let original_home = std::env::var_os("COMRADE_HOME").expect(
+        "set COMRADE_HOME to a fresh scratch directory before running live browser tests",
+    );
+    let original_bin = std::env::var_os("COMRADE_CHROMIUM_BIN");
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let home = PathBuf::from(&original_home).join(format!("install-{}-{stamp}", std::process::id()));
+    std::fs::create_dir_all(&home).expect("create test scratch directory");
+    let home = std::fs::canonicalize(home).unwrap();
+    assert!(
+        !home.join("browser").exists(),
+        "self-install test needs a home with no provisioned browser"
+    );
+    std::env::set_var("COMRADE_HOME", &home);
+    std::env::remove_var("COMRADE_CHROMIUM_BIN");
+    browser_driver::close_chromium().await;
+
+    let exe = provision::ensure_provisioned()
+        .await
+        .expect("self-install the bundled browser");
+    assert!(exe.is_file(), "missing binary: {}", exe.display());
+    let status = provision::status_json();
+    assert_eq!(status["installed"], true);
+    assert_eq!(status["phase"], "done");
+
+    // The freshly installed browser must actually drive.
     let port = browser_driver::ensure_chromium()
         .await
-        .expect("attach to external browser");
-    assert_eq!(
-        port, external_port,
-        "attach without launching a second browser"
-    );
-    let url = context.page("attached");
-    browser_driver::page_navigate(port, &url)
-        .await
-        .expect("navigate attached browser");
-
-    // Changing the chosen executable must invalidate the cached attachment.
-    context.configure(&context.home.join("missing-browser"), "user", external_port);
-    let error = browser_driver::ensure_chromium()
-        .await
-        .expect_err("missing selection must fail");
-    assert!(
-        error.starts_with("BROWSER_NOT_FOUND:"),
-        "unexpected error: {error}"
-    );
-
-    // The listener is real Chrome, but this selected executable is different.
-    // A test executable has no real browser profile; even a failed check cannot
-    // reach the user's Chrome profile.
-    context.configure(&std::env::current_exe().unwrap(), "user", external_port);
-    let error = browser_driver::ensure_chromium()
-        .await
-        .expect_err("wrong browser must not attach");
-    assert!(
-        error.starts_with("DEBUG_BROWSER_MISMATCH:"),
-        "unexpected error: {error}"
-    );
-    assert!(
-        debugger_alive(external_port).await,
-        "selection changes must not kill an attached browser"
-    );
-
-    context.configure(&context.browser, "user", external_port);
-    assert_eq!(
-        browser_driver::ensure_chromium().await.unwrap(),
-        external_port
-    );
-    assert_eq!(
-        browser_driver::close_chromium().await,
-        browser_driver::CloseOutcome::Detached
-    );
-    assert!(
-        debugger_alive(external_port).await,
-        "detach must leave the external browser running"
-    );
-    assert_eq!(
-        browser_driver::ensure_chromium().await.unwrap(),
-        external_port
-    );
-
-    // Switching to an isolated profile must not keep using the live user tab,
-    // even if the saved debug port still points at that external browser.
-    context.configure(&context.browser, "comrade", external_port);
-    let isolated_port = browser_driver::ensure_chromium()
-        .await
-        .expect("launch isolated browser");
-    assert_ne!(
-        isolated_port, external_port,
-        "profile changes must replace the cached attachment"
-    );
-    assert_eq!(page_targets(external_port).await.len(), 1);
-    assert_eq!(page_targets(external_port).await[0]["url"], url);
+        .expect("launch self-installed browser");
+    let page = home.join("hello.html");
+    std::fs::write(&page, "<!doctype html><title>hello</title><h1>hello</h1>").unwrap();
+    let url = reqwest::Url::from_file_path(page).unwrap().to_string();
+    let (_, current) = browser_driver::page_navigate(port, &url).await.expect("navigate");
+    assert_eq!(current, url);
+    let (title, _) = browser_driver::page_title(port).await.expect("title");
+    assert_eq!(title, "hello");
     assert_eq!(
         browser_driver::close_chromium().await,
         browser_driver::CloseOutcome::Closed
     );
-    assert!(
-        debugger_alive(external_port).await,
-        "closing isolated browser must preserve external browser"
-    );
-    child.kill().await.expect("stop scratch external browser");
+
+    std::env::set_var("COMRADE_HOME", &original_home);
+    match &original_bin {
+        Some(v) => std::env::set_var("COMRADE_CHROMIUM_BIN", v),
+        None => std::env::remove_var("COMRADE_CHROMIUM_BIN"),
+    }
 }

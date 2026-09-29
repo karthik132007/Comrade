@@ -16,11 +16,13 @@
       </div>
       <div class="head-right">
         <div id="status-pill" class="pill idle"><span class="dot"></span><span id="status-text">READY</span></div>
+        <button id="browser-btn" type="button" title="Toggle in-app browser">🌐</button>
         <button id="settings-btn" type="button" title="Settings & memory">⚙</button>
       </div>
     </header>
 
-    <main>
+    <main id="workarea">
+      <section id="chat-col">
       <section id="hero">
         <div id="orb" class="orb idle">
           <div class="ring r1"></div>
@@ -45,6 +47,25 @@
       </section>
 
       <section id="chat"><div id="messages"></div></section>
+      </section>
+
+      <div id="browser-divider" hidden title="Drag to resize the browser pane"></div>
+
+      <aside id="browser-pane" hidden aria-label="In-app browser">
+        <div class="browser-bar">
+          <button id="browser-back" type="button" title="Back">‹</button>
+          <button id="browser-forward" type="button" title="Forward">›</button>
+          <button id="browser-reload" type="button" title="Reload">↻</button>
+          <form id="browser-form">
+            <input id="browser-url" type="text" placeholder="https://…" autocomplete="off" spellcheck="false" />
+          </form>
+          <button id="browser-shot" type="button" title="Refresh view">⤾</button>
+          <button id="browser-hide" type="button" title="Hide browser">✕</button>
+        </div>
+        <div id="browser-title" class="muted">Comrade's browser — shown only here, inside the app.</div>
+        <div id="browser-view" class="idle"><img id="browser-img" alt="In-app browser view" /></div>
+        <div id="browser-status" class="muted"></div>
+      </aside>
     </main>
 
     <footer>
@@ -62,14 +83,8 @@
     <div class="onboard-card">
       <img src="logo.png" alt="Comrade logo" />
       <h1>Welcome to Comrade.</h1>
-      <p class="muted">Choose the browser Comrade will drive. With your own
-        profile it opens your tabs and logins — Gmail and all.</p>
-      <div id="browser-list"></div>
-      <div class="row checks">
-        <label class="check"><input type="radio" name="ob-profile" value="user" checked /> Use my profile (logged in)</label>
-        <label class="check"><input type="radio" name="ob-profile" value="comrade" /> Isolated Comrade profile</label>
-      </div>
-      <label class="check"><input id="ob-headless" type="checkbox" /> Run browser hidden (headless)</label>
+      <p class="muted">Comrade brings its own browser — it lives only inside
+        this app (resizable pane, no setup). Pick the coding agents it may use.</p>
       <h2 class="ob-section">Coding agents</h2>
       <p class="muted">Comrade delegates code tasks to these. All enabled by default.</p>
       <div id="agent-list"></div>
@@ -103,23 +118,23 @@
       <button id="settings-close" type="button">✕</button>
     </div>
     <div class="settings-body">
-      <h3>Preferences</h3>
-      <label class="muted" for="pref-browser">Browser</label>
-      <select id="pref-browser"></select>
-      <div class="row">
-        <label class="muted" for="pref-profile">Profile</label>
-        <select id="pref-profile">
-          <option value="user">My profile (logged in)</option>
-          <option value="comrade">Isolated Comrade profile</option>
-        </select>
-        <label class="muted" for="pref-debugport">Debug port</label>
-        <input id="pref-debugport" type="number" min="0" max="65535" step="1" title="Attach here first when your browser runs with --remote-debugging-port (0 = off)" />
-      </div>
-      <div id="browser-help" class="muted" hidden></div>
+      <h3>In-app browser</h3>
+      <p class="muted">Comrade drives its own bundled Chromium — nothing to
+        install or pick, and it never opens outside this app. The pane shows
+        exactly what the agent sees; drag the divider to resize it.</p>
       <div class="row checks">
-        <label class="check"><input id="pref-headless" type="checkbox" /> Headless</label>
+        <label class="check"><input id="pref-autoshow" type="checkbox" /> Auto-show on browser use</label>
         <label class="check"><input id="pref-autoplay" type="checkbox" /> Voice autoplay</label>
         <button id="pref-save" type="button">Save</button>
+      </div>
+      <div class="row">
+        <label class="muted" for="pref-bwidth">Pane width <span id="pref-bwidth-val"></span></label>
+        <input id="pref-bwidth" type="range" min="20" max="70" step="1" />
+      </div>
+      <div class="row">
+        <button id="pane-open-btn" type="button">Open pane</button>
+        <button id="pane-shot-btn" type="button">Refresh view</button>
+        <button id="pane-close-btn" type="button">Stop browser</button>
       </div>
       <div id="pref-status" class="muted"></div>
       <div id="pref-file" class="muted"></div>

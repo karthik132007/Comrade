@@ -145,16 +145,11 @@
     var text = input.value.trim();
     if (!text || messageStarting) return;
     messageStarting = true;
-    var startVersion = taskStartVersion;
-    waitForBrowserPrefs().then(function () {
-      messageStarting = false;
-      if (startVersion !== taskStartVersion) return null;
-      if (input.value.trim() === text) input.value = '';
-      addMessage('user', text);
-      resetTaskPanel(text);
-      currentResponseEl = null;
-      return invoke('send_message', { text: text, sessionId: currentSessionId });
-    }).then(function (res) {
+    if (input.value.trim() === text) input.value = '';
+    addMessage('user', text);
+    resetTaskPanel(text);
+    currentResponseEl = null;
+    invoke('send_message', { text: text, sessionId: currentSessionId }).then(function (res) {
       if (!res) return;
       if (res.session_id) { setSession(res.session_id); refreshChatList(); }
       if (res.status === 'done' || res.status === 'running') return;
@@ -192,14 +187,10 @@
     voiceActive = true;
     voiceStartPending = true;
     var startVersion = ++voiceStartVersion;
-    var taskVersion = taskStartVersion;
     micBtn.classList.add('live');
     currentResponseEl = null;
-    waitForBrowserPrefs().then(function () {
-      if (!voiceActive || startVersion !== voiceStartVersion || taskVersion !== taskStartVersion) return null;
-      voiceStartPending = false;
-      return invoke('start_voice_input', { oneShot: oneShot, sessionId: currentSessionId });
-    }).then(function (res) {
+    voiceStartPending = false;
+    invoke('start_voice_input', { oneShot: oneShot, sessionId: currentSessionId }).then(function (res) {
       if (startVersion !== voiceStartVersion) return;
       voiceStartPending = false;
       if (res === 'started') return;
@@ -310,11 +301,13 @@
       currentResponseEl = null;
     } else if (ev.type === 'step') {
       upsertStep(ev.label, ev.status, ev.detail);
+      if (ev.label && ev.label.indexOf('browser.') === 0) onBrowserActivity();
     } else if (ev.type === 'token') {
       if (!currentResponseEl) currentResponseEl = addMessage('comrade', '');
       currentResponseEl.textContent += ev.token;
     } else if (ev.type === 'done') {
       setState(ev.status === 'done' ? 'idle' : 'error');
+      if (browserIsOpen) refreshBrowser();
       if (ev.status !== 'done' && ev.error) addMessage('comrade', 'Error: ' + ev.error);
     }
   }
@@ -565,202 +558,299 @@
     });
   }
 
+  /* --- in-app browser pane (bundled Chromium, live screenshots) ---
+     The agent drives exactly one browser — Comrade's own bundled Chromium,
+     always headless so nothing opens outside the app. This pane is its only
+     visible surface: a live screenshot view with an address bar, resizable
+     via the divider, all inside the app. */
+  var browserBtn = document.getElementById('browser-btn');
+  var browserPane = document.getElementById('browser-pane');
+  var browserDivider = document.getElementById('browser-divider');
+  var browserForm = document.getElementById('browser-form');
+  var browserUrl = document.getElementById('browser-url');
+  var browserImg = document.getElementById('browser-img');
+  var browserView = document.getElementById('browser-view');
+  var browserTitle = document.getElementById('browser-title');
+  var browserStatus = document.getElementById('browser-status');
+  var browserBackBtn = document.getElementById('browser-back');
+  var browserFwdBtn = document.getElementById('browser-forward');
+  var browserReloadBtn = document.getElementById('browser-reload');
+  var browserShotBtn = document.getElementById('browser-shot');
+  var browserHideBtn = document.getElementById('browser-hide');
+  var browserIsOpen = false;
+  var browserAutoShow = true;
+  var browserRefreshing = false;
+
+  function clampWidth(pct) {
+    pct = Math.round(Number(pct) || 45);
+    return Math.max(20, Math.min(70, pct));
+  }
+
+  function applyBrowserWidth(pct, persist) {
+    pct = clampWidth(pct);
+    document.documentElement.style.setProperty('--browser-w', pct + '%');
+    try { window.localStorage.setItem('comrade-browser-width', String(pct)); } catch (e) { /* noop */ }
+    var slider = document.getElementById('pref-bwidth');
+    var val = document.getElementById('pref-bwidth-val');
+    if (slider) slider.value = String(pct);
+    if (val) val.textContent = pct + '%';
+    if (persist) persistBrowserPrefs();
+    return pct;
+  }
+
+  function setBrowserOpen(open, refresh) {
+    browserIsOpen = !!open;
+    document.body.classList.toggle('browser-open', browserIsOpen);
+    if (browserPane) browserPane.hidden = !browserIsOpen;
+    if (browserDivider) browserDivider.hidden = !browserIsOpen;
+    try { window.localStorage.setItem('comrade-browser-open', browserIsOpen ? '1' : '0'); } catch (e) { /* noop */ }
+    if (browserIsOpen && refresh !== false) ensureBrowserReady();
+  }
+
+  // Browser self-install: the built-in Chromium downloads itself once
+  // (first launch / first use). While that runs, the pane shows live %.
+  var browserInstallTimer = null;
+
+  function fmtBytes(n) {
+    n = Number(n) || 0;
+    if (n >= 1048576) return (n / 1048576).toFixed(1) + 'MB';
+    if (n >= 1024) return Math.round(n / 1024) + 'KB';
+    return n + 'B';
+  }
+
+  function stopInstallPoll() {
+    if (browserInstallTimer) { clearInterval(browserInstallTimer); browserInstallTimer = null; }
+  }
+
+  function pollBrowserInstall(done) {
+    stopInstallPoll();
+    browserInstallTimer = setInterval(function () {
+      invoke('browser_provision_status', {}).then(function (st) {
+        st = st || {};
+        if (st.installed) { stopInstallPoll(); done(true); return; }
+        if (st.phase === 'failed') {
+          stopInstallPoll();
+          if (browserStatus) browserStatus.textContent = 'Install failed: ' + String(st.error || 'unknown error').slice(0, 160);
+          done(false);
+          return;
+        }
+        var label = 'Installing built-in browser (one-time)';
+        if (st.phase === 'resolving') label += ' — finding latest release…';
+        else if (st.phase === 'extracting') label += ' — unpacking…';
+        else if (st.total) label += ' — ' + Math.round(100 * st.downloaded / st.total) + '% (' + fmtBytes(st.downloaded) + ' / ' + fmtBytes(st.total) + ')';
+        else if (st.downloaded) label += ' — ' + fmtBytes(st.downloaded) + '…';
+        else label += '…';
+        if (browserStatus) browserStatus.textContent = label;
+      }).catch(function () { /* keep polling */ });
+    }, 1000);
+  }
+
+  function isInstallError(msg) {
+    return /BROWSER_SETUP|install|download|connection|network|offline|release index/i.test(msg || '');
+  }
+
+  // Ensure the built-in browser is installed and running, showing install
+  // progress in the pane. Resolves true when the live view is refreshing.
+  function ensureBrowserReady() {
+    if (browserStatus) browserStatus.textContent = 'Starting built-in browser…';
+    return invoke('browser_ensure', {}).then(function (st) {
+      stopInstallPoll();
+      st = st || {};
+      if (st.url && browserUrl) browserUrl.value = st.url;
+      if (st.title && browserTitle) browserTitle.textContent = st.title + (st.url ? ' — ' + st.url : '');
+      refreshBrowser();
+      return true;
+    }).catch(function (err) {
+      var msg = errMsg(err);
+      if (!isInstallError(msg)) {
+        if (browserStatus) browserStatus.textContent = 'Browser unavailable: ' + msg;
+        return false;
+      }
+      if (browserStatus) browserStatus.textContent = 'Installing built-in browser (one-time)…';
+      return new Promise(function (resolve) {
+        pollBrowserInstall(function (ok) {
+          if (ok) ensureBrowserReady().then(resolve);
+          else resolve(false);
+        });
+      });
+    });
+  }
+
+  function refreshBrowser() {
+    if (browserRefreshing) return;
+    browserRefreshing = true;
+    if (browserStatus) browserStatus.textContent = 'updating…';
+    invoke('browser_state', {}).then(function (st) {
+      st = st || {};
+      if (st.url && browserUrl && document.activeElement !== browserUrl) browserUrl.value = st.url;
+      if (browserTitle) browserTitle.textContent = st.title ? st.title + ' — ' + (st.url || '') : (st.url || 'Comrade\u2019s browser — shown only here, inside the app.');
+      if (!st.running) {
+        if (browserStatus) browserStatus.textContent = 'Browser is idle. Open a page or run a task.';
+        if (browserView) browserView.classList.add('idle');
+        return null;
+      }
+      if (browserView) browserView.classList.remove('idle');
+      return invoke('browser_screenshot', {});
+    }).then(function (dataUrl) {
+      if (dataUrl && browserImg) browserImg.src = dataUrl;
+      if (browserStatus) browserStatus.textContent = '';
+    }).catch(function (err) {
+      var msg = errMsg(err);
+      if (isInstallError(msg)) { ensureBrowserReady(); return; }
+      if (browserStatus) browserStatus.textContent = 'Browser unavailable: ' + msg;
+    }).then(function () {
+      browserRefreshing = false;
+    });
+  }
+
+  // Browser mode: auto-show the pane when the agent touches the browser.
+  function onBrowserActivity() {
+    if (browserAutoShow && !browserIsOpen) setBrowserOpen(true);
+    else if (browserIsOpen) refreshBrowser();
+    else if (browserStatus) browserStatus.textContent = 'Agent is browsing (pane hidden).';
+  }
+
+  if (browserBtn) browserBtn.addEventListener('click', function () { setBrowserOpen(!browserIsOpen); });
+  if (browserHideBtn) browserHideBtn.addEventListener('click', function () { setBrowserOpen(false); });
+  if (browserShotBtn) browserShotBtn.addEventListener('click', refreshBrowser);
+  if (browserBackBtn) browserBackBtn.addEventListener('click', function () {
+    invoke('browser_back', {}).then(function (r) {
+      if (r && r.url && browserUrl) browserUrl.value = r.url;
+      refreshBrowser();
+    }).catch(function (err) { if (browserStatus) browserStatus.textContent = 'Back failed: ' + errMsg(err); });
+  });
+  if (browserFwdBtn) browserFwdBtn.addEventListener('click', function () {
+    invoke('browser_forward', {}).then(function (r) {
+      if (r && r.url && browserUrl) browserUrl.value = r.url;
+      refreshBrowser();
+    }).catch(function (err) { if (browserStatus) browserStatus.textContent = 'Forward failed: ' + errMsg(err); });
+  });
+  if (browserReloadBtn) browserReloadBtn.addEventListener('click', function () {
+    invoke('browser_reload', {}).then(refreshBrowser).catch(function (err) {
+      if (browserStatus) browserStatus.textContent = 'Reload failed: ' + errMsg(err);
+    });
+  });
+  if (browserForm) browserForm.addEventListener('submit', function (ev) {
+    ev.preventDefault();
+    var url = browserUrl.value.trim();
+    if (!url) return;
+    if (browserStatus) browserStatus.textContent = 'loading…';
+    invoke('browser_open', { url: url }).then(function (r) {
+      if (r && r.url && browserUrl) browserUrl.value = r.url;
+      refreshBrowser();
+    }).catch(function (err) {
+      if (isInstallError(errMsg(err))) { ensureBrowserReady(); return; }
+      if (browserStatus) browserStatus.textContent = 'Open failed: ' + errMsg(err);
+    });
+  });
+
+  // Drag the divider to resize the pane (in-app only).
+  (function wireDivider() {
+    if (!browserDivider) return;
+    var dragging = false;
+    browserDivider.addEventListener('mousedown', function (ev) {
+      ev.preventDefault();
+      dragging = true;
+      browserDivider.classList.add('drag');
+    });
+    document.addEventListener('mousemove', function (ev) {
+      if (!dragging) return;
+      var rect = document.getElementById('workarea').getBoundingClientRect();
+      var pct = 100 * (rect.right - ev.clientX) / Math.max(rect.width, 1);
+      applyBrowserWidth(pct, false);
+    });
+    document.addEventListener('mouseup', function () {
+      if (!dragging) return;
+      dragging = false;
+      browserDivider.classList.remove('drag');
+      var slider = document.getElementById('pref-bwidth');
+      applyBrowserWidth(slider ? slider.value : 45, true);
+    });
+  })();
+
+  // Restore pane size/open state from the last session immediately.
+  try {
+    var savedW = window.localStorage.getItem('comrade-browser-width');
+    if (savedW) applyBrowserWidth(savedW, false);
+    else applyBrowserWidth(45, false);
+  } catch (e) { /* noop */ }
+
   /* --- onboarding + preferences (comrade.conf) --- */
   var onboardingEl = document.getElementById('onboarding');
-  var browserList = document.getElementById('browser-list');
-  var obHeadless = document.getElementById('ob-headless');
   var obContinue = document.getElementById('ob-continue');
   var obStatus = document.getElementById('ob-status');
-  var prefBrowser = document.getElementById('pref-browser');
-  var prefProfile = document.getElementById('pref-profile');
-  var prefDebugPort = document.getElementById('pref-debugport');
-  var prefHeadless = document.getElementById('pref-headless');
+  var prefAutoshow = document.getElementById('pref-autoshow');
   var prefAutoplay = document.getElementById('pref-autoplay');
   var prefSave = document.getElementById('pref-save');
   var prefStatus = document.getElementById('pref-status');
   var prefFile = document.getElementById('pref-file');
-  var browserHelp = document.getElementById('browser-help');
-  var detectedBrowsers = [];
-  var prefsWriteQueue = Promise.resolve();
-  var browserPrefsError = null;
-  var browserEditRevision = 0;
-  var settingsLoadRevision = 0;
+  var prefBwidth = document.getElementById('pref-bwidth');
+  var prefBwidthVal = document.getElementById('pref-bwidth-val');
+  var paneOpenBtn = document.getElementById('pane-open-btn');
+  var paneShotBtn = document.getElementById('pane-shot-btn');
+  var paneCloseBtn = document.getElementById('pane-close-btn');
+  var panePrefsTimer = null;
 
-  // Preference writes are ordered, including a full Save after an auto-save.
-  // Tasks wait for the latest write so a selected browser is already active.
-  function queuePrefsSave(command, args) {
-    var revision = ++browserEditRevision;
-    var request = prefsWriteQueue.then(function () { return invoke(command, args); });
-    prefsWriteQueue = request.then(function (prefs) {
-      if (revision === browserEditRevision) browserPrefsError = null;
-      return prefs;
-    }, function (err) {
-      if (revision === browserEditRevision) browserPrefsError = err;
-    });
-    return request;
+  // Persist pane prefs (auto_show, width_pct) without touching the rest.
+  function persistBrowserPrefs() {
+    if (panePrefsTimer) clearTimeout(panePrefsTimer);
+    panePrefsTimer = setTimeout(function () {
+      var width = clampWidth(prefBwidth ? prefBwidth.value : 45);
+      var auto = prefAutoshow ? prefAutoshow.checked : true;
+      invoke('get_prefs', {}).then(function (existing) {
+        existing = existing || {};
+        existing.browser = { auto_show: auto, width_pct: width };
+        return invoke('save_prefs', { prefs: existing });
+      }).then(function () {
+        if (prefStatus) prefStatus.textContent = 'Browser pane settings saved.';
+      }).catch(function (err) {
+        if (prefStatus) prefStatus.textContent = 'Browser pane not saved: ' + errMsg(err);
+      });
+    }, 400);
   }
 
-  function waitForBrowserPrefs() {
-    var pending = prefsWriteQueue;
-    return pending.then(function () {
-      if (pending !== prefsWriteQueue) return waitForBrowserPrefs();
-      if (browserPrefsError) {
-        throw new Error('Browser settings were not saved. Retry Save in Settings: ' + errMsg(browserPrefsError));
-      }
-    });
-  }
-
-  function browserPrefsFromSettings() {
-    var opt = prefBrowser.options[prefBrowser.selectedIndex];
-    if (!opt || !opt.value) throw new Error('Pick a browser first.');
-    var dp = prefDebugPort ? Number(prefDebugPort.value) : 9222;
-    if (!Number.isInteger(dp) || dp < 0 || dp > 65535) {
-      throw new Error('Debug port must be a whole number from 0 to 65535.');
-    }
-    return {
-      exe: opt.value,
-      kind: opt.dataset.kind || 'binary',
-      headless: prefHeadless.checked,
-      profile: (prefProfile && prefProfile.value === 'comrade') ? 'comrade' : 'user',
-      debug_port: dp,
-    };
-  }
-
-  function autoSaveBrowserPrefs() {
-    updateBrowserHelp();
-    var browser;
-    try { browser = browserPrefsFromSettings(); } catch (err) {
-      browserEditRevision++;
-      browserPrefsError = err;
-      prefStatus.textContent = 'Browser settings not saved: ' + errMsg(err);
-      return;
-    }
-    prefStatus.textContent = 'Saving browser settings...';
-    var request = queuePrefsSave('save_browser_prefs', { browser: browser });
-    var revision = browserEditRevision;
-    request.then(function () {
-      if (revision === browserEditRevision) prefStatus.textContent = 'Browser settings saved.';
-    }).catch(function (err) {
-      if (revision === browserEditRevision) prefStatus.textContent = 'Browser settings not saved: ' + errMsg(err);
-    });
-  }
-
-  [prefBrowser, prefProfile, prefDebugPort, prefHeadless].forEach(function (control) {
-    if (control) control.addEventListener('change', autoSaveBrowserPrefs);
+  if (prefAutoshow) prefAutoshow.addEventListener('change', function () {
+    browserAutoShow = prefAutoshow.checked;
+    persistBrowserPrefs();
+  });
+  if (prefBwidth) prefBwidth.addEventListener('input', function () {
+    applyBrowserWidth(prefBwidth.value, false);
+  });
+  if (prefBwidth) prefBwidth.addEventListener('change', function () {
+    applyBrowserWidth(prefBwidth.value, true);
+  });
+  if (paneOpenBtn) paneOpenBtn.addEventListener('click', function () { setBrowserOpen(true); });
+  if (paneShotBtn) paneShotBtn.addEventListener('click', function () { setBrowserOpen(true); refreshBrowser(); });
+  if (paneCloseBtn) paneCloseBtn.addEventListener('click', function () {
+    invoke('browser_close', {}).then(function () {
+      if (browserStatus) browserStatus.textContent = 'Browser stopped.';
+      if (browserImg) browserImg.removeAttribute('src');
+      if (browserView) browserView.classList.add('idle');
+      refreshBrowser();
+    }).catch(function (err) { if (browserStatus) browserStatus.textContent = 'Stop failed: ' + errMsg(err); });
   });
 
-  function browserLabel(b) {
-    var label = b.name + (b.version ? ' — ' + b.version.split(' ').slice(0, 3).join(' ') : '');
-    if (!b.automation_supported) label += ' · manual use only';
-    return label;
-  }
-
-  function updateBrowserHelp() {
-    if (!browserHelp) return;
-    var browser = detectedBrowsers.filter(function (b) { return b.exe === prefBrowser.value; })[0];
-    var version = browser && (browser.version || '').match(/\b(\d+)\./);
-    var defaultProfileUnsupported = browser && browser.name === 'Chrome' && version &&
-      Number(version[1]) >= 136 && prefProfile && prefProfile.value === 'user';
-    browserHelp.hidden = !defaultProfileUnsupported;
-    browserHelp.textContent = defaultProfileUnsupported
-      ? 'This Chrome version cannot automate its default profile. Choose Isolated Comrade profile and sign in there.'
-      : '';
-  }
-
-  function fillBrowserControls(browsers, selectedExe) {
-    browserList.innerHTML = '';
-    prefBrowser.innerHTML = '';
-    browsers.forEach(function (b, i) {
-      var label = document.createElement('label');
-      var radio = document.createElement('input');
-      radio.type = 'radio';
-      radio.name = 'ob-browser';
-      radio.value = b.exe;
-      radio.dataset.kind = b.kind;
-      if ((selectedExe && b.exe === selectedExe) || (!selectedExe && i === 0)) radio.checked = true;
-      var span = document.createElement('span');
-      span.textContent = b.name;
-      var ver = document.createElement('span');
-      ver.className = 'ver' + (b.automation_supported === false ? ' noexec' : '');
-      ver.textContent = (b.version || b.kind) + (b.automation_supported === false ? ' · manual' : '');
-      label.appendChild(radio);
-      label.appendChild(span);
-      label.appendChild(ver);
-      browserList.appendChild(label);
-
-      var opt = document.createElement('option');
-      opt.value = b.exe;
-      opt.dataset.kind = b.kind;
-      opt.textContent = browserLabel(b);
-      if (selectedExe && b.exe === selectedExe) opt.selected = true;
-      prefBrowser.appendChild(opt);
-    });
-    if (selectedExe && !browsers.some(function (b) { return b.exe === selectedExe; })) {
-      var missing = document.createElement('option');
-      missing.value = selectedExe;
-      missing.textContent = selectedExe + ' (not detected)';
-      missing.selected = true;
-      prefBrowser.appendChild(missing);
-    }
-    if (!browsers.length) {
-      browserList.innerHTML = '<p class="muted">No Chromium-based browser found. Install Brave, Chrome or Chromium, then reopen Comrade.</p>';
-      if (!selectedExe) {
-        var opt = document.createElement('option');
-        opt.value = '';
-        opt.textContent = '(none found)';
-        prefBrowser.appendChild(opt);
-      }
-    }
-  }
-
-  function loadBrowsers(selectedExe) {
-    return invoke('system_browsers', {}).then(function (browsers) {
-      detectedBrowsers = browsers || [];
-      fillBrowserControls(detectedBrowsers, selectedExe);
-    }).catch(function (err) {
-      obStatus.textContent = 'browser scan failed: ' + errMsg(err);
-    });
-  }
-
-  function selectedProfile() {
-    var checked = document.querySelector('input[name="ob-profile"]:checked');
-    return (checked && checked.value === 'comrade') ? 'comrade' : 'user';
-  }
-
-  function selectedBrowser() {
-    var checked = browserList.querySelector('input[name="ob-browser"]:checked');
-    if (checked) return { exe: checked.value, kind: checked.dataset.kind || 'binary' };
-    var opt = prefBrowser.options[prefBrowser.selectedIndex];
-    if (opt && opt.value) return { exe: opt.value, kind: opt.dataset.kind || 'binary' };
-    return null;
-  }
-
-  function browserPrefsForSave(b) {
-    return {
-      exe: b.exe,
-      kind: b.kind,
-      headless: obHeadless.checked,
-      profile: selectedProfile(),
-      debug_port: 9222,
-    };
-  }
-
   obContinue.addEventListener('click', function () {
-    var b = selectedBrowser();
-    if (!b) { obStatus.textContent = 'Pick a browser first.'; return; }
     var agents = checkedAgentIds(agentList);
     if (!agents.length) { obStatus.textContent = 'Enable at least one coding agent.'; return; }
     obStatus.textContent = 'saving...';
-    queuePrefsSave('save_prefs', { prefs: {
-      browser: browserPrefsForSave(b),
-      voice: {
-        autoplay: true, enabled: true, mic: '',
-        stt: { engine: 'sherpa-onnx', model: 'zipformer-en-20M-int8', language: 'en', sample_rate: 16000 },
-        vad: { threshold: 0.5, silence_ms: 700, min_speech_ms: 250 },
-        tts: { engine: 'kokoro', voice: '0', speed: 1.0 },
-      },
-      coding: { agents: agents, default: obDefault.value || agents[0] },
-    } }).then(function () {
+    invoke('get_prefs', {}).then(function (existing) {
+      var v = (existing && existing.voice) || {};
+      return invoke('save_prefs', { prefs: {
+        browser: (existing && existing.browser) || { auto_show: true, width_pct: 45 },
+        voice: {
+          autoplay: true, enabled: true, mic: v.mic || '',
+          stt: v.stt || { engine: 'sherpa-onnx', model: 'zipformer-en-20M-int8', language: 'en', sample_rate: 16000 },
+          vad: v.vad || { threshold: 0.5, silence_ms: 700, min_speech_ms: 250 },
+          tts: v.tts || { engine: 'kokoro', voice: '0', speed: 1.0 },
+          runtime: v.runtime || { max_utterance_ms: 30000, decode_every_frames: 16, chunk_max_chars: 220, chunk_min_merge: 12, num_threads: 2 },
+        },
+        coding: { agents: agents, default: obDefault.value || agents[0] },
+        llm: (existing && existing.llm) || { provider: 'deepseek', model: 'deepseek-flash' },
+        agent: (existing && existing.agent) || { max_steps: 15, timeout_ms: 120000 },
+        memory: (existing && existing.memory) || { embedding_model: 'openai/text-embedding-3-small', embedding_dim: 1536 },
+      } });
+    }).then(function () {
       onboardingEl.hidden = true;
       refreshAppInfo();
     }).catch(function (err) {
@@ -834,6 +924,7 @@
     var vad = base.vad || {};
     var tts = base.tts || {};
     var stt = base.stt || {};
+    var rt = base.runtime || {};
     return {
       autoplay: prefAutoplay.checked,
       enabled: base.enabled !== false,
@@ -854,43 +945,33 @@
         voice: voiceTtsVoice.value || '0',
         speed: parseFloat(voiceTtsSpeed.value) || 1.0,
       },
+      runtime: {
+        max_utterance_ms: rt.max_utterance_ms || 30000,
+        decode_every_frames: rt.decode_every_frames || 16,
+        chunk_max_chars: rt.chunk_max_chars || 220,
+        chunk_min_merge: (rt.chunk_min_merge == null ? 12 : rt.chunk_min_merge),
+        num_threads: rt.num_threads || 2,
+      },
     };
   }
 
   function loadPrefsIntoSettings() {
-    var loadRevision = ++settingsLoadRevision;
-    var editRevision = browserEditRevision;
-    waitForBrowserPrefs().then(function () {
-      return Promise.all([invoke('get_prefs', {}), invoke('system_browsers', {})]);
-    }).then(function (results) {
-      if (loadRevision !== settingsLoadRevision || editRevision !== browserEditRevision) return;
-      var prefs = results[0];
-      detectedBrowsers = results[1] || [];
-      fillBrowserControls(detectedBrowsers, prefs.browser && prefs.browser.exe);
+    invoke('get_prefs', {}).then(function (prefs) {
+      prefs = prefs || {};
       prefStatus.textContent = '';
       var coding = prefs.coding || { agents: [], default: '' };
       loadAgents(coding.agents, coding.default);
-      prefHeadless.checked = !!(prefs.browser && prefs.browser.headless);
-      if (prefProfile) {
-        var prof = (prefs.browser && prefs.browser.profile === 'comrade') ? 'comrade' : 'user';
-        prefProfile.value = prof;
-        var radios = document.querySelectorAll('input[name="ob-profile"]');
-        Array.prototype.forEach.call(radios, function (r) { r.checked = (r.value === prof); });
-      }
-      if (prefDebugPort) {
-        var dp = prefs.browser && prefs.browser.debug_port;
-        prefDebugPort.value = (typeof dp === 'number' && dp >= 0) ? dp : 9222;
-      }
-      updateBrowserHelp();
+      var bp = prefs.browser || {};
+      browserAutoShow = bp.auto_show !== false;
+      if (prefAutoshow) prefAutoshow.checked = browserAutoShow;
+      applyBrowserWidth(bp.width_pct || 45, false);
       prefAutoplay.checked = !(prefs.voice && prefs.voice.autoplay === false);
       currentVoicePrefs = prefs.voice || null;
       fillVoiceSettings(prefs.voice || {});
       refreshModelStatus();
-      prefFile.textContent = 'Browser changes save automatically. Use Save for other settings. Stored in comrade.conf inside the comrade-agent home folder.';
+      prefFile.textContent = 'Stored in comrade.conf inside the comrade-agent home folder. The browser needs no setup — it is bundled and lives only inside this app.';
     }).catch(function (err) {
-      if (loadRevision === settingsLoadRevision && editRevision === browserEditRevision) {
-        prefStatus.textContent = 'failed: ' + errMsg(err);
-      }
+      prefStatus.textContent = 'failed: ' + errMsg(err);
     });
   }
 
@@ -986,25 +1067,27 @@
   }
 
   prefSave.addEventListener('click', function () {
-    var browser;
-    try { browser = browserPrefsFromSettings(); } catch (err) {
-      prefStatus.textContent = errMsg(err);
-      return;
-    }
     var agents = checkedAgentIds(codeAgentList);
     if (!agents.length) { prefStatus.textContent = 'Enable at least one coding agent.'; return; }
     prefStatus.textContent = 'saving...';
-    var request = queuePrefsSave('save_prefs', { prefs: {
-      browser: browser,
-      voice: voicePrefsForSave(),
-      coding: { agents: agents, default: codeDefault.value || agents[0] },
-    } });
-    var revision = browserEditRevision;
-    request.then(function () {
-      if (revision === browserEditRevision) prefStatus.textContent = 'saved to comrade.conf.';
+    invoke('get_prefs', {}).then(function (existing) {
+      existing = existing || {};
+      return invoke('save_prefs', { prefs: {
+        browser: {
+          auto_show: prefAutoshow ? prefAutoshow.checked : true,
+          width_pct: clampWidth(prefBwidth ? prefBwidth.value : 45),
+        },
+        voice: voicePrefsForSave(),
+        coding: { agents: agents, default: codeDefault.value || agents[0] },
+        llm: (existing && existing.llm) || { provider: 'deepseek', model: 'deepseek-flash' },
+        agent: (existing && existing.agent) || { max_steps: 15, timeout_ms: 120000 },
+        memory: (existing && existing.memory) || { embedding_model: 'openai/text-embedding-3-small', embedding_dim: 1536 },
+      } });
+    }).then(function () {
+      prefStatus.textContent = 'saved to comrade.conf.';
       refreshAppInfo();
     }).catch(function (err) {
-      if (revision === browserEditRevision) prefStatus.textContent = 'failed: ' + errMsg(err);
+      prefStatus.textContent = 'failed: ' + errMsg(err);
     });
   });
 
@@ -1016,10 +1099,17 @@
 
   // boot: sidebar open, list chats, restore last session
   toggleSidebar(true);
+  try {
+    if (window.localStorage.getItem('comrade-browser-open') === '1') setBrowserOpen(true, false);
+  } catch (e) { /* noop */ }
+  invoke('get_prefs', {}).then(function (prefs) {
+    var bp = (prefs && prefs.browser) || {};
+    browserAutoShow = bp.auto_show !== false;
+    if (bp.width_pct) applyBrowserWidth(bp.width_pct, false);
+  }).catch(function () { /* pane keeps local defaults */ });
   invoke('app_info', {}).then(function (info) {
     if (!info.onboarded) {
       onboardingEl.hidden = false;
-      loadBrowsers(null);
       loadAgents([], '');
     }
   }).catch(function () { /* settings will surface backend errors */ });

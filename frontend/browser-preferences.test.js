@@ -1,5 +1,6 @@
 // Run from the repo root with Node, or JavaScriptCore's jsc executable.
-// Exercises the real app event handlers with a small DOM/IPC substitute.
+// Exercises the in-app browser pane: instant task start (no browser gating),
+// auto-show on browser steps, address-bar navigation, and manual toggle.
 (function () {
   'use strict';
   var source = typeof require === 'function'
@@ -7,11 +8,6 @@
     : readFile('frontend/app.js');
   var report = typeof print === 'function' ? print : console.log;
   function assert(condition, message) { if (!condition) throw new Error(message); }
-  function deferred() {
-    var result = {};
-    result.promise = new Promise(function (resolve, reject) { result.resolve = resolve; result.reject = reject; });
-    return result;
-  }
   async function flush() { for (var i = 0; i < 30; i++) await Promise.resolve(); }
 
   function Element(tag) {
@@ -19,11 +15,12 @@
     this.children = [];
     this.listeners = {};
     this.dataset = {};
-    this.style = {};
+    this.style = { setProperty: function () {} };
     this.classList = { add: function () {}, remove: function () {}, toggle: function () {} };
     this.textContent = '';
     this.selectedIndex = -1;
     this._value = '';
+    this.hidden = false;
   }
   Object.defineProperties(Element.prototype, {
     options: { get: function () { return this.children; } },
@@ -43,8 +40,8 @@
   Element.prototype.addEventListener = function (event, listener) {
     (this.listeners[event] || (this.listeners[event] = [])).push(listener);
   };
-  Element.prototype.dispatch = function (event) {
-    (this.listeners[event] || []).forEach(function (listener) { listener({ preventDefault: function () {} }); });
+  Element.prototype.dispatch = function (event, payload) {
+    (this.listeners[event] || []).forEach(function (listener) { listener(payload || { preventDefault: function () {} }); });
   };
   Element.prototype.querySelectorAll = function (selector) {
     var descendants = [];
@@ -60,130 +57,138 @@
   };
   Element.prototype.querySelector = function (selector) { return this.querySelectorAll(selector)[0] || null; };
   Element.prototype.scrollIntoView = Element.prototype.focus = function () {};
+  Element.prototype.getBoundingClientRect = function () { return { right: 1000, width: 1000 }; };
+  Element.prototype.removeAttribute = function () {};
 
-  var brave = '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser';
-  var chrome = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
-  var edge = '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge';
-  async function app(savedExe) {
+  function boot(saved, opts) {
+    opts = opts || {};
+    var ensureCalls = 0;
     var elements = {};
-    var selects = ['pref-browser', 'pref-profile', 'voice-mic', 'ob-default', 'code-default', 'mem-kind'];
+    var selects = ['voice-mic', 'ob-default', 'code-default', 'mem-kind'];
+    var store = { 'comrade-browser-width': '45' };
     var document = {
       body: new Element('body'),
+      documentElement: new Element('html'),
+      activeElement: null,
       getElementById: function (id) { return elements[id] || (elements[id] = new Element(selects.indexOf(id) >= 0 ? 'select' : 'div')); },
       createElement: function (tag) { return new Element(tag); },
       querySelectorAll: function () { return []; },
       querySelector: function () { return null; },
+      addEventListener: function () {},
     };
-    ['user', 'comrade'].forEach(function (value) {
-      var option = new Element('option'); option.value = value;
-      document.getElementById('pref-profile').appendChild(option);
-    });
     document.getElementById('settings').hidden = true;
-    var state = {
-      elements: elements,
-      calls: [],
-      handlers: {},
-      saved: { browser: { exe: savedExe || brave, kind: 'binary', profile: 'user', headless: false, debug_port: 9222 }, voice: {}, coding: { agents: [], default: '' } },
-    };
-    var browsers = [
-      { name: 'Brave', exe: brave, kind: 'binary', version: 'Brave 154.0', automation_supported: true },
-      { name: 'Chrome', exe: chrome, kind: 'binary', version: 'Google Chrome 154.0.8037.57', automation_supported: true },
-      { name: 'Edge', exe: edge, kind: 'binary', version: 'Microsoft Edge 154.0', automation_supported: true },
-    ];
+    document.getElementById('browser-pane').hidden = true;
+    document.getElementById('browser-divider').hidden = true;
+    var state = { elements: elements, calls: [], saved: saved || null, agentHandlers: [] };
     function copy(value) { return JSON.parse(JSON.stringify(value)); }
     globalThis.document = document;
     globalThis.requestAnimationFrame = function () {};
     globalThis.window = {
-      localStorage: { getItem: function () { return null; }, setItem: function () {}, removeItem: function () {} },
+      localStorage: {
+        getItem: function (k) { return Object.prototype.hasOwnProperty.call(store, k) ? store[k] : null; },
+        setItem: function (k, v) { store[k] = String(v); },
+        removeItem: function (k) { delete store[k]; },
+      },
       __TAURI__: {
-        event: { listen: function () {} },
+        event: { listen: function (name, fn) { state.agentHandlers.push({ name: name, fn: fn }); } },
         core: { invoke: function (command, args) {
           state.calls.push({ command: command, args: copy(args || {}) });
-          if (state.handlers[command]) return state.handlers[command](args);
           if (command === 'app_info') return Promise.resolve({ onboarded: true, memory_kinds: [] });
-          if (command === 'get_prefs') return Promise.resolve(copy(state.saved));
-          if (command === 'system_browsers') return Promise.resolve(browsers);
+          if (command === 'get_prefs') return Promise.resolve({ browser: { auto_show: true, width_pct: 45 }, voice: {}, coding: { agents: [], default: '' } });
+          if (command === 'save_prefs') { state.saved = copy(args.prefs); return Promise.resolve(state.saved); }
           if (command === 'get_audio_devices') return Promise.resolve({ inputs: [] });
           if (command === 'voice_models_status') return Promise.resolve({ ready: true });
-          if (command === 'save_browser_prefs') { state.saved.browser = copy(args.browser); return Promise.resolve(copy(state.saved)); }
           if (command === 'send_message') return Promise.resolve({ status: 'done' });
-          if (command === 'start_voice_input') return Promise.resolve('started');
+          if (command === 'browser_state') return Promise.resolve({ running: true, url: 'https://example.com', title: 'Example' });
+          if (command === 'browser_screenshot') return Promise.resolve('data:image/png;base64,AAA');
+          if (command === 'browser_open') return Promise.resolve({ url: args.url, title: 'T' });
+          if (command === 'browser_back' || command === 'browser_forward' || command === 'browser_reload') {
+            return Promise.resolve({ url: 'https://example.com' });
+          }
+          if (command === 'browser_ensure') {
+            ensureCalls++;
+            if (opts.ensureFails && ensureCalls <= opts.ensureFails) {
+              return Promise.reject('BROWSER_SETUP: installing built-in browser…');
+            }
+            return Promise.resolve({ running: true, url: 'https://example.com', title: 'Example' });
+          }
+          if (command === 'browser_provision_status') {
+            return Promise.resolve(opts.provisionDone
+              ? { installed: true, phase: 'done', downloaded: 100, total: 100, error: '' }
+              : { installed: false, phase: 'downloading', downloaded: 50, total: 100, error: '' });
+          }
           return Promise.resolve([]);
         } },
       },
     };
     (0, eval)(source);
-    await flush();
-    elements['settings-btn'].dispatch('click');
-    await flush();
-    state.choose = function (exe) { elements['pref-browser'].value = exe; elements['pref-browser'].dispatch('change'); };
-    state.send = function () { elements.input.value = 'open youtube'; elements.composer.dispatch('submit'); };
+    state.fire = function (name, payload) {
+      state.agentHandlers.filter(function (h) { return h.name === name; }).forEach(function (h) { h.fn({ payload: payload }); });
+    };
     state.count = function (command) { return state.calls.filter(function (c) { return c.command === command; }).length; };
     return state;
   }
 
   async function run() {
-    var s = await app();
-    var save = deferred();
-    s.handlers.save_browser_prefs = function (args) { return save.promise.then(function () { s.saved.browser = args.browser; return s.saved; }); };
-    s.choose(chrome);
-    s.send();
+    // 1. Tasks start immediately — no browser prefs gating anymore.
+    var s = await boot();
     await flush();
-    assert(s.count('save_browser_prefs') === 1, 'Browser change must save without coding agents or global Save');
-    assert(s.count('save_prefs') === 0, 'Browser change must not write unrelated controls');
-    assert(s.count('send_message') === 0, 'Message must wait for the browser save');
-    assert(s.elements['browser-help'].hidden === false, 'Chrome 154 default profile must explain the limitation');
-    save.resolve(); await flush();
-    assert(s.saved.browser.exe === chrome && s.count('send_message') === 1, 'Message should use the saved Chrome selection');
-
-    s = await app();
-    var first = deferred(); var second = deferred();
-    var writes = 0;
-    s.handlers.save_browser_prefs = function () { writes++; return writes === 1 ? first.promise : second.promise; };
-    s.choose(chrome); s.choose(edge); s.send(); await flush();
-    assert(writes === 1, 'Rapid changes must serialize writes');
-    first.resolve(); await flush();
-    assert(writes === 2 && s.count('send_message') === 0, 'Task must wait for the newest selection');
-    second.resolve(); await flush();
-    assert(s.count('send_message') === 1 && s.elements['pref-browser'].value === edge, 'Latest selection must win');
-
-    s = await app();
-    var stale = deferred();
-    var oldPrefs = JSON.parse(JSON.stringify(s.saved));
-    s.handlers.get_prefs = function () { return stale.promise; };
-    s.elements['settings-btn'].dispatch('click'); s.elements['settings-btn'].dispatch('click');
+    s.elements.input.value = 'open youtube';
+    s.elements.composer.dispatch('submit');
     await flush();
-    s.choose(chrome); await flush();
-    stale.resolve(oldPrefs); await flush();
-    assert(s.elements['pref-browser'].value === chrome, 'Late settings load must not revert a newer browser choice');
+    assert(s.count('send_message') === 1, 'Message must send immediately with no browser setup gating');
+    assert(s.count('save_prefs') === 0, 'Sending a message must not write prefs');
 
-    s = await app();
-    s.handlers.save_browser_prefs = function () { return Promise.reject(new Error('Disk is full')); };
-    s.choose(chrome); s.send(); await flush();
-    assert(s.count('send_message') === 0 && s.elements.input.value === 'open youtube', 'Save failure must prevent wrong-browser execution and preserve the message');
-    assert(s.elements['pref-status'].textContent.indexOf('Disk is full') >= 0, 'Save failure must be visible');
-    delete s.handlers.save_browser_prefs;
-    s.choose(chrome); s.send(); await flush();
-    assert(s.count('send_message') === 1, 'A successful retry should unblock task start');
+    // 2. Browser mode: a browser.* step auto-shows the in-app pane and loads the view.
+    s = await boot();
+    await flush();
+    assert(s.elements['browser-pane'].hidden === true, 'Pane starts hidden');
+    s.fire('agent-event', { type: 'step', label: 'browser.open url="https://example.com"', status: 'done' });
+    await flush();
+    assert(s.elements['browser-pane'].hidden === false, 'Browser step must auto-show the in-app pane');
+    assert(s.count('browser_state') >= 1, 'Pane must fetch browser state on auto-show');
+    assert(s.count('browser_screenshot') >= 1, 'Pane must render a live screenshot on auto-show');
 
-    s = await app('/Applications/Removed Browser.app/browser');
-    assert(s.elements['pref-browser'].value === '/Applications/Removed Browser.app/browser', 'An unavailable saved browser must not display a different browser');
+    // 3. Address bar drives the same bundled tab; non-browser steps don't touch the pane.
+    var shots = s.count('browser_screenshot');
+    s.elements['browser-url'].value = 'example.org';
+    s.elements['browser-form'].dispatch('submit');
+    await flush();
+    assert(s.count('browser_open') === 1, 'Address bar must navigate via browser_open');
+    assert(s.calls.filter(function (c) { return c.command === 'browser_open'; })[0].args.url === 'example.org',
+      'Address bar must send the typed URL to the bundled tab');
+    s.fire('agent-event', { type: 'step', label: 'terminal.execute command="ls"', status: 'done' });
+    await flush();
+    assert(s.count('browser_screenshot') === shots + 1, 'Only the address-bar refresh may add exactly one screenshot');
+    s.fire('agent-event', { type: 'done', status: 'done' });
+    await flush();
 
-    s = await app();
-    save = deferred();
-    s.handlers.save_browser_prefs = function () { return save.promise; };
-    s.choose(chrome); s.elements['mic-btn'].dispatch('mousedown'); await flush();
-    assert(s.count('start_voice_input') === 0, 'Voice task must wait for browser save');
-    s.elements['mic-btn'].dispatch('mouseup'); save.resolve(); await flush();
-    assert(s.count('start_voice_input') === 0, 'Releasing the microphone while saving must cancel the pending voice start');
-    s.elements['mic-btn'].dispatch('mousedown'); await flush();
-    assert(s.count('start_voice_input') === 1, 'Voice should start after browser preferences are saved');
+    // 4. Manual toggle hides/shows the pane inside the app.
+    s.elements['browser-btn'].dispatch('click');
+    await flush();
+    assert(s.elements['browser-pane'].hidden === true, 'Toggle must hide the pane');
+    s.elements['browser-btn'].dispatch('click');
+    await flush();
+    assert(s.elements['browser-pane'].hidden === false, 'Toggle must re-open the pane');
 
-    report('PASS: browser auto-save, ordered writes, task/voice gating, stale loads, failure recovery, and missing browser display');
+    // 5. First-run self-install: pane opens, shows install progress, no dead-end error.
+    s = await boot(null, { ensureFails: 99 });
+    await flush();
+    s.elements['browser-btn'].dispatch('click');
+    await flush();
+    assert(s.elements['browser-pane'].hidden === false, 'Pane must open even while installing');
+    assert(s.elements['browser-status'].textContent.indexOf('Installing built-in browser') === 0,
+      'Pane must show install progress, got: ' + s.elements['browser-status'].textContent);
+    assert(s.count('browser_provision_status') === 0, 'Progress polls on a timer, not in a burst');
+
+    report('PASS: instant task start, browser-mode auto-show, address-bar navigation, pane toggle, self-install progress');
+    // Install-progress polling uses a real timer that the mock never
+    // completes — exit explicitly instead of hanging on it.
+    if (typeof process !== 'undefined') process.exit(0);
   }
   run().catch(function (error) {
     report(error.stack || String(error));
-    if (typeof process !== 'undefined') process.exitCode = 1;
+    if (typeof process !== 'undefined') process.exit(1);
     else quit(1);
   });
 })();

@@ -20,9 +20,14 @@ body {
   height: 100vh;
 }
 
-#app { display: flex; flex-direction: column; height: 100vh; max-width: 980px; margin: 0 auto; transition: margin-left 0.2s; }
+#app { display: flex; flex-direction: column; height: 100vh; max-width: 980px; margin: 0 auto; transition: margin-left 0.2s, max-width 0.2s; }
 
 body.sidebar-open #app { margin-left: max(260px, calc((100vw - 720px) / 2)); }
+
+/* Browser mode needs the full window: drop the centered 980px column so the
+   chat + pane split uses all available width instead of leaving dead space. */
+body.browser-open #app { max-width: none; margin: 0; }
+body.browser-open.sidebar-open #app { margin-left: 260px; }
 
 .head-left { display: flex; align-items: center; gap: 10px; }
 
@@ -85,12 +90,14 @@ header {
 
 .head-right { display: flex; align-items: center; gap: 10px; }
 
-#settings-btn {
+#settings-btn, #browser-btn {
   background: var(--panel); color: var(--dim);
   border: 1px solid var(--line); border-radius: 8px; padding: 5px 10px; cursor: pointer; font-size: 14px;
 }
 
-#settings-btn:hover { color: var(--text); border-color: var(--accent); }
+#settings-btn:hover, #browser-btn:hover { color: var(--text); border-color: var(--accent); }
+
+body.browser-open #browser-btn { color: var(--accent); border-color: var(--accent); }
 
 #logo {
   width: 30px; height: 30px; border-radius: 8px;
@@ -115,6 +122,52 @@ header {
 @keyframes pulse { 50% { opacity: 0.35; } }
 
 main { flex: 1; overflow-y: auto; padding: 20px; }
+
+#workarea { display: flex; align-items: stretch; gap: 0; overflow: hidden; }
+
+#chat-col { flex: 1 1 auto; min-width: 280px; overflow-y: auto; padding: 20px; }
+
+body.browser-open #chat-col { flex-basis: calc(100% - var(--browser-w, 45%) - 8px); }
+
+/* --- in-app browser pane (Comrade's own Chromium, live screenshots) --- */
+
+#browser-divider {
+  flex: 0 0 8px; cursor: col-resize; background: transparent;
+  border-left: 1px solid var(--line);
+}
+#browser-divider:hover, #browser-divider.drag { background: var(--accent); opacity: 0.5; }
+#browser-divider[hidden] { display: none; }
+
+#browser-pane {
+  flex: 0 0 var(--browser-w, 45%); min-width: 240px; max-width: 70%;
+  background: var(--panel); border-left: 1px solid var(--line);
+  display: flex; flex-direction: column; min-height: 0;
+}
+#browser-pane[hidden] { display: none; }
+
+.browser-bar { display: flex; gap: 4px; padding: 8px; border-bottom: 1px solid var(--line); align-items: center; }
+.browser-bar button {
+  background: var(--bg); color: var(--dim);
+  border: 1px solid var(--line); border-radius: 6px; padding: 4px 9px; cursor: pointer; font-size: 13px;
+}
+.browser-bar button:hover { color: var(--text); border-color: var(--accent); }
+#browser-form { flex: 1; display: flex; }
+#browser-url {
+  flex: 1; background: var(--bg); border: 1px solid var(--line);
+  border-radius: 6px; color: var(--text); padding: 5px 8px; font-size: 12px; outline: none; min-width: 0;
+}
+#browser-url:focus { border-color: var(--accent); }
+
+#browser-title { padding: 6px 10px 0; font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#browser-view {
+  flex: 1; overflow: auto; margin: 6px 10px; background: #fff;
+  border: 1px solid var(--line); border-radius: 8px; min-height: 120px;
+  display: flex; align-items: flex-start; justify-content: center;
+}
+#browser-img { width: 100%; height: auto; display: block; border-radius: 7px; }
+#browser-img:not([src]) { display: none; }
+#browser-view.idle { background: var(--bg); min-height: 200px; }
+#browser-status { padding: 0 10px 8px; font-size: 11px; min-height: 16px; }
 
 #hero { text-align: center; margin: 24px 0; }
 
@@ -307,6 +360,8 @@ footer { padding: 12px 20px 16px; border-top: 1px solid var(--line); }
 .settings-body input[type="file"] { font-size: 12px; color: var(--dim); max-width: 200px; }
 
 .settings-body .row { display: flex; gap: 8px; margin-top: 8px; }
+
+.settings-body input[type="range"] { flex: 1; accent-color: var(--accent); }
 
 .settings-body .row button {
   background: var(--panel); color: var(--accent);

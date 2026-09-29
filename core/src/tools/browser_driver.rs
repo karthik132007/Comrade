@@ -1,23 +1,25 @@
 /*!
- * Browser driver layer.
+ * Browser driver: Comrade's own bundled Chromium, driven over CDP.
  *
- * Architecture (family-agnostic, Chromium implemented first):
+ * Architecture:
  *
  * ```text
- * tools/browser.rs  ->  BrowserDriver trait  ->  ChromiumDriver (CDP)
- *                                          ->  GeckoDriver (WebDriver BiDi, planned)
+ * tools/browser.rs  ->  this driver  ->  bundled Chromium (CDP)
+ *                             |
+ *                   comrade-agent/browser/  (provisioned binary, see
+ *                   scripts/fetch-chromium.sh; override: COMRADE_CHROMIUM_BIN)
+ *                   comrade-agent/browser-profile/  (single isolated profile)
  * ```
  *
- * Chromium family (Chrome, Brave, Edge, Opera, Vivaldi, Chromium) is driven
- * over the Chrome DevTools Protocol:
- * - the configured browser exe is launched once with `--remote-debugging-port`
- *   against a persistent profile (`comrade-agent/browser-profile`),
- * - tabs are managed via the HTTP DevTools endpoints (`/json/list`, `/json/new`),
- * - page automation goes over a per-call WebSocket (`tokio-tungstenite`).
- *
- * Firefox family (Firefox, Zen, LibreWolf, Floorp) shares the same trait but
- * returns a clear `FIREFOX_UNSUPPORTED` error until the BiDi backend lands.
- * Detection is by exe/app-id substring so any current or future fork works.
+ * There is deliberately exactly one browser: the agent never touches any
+ * system browser and never reads any user profile. The bundled Chromium
+ * always runs headless (`--headless=new`), so no window ever opens outside
+ * the app — the only visible surface is the resizable in-app browser pane,
+ * which renders live screenshots of this same instance (same tabs, same
+ * session). Tabs are managed via the HTTP DevTools endpoints
+ * (`/json/list`, `/json/new`); page automation goes over a per-call
+ * WebSocket (`tokio-tungstenite`). One tab is reused across navigation,
+ * reading, and clicking.
  */
 
 use std::sync::OnceLock;
@@ -27,190 +29,21 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 
 // ---------------------------------------------------------------------------
-// Family detection (works for any present or future fork)
-// ---------------------------------------------------------------------------
-
-/// Browser automation family.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BrowserFamily {
-    Chromium,
-    Gecko,
-}
-
-const GECKO_MARKERS: &[&str] = &[
-    "firefox",
-    "zen",
-    "librewolf",
-    "floorp",
-    "waterfox",
-    "mozilla",
-];
-
-/// Classify an exe path or flatpak app-id into its automation family.
-/// Unknown / unbranded Chromium forks default to Chromium (CDP is the
-/// de-facto standard there); only known Gecko markers route to Gecko.
-pub fn detect_family(exe: &str) -> BrowserFamily {
-    let lower = exe.to_lowercase();
-    if GECKO_MARKERS.iter().any(|m| lower.contains(m)) {
-        BrowserFamily::Gecko
-    } else {
-        BrowserFamily::Chromium
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Managed Chromium process (singleton)
+// Managed bundled-Chromium process (singleton)
 // ---------------------------------------------------------------------------
 
 struct ManagedBrowser {
-    /// Launched by us (killed on close) vs attached to the user's live
-    /// browser (never killed — detach only).
+    /// Always launched by us (killed on close). Nothing is ever attached to:
+    /// there is no user browser to attach to by design.
     child: Option<tokio::process::Child>,
     port: u16,
-    prefs: crate::prefs::BrowserPrefs,
-    profile_key: String,
     page_id: Option<String>,
 }
 
 #[derive(Default)]
 struct BrowserState {
     browser: Option<ManagedBrowser>,
-    failed_launch: Option<(crate::prefs::BrowserPrefs, String, Instant)>,
-}
-
-/// Which profile to drive: the user's own (logged in) or Comrade's isolated one.
-pub fn use_user_profile(mode: &str) -> bool {
-    mode.trim().to_lowercase() != "comrade"
-}
-
-fn home_dir() -> String {
-    std::env::var("HOME").unwrap_or_else(|_| ".".to_string())
-}
-
-/// One profile location in all three OS conventions:
-/// unix/mac relative paths, win relative to %LOCALAPPDATA% (+ `\User Data`).
-struct Leaf {
-    unix: &'static str,
-    mac: &'static str,
-    win: &'static str,
-}
-
-fn expand_leaf(leaf: &Leaf) -> String {
-    if cfg!(target_os = "windows") {
-        let base = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| home_dir());
-        format!("{base}\\{}\\User Data", leaf.win)
-    } else if cfg!(target_os = "macos") {
-        format!("{}/{}", home_dir(), leaf.mac)
-    } else {
-        let rel = leaf.unix;
-        if let Some(stripped) = rel.strip_prefix(".config/") {
-            match std::env::var("XDG_CONFIG_HOME").ok().filter(|v| !v.trim().is_empty()) {
-                Some(base) => format!("{base}/{stripped}"),
-                None => format!("{}/{rel}", home_dir()),
-            }
-        } else {
-            format!("{}/{rel}", home_dir())
-        }
-    }
-}
-
-/// Ordered profile-dir candidates for the concrete binary/channel.
-/// First entry = that build's own default location; the rest are sibling
-/// fallbacks (other channels of the same browser).
-fn user_profile_candidates(exe: &str) -> Vec<std::path::PathBuf> {
-    struct Fam {
-        mark: &'static str,
-        channels: &'static [(&'static str, Leaf)],
-        default: Leaf,
-        fallback: Option<Leaf>,
-    }
-    // NOTE: the "Origin" build (this machine's brave-origin) keeps its data
-    // under BraveSoftware/Brave-Origin — NOT Brave-Browser. Channel-aware
-    // ordering matters: a wrong pick silently yields a fresh empty profile.
-    let fams: &[Fam] = &[
-        Fam { mark: "brave", channels: &[
-            ("origin", Leaf { unix: ".config/BraveSoftware/Brave-Origin", mac: "Library/Application Support/BraveSoftware/Brave-Origin", win: "BraveSoftware\\Brave-Origin" }),
-            ("beta", Leaf { unix: ".config/BraveSoftware/Brave-Browser-Beta", mac: "Library/Application Support/BraveSoftware/Brave-Browser-Beta", win: "BraveSoftware\\Brave-Browser-Beta" }),
-            ("dev", Leaf { unix: ".config/BraveSoftware/Brave-Browser-Dev", mac: "Library/Application Support/BraveSoftware/Brave-Browser-Dev", win: "BraveSoftware\\Brave-Browser-Dev" }),
-            ("nightly", Leaf { unix: ".config/BraveSoftware/Brave-Browser-Nightly", mac: "Library/Application Support/BraveSoftware/Brave-Browser-Nightly", win: "BraveSoftware\\Brave-Browser-Nightly" }),
-        ],
-            default: Leaf { unix: ".config/BraveSoftware/Brave-Browser", mac: "Library/Application Support/BraveSoftware/Brave-Browser", win: "BraveSoftware\\Brave-Browser" },
-            fallback: Some(Leaf { unix: ".config/BraveSoftware/Brave-Origin", mac: "Library/Application Support/BraveSoftware/Brave-Origin", win: "BraveSoftware\\Brave-Origin" }) },
-        Fam { mark: "msedge", channels: &[
-            ("beta", Leaf { unix: ".config/microsoft-edge-beta", mac: "Library/Application Support/Microsoft Edge Beta", win: "Microsoft\\Edge Beta" }),
-            ("dev", Leaf { unix: ".config/microsoft-edge-dev", mac: "Library/Application Support/Microsoft Edge Dev", win: "Microsoft\\Edge Dev" }),
-        ],
-            default: Leaf { unix: ".config/microsoft-edge", mac: "Library/Application Support/Microsoft Edge", win: "Microsoft\\Edge" },
-            fallback: None },
-        Fam { mark: "edge", channels: &[
-            ("beta", Leaf { unix: ".config/microsoft-edge-beta", mac: "Library/Application Support/Microsoft Edge Beta", win: "Microsoft\\Edge Beta" }),
-            ("dev", Leaf { unix: ".config/microsoft-edge-dev", mac: "Library/Application Support/Microsoft Edge Dev", win: "Microsoft\\Edge Dev" }),
-        ],
-            default: Leaf { unix: ".config/microsoft-edge", mac: "Library/Application Support/Microsoft Edge", win: "Microsoft\\Edge" },
-            fallback: None },
-        Fam { mark: "opera", channels: &[
-            ("beta", Leaf { unix: ".config/opera-beta", mac: "Library/Application Support/com.operasoftware.OperaBeta", win: "Opera Software\\Opera Beta" }),
-            ("developer", Leaf { unix: ".config/opera-developer", mac: "Library/Application Support/com.operasoftware.OperaDeveloper", win: "Opera Software\\Opera Developer" }),
-        ],
-            default: Leaf { unix: ".config/opera", mac: "Library/Application Support/com.operasoftware.Opera", win: "Opera Software\\Opera Stable" },
-            fallback: None },
-        Fam { mark: "vivaldi", channels: &[
-            ("snapshot", Leaf { unix: ".config/vivaldi-snapshot", mac: "Library/Application Support/Vivaldi Snapshot", win: "Vivaldi\\Vivaldi Snapshot" }),
-        ],
-            default: Leaf { unix: ".config/vivaldi", mac: "Library/Application Support/Vivaldi", win: "Vivaldi" },
-            fallback: None },
-        Fam { mark: "chromium", channels: &[],
-            default: Leaf { unix: ".config/chromium", mac: "Library/Application Support/Chromium", win: "Chromium" },
-            fallback: None },
-        Fam { mark: "chrome", channels: &[
-            ("beta", Leaf { unix: ".config/google-chrome-beta", mac: "Library/Application Support/Google/Chrome Beta", win: "Google\\Chrome Beta" }),
-            ("unstable", Leaf { unix: ".config/google-chrome-unstable", mac: "Library/Application Support/Google/Chrome Dev", win: "Google\\Chrome Dev" }),
-            ("dev", Leaf { unix: ".config/google-chrome-unstable", mac: "Library/Application Support/Google/Chrome Dev", win: "Google\\Chrome Dev" }),
-        ],
-            default: Leaf { unix: ".config/google-chrome", mac: "Library/Application Support/Google/Chrome", win: "Google\\Chrome" },
-            fallback: None },
-    ];
-    let lower = exe.to_lowercase();
-    let Some(fam) = fams.iter().find(|f| lower.contains(f.mark)) else {
-        return Vec::new();
-    };
-    let mut leaves: Vec<&Leaf> = Vec::new();
-    if let Some((_, leaf)) = fam.channels.iter().find(|(m, _)| lower.contains(m)) {
-        leaves.push(leaf);
-    }
-    leaves.push(&fam.default);
-    if let Some(fb) = &fam.fallback {
-        leaves.push(fb);
-    }
-    leaves.into_iter().map(|l| std::path::PathBuf::from(expand_leaf(l))).collect()
-}
-
-/// The browser's own profile directory (cookies, logins, tabs).
-/// Unknown forks yield None → the isolated Comrade profile (safe default —
-/// never guess at a path that could belong to another app).
-pub fn user_profile_dir(exe: &str) -> Option<std::path::PathBuf> {
-    let cands = user_profile_candidates(exe);
-    if cands.is_empty() {
-        return None;
-    }
-    // A live session wins: the profile actually in use right now.
-    if let Some(live) = cands.iter().find(|p| p.is_dir() && lock_holder_pid(p).is_some()) {
-        return Some(live.clone());
-    }
-    // Otherwise the first existing dir; if none exists yet, the build's own
-    // default location (first candidate) so launch uses the standard place.
-    cands.iter().find(|p| p.is_dir()).cloned().or_else(|| cands.into_iter().next())
-}
-
-/// Resolve the `--user-data-dir` for this run: your own profile (logged in)
-/// or Comrade's isolated one, per Settings.
-pub fn resolve_profile_dir(exe: &str, mode: &str) -> std::path::PathBuf {
-    if use_user_profile(mode) {
-        if let Some(dir) = user_profile_dir(exe) {
-            return dir;
-        }
-    }
-    profile_dir()
+    failed_launch: Option<(String, Instant)>,
 }
 
 static MANAGED: OnceLock<tokio::sync::Mutex<BrowserState>> = OnceLock::new();
@@ -230,6 +63,13 @@ fn profile_dir() -> std::path::PathBuf {
 
 fn debugger_url(port: u16) -> String {
     format!("http://127.0.0.1:{port}")
+}
+
+/// Resolve the bundled Chromium executable, installing it first if needed.
+/// The browser is a core feature: it provisions itself automatically on
+/// first use (one-time download into `comrade-agent/browser/`).
+pub async fn bundled_exe() -> Result<std::path::PathBuf, String> {
+    super::provision::ensure_provisioned().await
 }
 
 async fn http_ok(url: &str) -> bool {
@@ -257,112 +97,53 @@ async fn wait_for_debugger(port: u16) -> anyhow::Result<()> {
     anyhow::bail!("browser did not expose DevTools on port {port} within 20s")
 }
 
-fn launch_args(port: u16, headless: bool, profile: &str) -> Vec<String> {
-    let mut args = vec![
+/// Headless always: the Chromium window must never appear outside the app.
+/// What the user sees is the in-app pane (live screenshots of this process).
+fn launch_args(port: u16, profile: &str) -> Vec<String> {
+    vec![
         format!("--remote-debugging-port={port}"),
         "--remote-allow-origins=*".to_string(),
         format!("--user-data-dir={profile}"),
+        "--headless=new".to_string(),
+        "--disable-gpu".to_string(),
         "--no-first-run".to_string(),
         "--no-default-browser-check".to_string(),
         "--disable-dev-shm-usage".to_string(),
         "--no-sandbox".to_string(),
-        // A URL here gets forwarded into an already-running browser even
-        // when the new process cannot enable DevTools. Create a page only
-        // after successfully connecting, via active_page().
+        "--window-size=1280,860".to_string(),
+        // A URL here would open a tab on every launch; pages are created
+        // only after connecting, via active_page().
         "--no-startup-window".to_string(),
-    ];
-    if headless {
-        args.push("--headless=new".to_string());
-        args.push("--disable-gpu".to_string());
-    }
-    args
+    ]
 }
 
-/// Ensure the configured Chromium browser is ready to drive.
-/// Order: reuse our instance → attach to your live browser on debug_port →
-/// launch (your own profile by default, so Gmail/logins are present).
-/// Returns the DevTools HTTP base port.
+/// Ensure Comrade's bundled Chromium is running and return its DevTools port.
+/// Reuses the live instance; otherwise launches it headless against the
+/// single isolated profile. Never touches system browsers or user profiles.
 pub async fn ensure_chromium() -> Result<u16, String> {
-    let prefs = crate::prefs::load();
-    ensure_chromium_with(&prefs.browser).await
-}
-
-async fn ensure_chromium_with(prefs: &crate::prefs::BrowserPrefs) -> Result<u16, String> {
-    let exe = prefs.exe.trim().to_string();
-    if exe.is_empty() {
-        return Err("NO_BROWSER: pick a browser in Settings first.".to_string());
-    }
-    if detect_family(&exe) == BrowserFamily::Gecko {
-        return Err(gecko_unsupported(&exe));
-    }
-
-    if prefs.kind == "flatpak" {
-        return Err("FLATPAK_UNSUPPORTED: Chromium flatpak automation is not wired yet; pick a native binary build.".to_string());
-    }
-    if !std::path::Path::new(&exe).exists() {
-        return Err(format!("BROWSER_NOT_FOUND: executable missing: {exe}"));
-    }
-    let user_mode = use_user_profile(&prefs.profile);
-    let profile = resolve_profile_dir(&exe, &prefs.profile);
+    let exe = bundled_exe().await?;
+    let exe_key = exe.to_string_lossy().to_string();
+    let profile = profile_dir();
     let profile_key = profile.to_string_lossy().to_string();
     let mut guard = managed_lock().lock().await;
 
-    // Reuse the live instance when it still answers (launched or attached).
-    // A launched instance is only reused for the same exe + profile: if you
-    // switched browsers or profiles in Settings, it is retired below.
+    // Reuse the live instance while its process is still ours and answering.
     if let Some(m) = guard.browser.as_mut() {
-        let same_target = m.prefs == *prefs && m.profile_key == profile_key;
         let usable = match m.child.as_mut() {
-            Some(child) => same_target && child.try_wait().map(|s| s.is_none()).unwrap_or(false),
-            None => same_target && verify_debugger_owner(m.port, &exe).is_ok(),
+            Some(child) => child.try_wait().map(|s| s.is_none()).unwrap_or(false),
+            None => false,
         };
         if usable && http_ok(&format!("{}/json/version", debugger_url(m.port))).await {
             return Ok(m.port);
         }
-        // Stale: kill only what we launched; attached sessions just detach.
         if let Some(mut child) = m.child.take() {
             let _ = child.kill().await;
         }
         guard.browser = None;
     }
 
-    // Attach to your already-running browser first (your tabs + logins, and
-    // no profile-lock fight). Start it once with e.g.
-    // `brave --remote-debugging-port=9222` and Comrade drives that window.
-    if user_mode && prefs.debug_port != 0
-        && http_ok(&format!("{}/json/version", debugger_url(prefs.debug_port))).await
-    {
-        let port = prefs.debug_port;
-        verify_debugger_owner(port, &exe)?;
-        guard.browser = Some(ManagedBrowser {
-            child: None,
-            port,
-            prefs: prefs.clone(),
-            profile_key,
-            page_id: None,
-        });
-        guard.failed_launch = None;
-        return Ok(port);
-    }
-
-    // Check BEFORE spawning: Chromium's process-singleton forwards startup
-    // requests to this process then exits successfully. Retrying that launch
-    // cannot enable debugging and used to add a blank tab on every tool call.
-    if user_mode {
-        if let Some(pid) = lock_holder_pid(&profile) {
-            return Err(profile_in_use(&exe, Some(pid), prefs.debug_port));
-        }
-        if chrome_requires_separate_profile(&exe).await {
-            return Err(
-                "DEFAULT_PROFILE_UNSUPPORTED: Chrome 136 and newer do not allow browser control with the default personal profile. \
-                 Select the Comrade profile in Settings and save, or attach to Chrome already started with a separate \
-                 --user-data-dir and the configured debugging port."
-                    .to_string(),
-            );
-        }
-    }
-    if let Some((failed_prefs, error, when)) = &guard.failed_launch {
-        if failed_prefs == prefs && when.elapsed() < Duration::from_secs(30) {
+    if let Some((error, when)) = &guard.failed_launch {
+        if when.elapsed() < Duration::from_secs(30) {
             return Err(error.clone());
         }
     }
@@ -371,161 +152,32 @@ async fn ensure_chromium_with(prefs: &crate::prefs::BrowserPrefs) -> Result<u16,
         return Err(format!("PROFILE_FAILED: cannot create browser profile: {e}"));
     }
 
-    let launch_once = |port: u16| launch_args(port, prefs.headless, &profile_key);
-
     let port = free_port().map_err(|e| format!("PORT_FAILED: {e}"))?;
-    let result = match spawn_and_settle(&exe, &launch_once(port), port).await {
+    let result = match spawn_and_settle(&exe_key, &launch_args(port, &profile_key), port).await {
         Ok(child) => {
-            guard.browser = Some(ManagedBrowser {
-                child: Some(child), port, prefs: prefs.clone(), profile_key: profile_key.clone(), page_id: None,
-            });
+            guard.browser = Some(ManagedBrowser { child: Some(child), port, page_id: None });
             Ok(port)
         }
         Err(code) => {
             let locked_exit = code.starts_with("EXITED:21") || lock_held(&profile);
             let hung = code.starts_with("NO_DEVTOOLS");
-            if user_mode {
-                if code == "EXITED:0" || lock_holder_pid(&profile).is_some() {
-                    Err(profile_in_use(&exe, lock_holder_pid(&profile), prefs.debug_port))
-                } else if hung {
-                    Err(format!(
-                        "PROFILE_DEBUGGING_UNAVAILABLE: {exe} did not enable browser control with your personal profile. \
-                         Chrome 136 and newer require a separate data directory. Select the Comrade profile in Settings, \
-                         save, and retry."
-                    ))
-                } else {
-                    Err(friendly_launch_error(&exe, &code))
-                }
-            } else if locked_exit || hung {
+            if locked_exit || hung {
                 // Our isolated profile is ours to reclaim (orphan from an
-                // earlier agent run). Never do this for a user profile.
+                // earlier agent run).
                 kill_stale_profile_holders(&profile_key).await;
                 if lock_holder_pid(&profile).is_none() {
                     clear_stale_locks(&profile);
                 }
-                retry_launch(&exe, &launch_once, prefs, &mut guard.browser).await
+                retry_launch(&exe_key, &profile_key, &mut guard.browser).await
             } else {
-                Err(friendly_launch_error(&exe, &code))
+                Err(friendly_launch_error(&exe_key, &code))
             }
         }
     };
     if let Err(error) = &result {
-        guard.failed_launch = Some((prefs.clone(), error.clone(), Instant::now()));
+        guard.failed_launch = Some((error.clone(), Instant::now()));
     }
     result
-}
-
-fn profile_in_use(exe: &str, pid: Option<u32>, debug_port: u16) -> String {
-    let owner = pid.map(|pid| format!(" (pid {pid})")).unwrap_or_default();
-    let port = if debug_port == 0 { 9222 } else { debug_port };
-    format!(
-        "PROFILE_IN_USE: {exe} is already running with your profile{owner} without an accessible debugging connection. \
-         Select the Comrade profile in Settings and save, or connect the selected browser's existing debugging session \
-         on port {port}. Do not retry launching the personal profile or open another browser."
-    )
-}
-
-fn chrome_version_requires_separate_profile(version: &str) -> bool {
-    // Chrome's policy does not establish what a Chromium fork supports.
-    // Chrome for Testing explicitly retains the older behavior.
-    let Some(version) = version.trim().strip_prefix("Google Chrome ") else { return false };
-    version.split('.').next().and_then(|major| major.parse::<u32>().ok()).is_some_and(|major| major >= 136)
-}
-
-async fn chrome_requires_separate_profile(exe: &str) -> bool {
-    let lower = exe.to_lowercase();
-    if !lower.contains("chrome") || lower.contains("chromium") {
-        return false;
-    }
-    let output = tokio::time::timeout(
-        Duration::from_secs(3),
-        tokio::process::Command::new(exe).arg("--version").kill_on_drop(true).output(),
-    )
-    .await;
-    matches!(output, Ok(Ok(output)) if output.status.success()
-        && chrome_version_requires_separate_profile(&String::from_utf8_lossy(&output.stdout)))
-}
-
-fn process_executable(pid: u32) -> Option<std::path::PathBuf> {
-    #[cfg(target_os = "linux")]
-    {
-        std::fs::read_link(format!("/proc/{pid}/exe")).ok()
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let output = std::process::Command::new("ps")
-            .args(["-p", &pid.to_string(), "-o", "comm="])
-            .output()
-            .ok()?;
-        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        (output.status.success() && !path.is_empty()).then(|| path.into())
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let output = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-Command", &format!("(Get-Process -Id {pid}).Path")])
-            .output()
-            .ok()?;
-        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        (output.status.success() && !path.is_empty()).then(|| path.into())
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    {
-        let _ = pid;
-        None
-    }
-}
-
-fn listener_pids(port: u16) -> Vec<u32> {
-    #[cfg(unix)]
-    let output = std::process::Command::new("lsof")
-        .args(["-nP", "-t", &format!("-iTCP:{port}"), "-sTCP:LISTEN"])
-        .output();
-    #[cfg(windows)]
-    let output = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-Command", &format!(
-            "Get-NetTCPConnection -State Listen -LocalPort {port} | Select-Object -ExpandProperty OwningProcess"
-        )])
-        .output();
-    #[cfg(not(any(unix, windows)))]
-    return Vec::new();
-    #[cfg(any(unix, windows))]
-    output.ok().filter(|o| o.status.success()).map(|output| {
-        String::from_utf8_lossy(&output.stdout).lines()
-            .filter_map(|line| line.trim().parse().ok()).collect()
-    }).unwrap_or_default()
-}
-
-fn executable_matches(selected: &std::path::Path, actual: &std::path::Path) -> bool {
-    let Ok(selected) = selected.canonicalize() else { return false };
-    let Ok(actual) = actual.canonicalize() else { return false };
-    if selected == actual {
-        return true;
-    }
-    // Linux Chrome's package entry point is a shell wrapper; its real
-    // executable is the sibling chrome binary in the same install directory.
-    #[cfg(target_os = "linux")]
-    if selected.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("google-chrome")) {
-        return selected.parent().map(|p| p.join("chrome")).and_then(|p| p.canonicalize().ok()).as_ref() == Some(&actual);
-    }
-    false
-}
-
-fn verify_debugger_owner(port: u16, exe: &str) -> Result<(), String> {
-    let owners: Vec<_> = listener_pids(port).into_iter().filter_map(process_executable).collect();
-    if owners.is_empty() {
-        return Err(format!(
-            "DEBUG_BROWSER_UNVERIFIED: cannot verify which executable owns debugging port {port}. \
-             Select the Comrade profile in Settings to launch the selected browser in its own session."
-        ));
-    }
-    if !owners.iter().all(|actual| executable_matches(std::path::Path::new(exe), actual)) {
-        return Err(format!(
-            "DEBUG_BROWSER_MISMATCH: debugging port {port} belongs to a different application than the selected browser {exe}. \
-             Change the debugging port or select the Comrade profile in Settings and save."
-        ));
-    }
-    Ok(())
 }
 
 /// Spawn, early-exit check, then DevTools wait. Ok = live child.
@@ -546,27 +198,15 @@ async fn spawn_and_settle(exe: &str, args: &[String], port: u16) -> Result<tokio
 /// Single retry on a fresh port (used after reclaiming a stale lock).
 async fn retry_launch(
     exe: &str,
-    launch_once: &(dyn Fn(u16) -> Vec<String> + Sync),
-    prefs: &crate::prefs::BrowserPrefs,
+    profile_key: &str,
     slot: &mut Option<ManagedBrowser>,
 ) -> Result<u16, String> {
     let exe_owned = exe.to_string();
     let port = free_port().map_err(|e| format!("PORT_FAILED: {e}"))?;
-    let args = launch_once(port);
+    let args = launch_args(port, profile_key);
     match spawn_and_settle(&exe_owned, &args, port).await {
         Ok(child) => {
-            let profile_key = args
-                .iter()
-                .find_map(|a| a.strip_prefix("--user-data-dir="))
-                .unwrap_or("")
-                .to_string();
-            *slot = Some(ManagedBrowser {
-                child: Some(child),
-                port,
-                prefs: prefs.clone(),
-                profile_key,
-                page_id: None,
-            });
+            *slot = Some(ManagedBrowser { child: Some(child), port, page_id: None });
             Ok(port)
         }
         Err(code) => Err(friendly_launch_error(&exe_owned, &code)),
@@ -575,7 +215,7 @@ async fn retry_launch(
 
 fn friendly_launch_error(exe: &str, code: &str) -> String {
     if let Some(n) = code.strip_prefix("EXITED:") {
-        format!("LAUNCH_FAILED: {exe} exited immediately with {n} (check --no-sandbox / missing libs).")
+        format!("LAUNCH_FAILED: bundled Chromium exited immediately with {n} ({exe}; check missing libs).")
     } else if let Some(detail) = code.strip_prefix("NO_DEVTOOLS:") {
         format!("LAUNCH_FAILED: {detail}")
     } else {
@@ -592,19 +232,17 @@ fn spawn_browser(exe: &str, args: &[String]) -> Result<tokio::process::Child, St
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true)
         .spawn()
-        .map_err(|e| format!("LAUNCH_FAILED: cannot start {exe}: {e}"))
+        .map_err(|e| format!("LAUNCH_FAILED: cannot start bundled Chromium ({exe}): {e}"))
 }
 
-/// Quick existence check for the profile lock (secondary signal next to
-/// exit code 21 — some forks differ; lock_holder_pid is the authority).
+/// Quick existence check for the profile lock.
 fn lock_held(profile: &std::path::Path) -> bool {
     // SingletonLock is a hostname-pid symlink, not a filesystem target.
     std::fs::symlink_metadata(profile.join("SingletonLock")).is_ok()
 }
 
 /// PID recorded in the profile's SingletonLock (`hostname-pid`), verified
-/// alive AND browser-shaped (guards against PID reuse and against locks from
-/// non-browser crashes). None = no live holder (lock missing or stale).
+/// alive AND browser-shaped (guards against PID reuse). None = no live holder.
 fn lock_holder_pid(profile: &std::path::Path) -> Option<u32> {
     let target = std::fs::read_link(profile.join("SingletonLock")).ok()?;
     let pid: u32 = target.to_string_lossy().rsplit('-').next()?.parse().ok()?;
@@ -612,7 +250,7 @@ fn lock_holder_pid(profile: &std::path::Path) -> Option<u32> {
         return None;
     }
     let cmd = process_command(pid).to_lowercase();
-    const MARKERS: &[&str] = &["brave", "chrome", "chromium", "msedge", "edge", "opera", "vivaldi"];
+    const MARKERS: &[&str] = &["chrome", "chromium", "headless_shell"];
     if MARKERS.iter().any(|m| cmd.contains(m)) {
         Some(pid)
     } else {
@@ -643,14 +281,10 @@ fn clear_stale_locks(profile: &std::path::Path) {
     }
 }
 
-/// Kill leftover browser processes launched by Comrade against the ISOLATED
-/// profile. Never call this for a user profile — only our own
-/// `--user-data-dir=<profile>` command lines match, then waits until the
-/// SingletonSocket lock clears (Chrome needs a moment to tear down its
-/// zygote children after SIGTERM).
+/// Kill leftover processes launched against the ISOLATED profile only.
+/// Scoped to our `--user-data-dir=<profile>` so nothing else is touched.
 async fn kill_stale_profile_holders(profile_key: &str) {
-    // pkill -f matches the full command line; scoped to our profile dir so
-    // the user's own browser windows are never touched.
+    // pkill -f matches the full command line; scoped to our profile dir.
     let _ = tokio::process::Command::new("pkill")
         .args(["-f", &format!("--user-data-dir={profile_key}")])
         .output()
@@ -677,27 +311,19 @@ async fn holder_running(profile_key: &str) -> bool {
         .unwrap_or(false)
 }
 
-pub fn gecko_unsupported(exe: &str) -> String {
-    format!(
-        "FIREFOX_UNSUPPORTED: \"{exe}\" is a Firefox-family (Gecko) browser. \
-         Gecko automation via WebDriver BiDi is planned but not implemented yet — \
-         pick a Chromium-family browser (Chrome, Brave, Edge, Chromium, Opera, Vivaldi) in Settings."
-    )
-}
-
-/// Outcome of detaching from / stopping the managed browser.
+/// Outcome of stopping the managed browser.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CloseOutcome {
-    /// Killed a browser Comrade launched.
+    /// Killed the bundled Chromium Comrade launched.
     Closed,
-    /// Detached from your live browser (left running — it's yours).
+    /// Kept for API compatibility; the bundled browser is always launched,
+    /// never attached, so detaching cannot happen.
     Detached,
     /// Nothing was connected.
     Idle,
 }
 
-/// Stop the managed browser (used by browser.close / tests). Launched
-/// instances are killed; attached live sessions are only detached from.
+/// Stop the managed browser (used by browser.close / tests).
 pub async fn close_chromium() -> CloseOutcome {
     let mut guard = managed_lock().lock().await;
     guard.failed_launch = None;
@@ -712,6 +338,42 @@ pub async fn close_chromium() -> CloseOutcome {
         Some(_) => CloseOutcome::Detached,
         None => CloseOutcome::Idle,
     }
+}
+
+/// DevTools port of the running instance, if any.
+pub async fn managed_port() -> Option<u16> {
+    let guard = managed_lock().lock().await;
+    let m = guard.browser.as_ref()?;
+    m.child.is_some().then_some(m.port)
+}
+
+/// Best-effort snapshot for the in-app pane: running flag + current URL/title.
+/// Never fails — the pane renders placeholders when the browser is down.
+pub async fn state_snapshot() -> serde_json::Value {
+    let Some(port) = managed_port().await else {
+        return serde_json::json!({ "running": false, "url": "", "title": "" });
+    };
+    if !http_ok(&format!("{}/json/version", debugger_url(port))).await {
+        return serde_json::json!({ "running": false, "url": "", "title": "" });
+    }
+    let url = current_url(port).await.unwrap_or_default();
+    let title = page_title(port).await.map(|(t, _)| t).unwrap_or_default();
+    serde_json::json!({ "running": true, "url": url, "title": title })
+}
+
+/// Raw PNG bytes of the current tab (for the in-app pane live view).
+pub async fn screenshot_bytes() -> Result<Vec<u8>, String> {
+    let port = ensure_chromium().await?;
+    let page = active_page(port).await?;
+    let res = cdp_call(&page.ws_url, "Page.captureScreenshot", serde_json::json!({ "format": "png" })).await?;
+    let b64 = res
+        .get("data")
+        .and_then(|d| d.as_str())
+        .ok_or_else(|| "SCREENSHOT_FAILED: browser returned no image data.".to_string())?;
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .map_err(|e| format!("SCREENSHOT_FAILED: bad image data: {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1122,53 +784,36 @@ pub async fn page_screenshot(port: u16) -> Result<std::path::PathBuf, String> {
     Ok(path)
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn family_detection_covers_forks() {
-        assert_eq!(detect_family("/usr/bin/google-chrome-stable"), BrowserFamily::Chromium);
-        assert_eq!(detect_family("/usr/bin/brave-origin"), BrowserFamily::Chromium);
-        assert_eq!(detect_family("/opt/microsoft/msedge/msedge"), BrowserFamily::Chromium);
-        assert_eq!(detect_family("com.brave.Browser"), BrowserFamily::Chromium);
-        assert_eq!(detect_family("/usr/bin/firefox"), BrowserFamily::Gecko);
-        assert_eq!(detect_family("/opt/zen/zen"), BrowserFamily::Gecko);
-        assert_eq!(detect_family("org.mozilla.firefox"), BrowserFamily::Gecko);
-        assert_eq!(detect_family("/usr/bin/librewolf"), BrowserFamily::Gecko);
+    #[tokio::test]
+    async fn bundled_exe_honors_override() {
+        let exe = std::env::current_exe().unwrap();
+        std::env::set_var("COMRADE_CHROMIUM_BIN", exe.to_string_lossy().to_string());
+        assert!(bundled_exe().await.is_ok());
+        std::env::remove_var("COMRADE_CHROMIUM_BIN");
     }
 
     #[test]
-    fn profile_resolution_prefers_real_dirs() {
-        // Whatever exists on this machine, resolution must be deterministic:
-        // comrade mode always yields the isolated profile.
-        let iso = resolve_profile_dir("/usr/bin/brave-origin", "comrade");
-        assert!(iso.ends_with("browser-profile"));
-        // Unknown forks safely fall back to the isolated profile.
-        let unknown = resolve_profile_dir("/usr/bin/some-future-browser", "user");
-        assert!(unknown.ends_with("browser-profile"));
-        // Known forks resolve into their conventional homes. Channel-aware:
-        // brave-origin keeps Brave-Origin (NOT Brave-Browser) — picking the
-        // wrong sibling silently yields a fresh logged-out profile.
-        let brave = resolve_profile_dir("/usr/bin/brave-origin", "user");
-        let s = brave.to_string_lossy().to_string();
-        if cfg!(target_os = "linux") {
-            assert!(s.ends_with("Brave-Origin"), "got {s}");
-            let plain = resolve_profile_dir("/usr/bin/brave", "user").to_string_lossy().to_string();
-            assert!(plain.ends_with("Brave-Browser"), "got {plain}");
-            let chrome = resolve_profile_dir("/usr/bin/google-chrome-stable", "user")
-                .to_string_lossy()
-                .to_string();
-            assert!(chrome.ends_with("google-chrome"), "got {chrome}");
-        } else {
-            assert!(s.contains("BraveSoftware") || s.ends_with("browser-profile"), "got {s}");
-        }
-        // Mode parsing: only "comrade" opts out of the user profile.
-        assert!(use_user_profile("user"));
-        assert!(use_user_profile(""));
-        assert!(use_user_profile("EVERYTHING"));
-        assert!(!use_user_profile("comrade"));
-        assert!(!use_user_profile("Comrade"));
+    fn install_failure_keeps_setup_code() {
+        // The agent stops the task on these codes instead of falling back to
+        // another browser: the built-in browser installs itself, and when the
+        // install itself fails (offline) the task reports it honestly.
+        let msg = super::super::provision::status_json();
+        assert!(msg.get("phase").and_then(|v| v.as_str()).is_some());
+    }
+
+    #[test]
+    fn launch_is_always_headless_and_isolated() {
+        let args = launch_args(9334, "/tmp/comrade-test-profile");
+        assert!(args.iter().all(|arg| arg.starts_with("--")), "no startup URL may be forwarded: {args:?}");
+        assert!(args.iter().any(|arg| arg == "--no-startup-window"));
+        assert!(args.iter().any(|arg| arg == "--headless=new"), "nothing may open outside the app: {args:?}");
+        assert!(args.iter().any(|arg| arg.starts_with("--user-data-dir=/tmp/comrade-test-profile")));
+        assert!(!args.iter().any(|arg| arg.contains("remote-debugging-port=0")));
     }
 
     #[test]
@@ -1176,7 +821,6 @@ mod tests {
         let dir = std::env::temp_dir().join("comrade-lock-test");
         let _ = std::fs::create_dir_all(&dir);
         assert_eq!(lock_holder_pid(&dir), None);
-        // Garbage target: no live holder.
         #[cfg(unix)]
         std::os::unix::fs::symlink("not-a-lock", dir.join("SingletonLock")).unwrap();
         #[cfg(unix)]
@@ -1209,25 +853,6 @@ mod tests {
     }
 
     #[test]
-    fn browser_startup_cannot_forward_blank_tabs_into_existing_session() {
-        for headless in [false, true] {
-            let args = launch_args(9334, headless, "/tmp/comrade-test-profile");
-            assert!(args.iter().all(|arg| arg.starts_with("--")), "no startup URL may be forwarded: {args:?}");
-            assert!(args.iter().any(|arg| arg == "--no-startup-window"));
-        }
-    }
-
-    #[test]
-    fn chrome_default_profile_policy_only_applies_to_supported_versions() {
-        assert!(chrome_version_requires_separate_profile("Google Chrome 136.0.7103.25\n"));
-        assert!(chrome_version_requires_separate_profile("Google Chrome 154.0.8037.57"));
-        assert!(!chrome_version_requires_separate_profile("Google Chrome 135.0.0.0"));
-        assert!(!chrome_version_requires_separate_profile("Google Chrome for Testing 154.0.0.0"));
-        assert!(!chrome_version_requires_separate_profile("Chromium 154.0.0.0"));
-        assert!(!chrome_version_requires_separate_profile("Brave Browser 144.1.86.142"));
-    }
-
-    #[test]
     fn page_selection_stays_on_same_target_when_another_tab_opens() {
         let page = |id: &str, url: &str| PageTarget { id: id.into(), url: url.into(), ws_url: String::new() };
         let targets = vec![
@@ -1240,17 +865,5 @@ mod tests {
         assert_eq!(choose_page(&targets, None).unwrap().id, "unrelated");
         assert_eq!(choose_page(&targets[..1], None).unwrap().id, "blank");
         assert!(choose_page(&[], None).is_none());
-    }
-
-    #[test]
-    fn debugger_identity_uses_executable_path_instead_of_browser_brand() {
-        let current = std::env::current_exe().unwrap();
-        assert!(executable_matches(&current, &current));
-        assert!(!executable_matches(&current, std::path::Path::new("/definitely-not-the-same-browser")));
-        #[cfg(unix)]
-        {
-            // Executables sharing a directory are not interchangeable.
-            assert!(!executable_matches(std::path::Path::new("/bin/sh"), std::path::Path::new("/bin/ls")));
-        }
     }
 }

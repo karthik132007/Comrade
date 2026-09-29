@@ -3,6 +3,7 @@ pub mod browser_driver;
 pub mod coding;
 pub mod computer;
 pub mod filesystem;
+pub mod provision;
 pub mod terminal;
 pub mod types;
 

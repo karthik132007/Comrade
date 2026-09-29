@@ -21,8 +21,8 @@ Rules:
 - Use tools for actions. Never claim you did something you did not call a tool for.
 - CODING tasks (modify/create/debug source code) MUST go through coding.executeTask (it routes to the enabled coding agent) — never edit code with filesystem.write directly.
 - BROWSER_* tools read/navigate sites only; they cannot change code.
-- For website actions, use browser.* tools with the browser selected in Settings. browser.open navigates the same tab; reuse it throughout the task.
-- Never work around a browser connection/setup failure by launching another browser, running open/xdg-open/start in the terminal, or using computer.openApplication. Report the setup error and the Settings change needed.
+- For website actions, use browser.* tools: they drive Comrade's own bundled Chromium, visible only in the resizable in-app browser pane. browser.open navigates the same tab; reuse it throughout the task.
+- Never work around a browser connection/setup failure by launching another browser, running open/xdg-open/start in the terminal, or using computer.openApplication. Report the setup error and the fetch step needed.
 - After each action, verify: re-read, re-list, check output, then report what actually happened.
 - Keep responses short and factual. No emojis.
 - Never print secrets, keys, tokens, or cookies.
@@ -355,11 +355,10 @@ impl<P: LlmProvider, E: Embedder> Agent<P, E> {
 fn browser_setup_failed(tool: &str, code: &str) -> bool {
     tool.starts_with("browser.")
         && matches!(code,
-            "NO_BROWSER" | "BROWSER_NOT_FOUND" | "FIREFOX_UNSUPPORTED"
-            | "FLATPAK_UNSUPPORTED" | "PROFILE_IN_USE" | "PROFILE_FAILED"
-            | "LAUNCH_FAILED" | "PORT_FAILED" | "DEBUG_BROWSER_MISMATCH"
-            | "DEBUG_BROWSER_UNVERIFIED" | "DEFAULT_PROFILE_UNSUPPORTED"
-            | "PROFILE_DEBUGGING_UNAVAILABLE")
+            "BROWSER_SETUP" | "BROWSER_NOT_FOUND" | "BROWSER_ERROR"
+            | "PROFILE_FAILED" | "LAUNCH_FAILED" | "PORT_FAILED"
+            | "CDP_HTTP" | "CDP_WS" | "CDP_TIMEOUT" | "CDP_ERROR"
+            | "NAVIGATE_FAILED" | "OPEN_FAILED")
 }
 
 #[cfg(test)]
@@ -415,7 +414,7 @@ mod tests {
             _: &'a serde_json::Value,
             _: &'a ToolContext,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolResult> + Send + 'a>> {
-            Box::pin(async { ToolResult::fail("PROFILE_IN_USE", "Choose a supported profile in Settings.") })
+            Box::pin(async { ToolResult::fail("BROWSER_SETUP", "Built-in browser install failed (offline?). Reconnect and retry.") })
         }
     }
 
@@ -443,7 +442,7 @@ mod tests {
         let task = agent.run_task("Open example.com", &NoopCallbacks).await;
         assert_eq!(task.status, TaskStatus::Failed);
         assert_eq!(task.tool_calls.len(), 1);
-        assert_eq!(task.error.as_deref(), Some("Choose a supported profile in Settings."));
+        assert_eq!(task.error.as_deref(), Some("Built-in browser install failed (offline?). Reconnect and retry."));
     }
 
     #[test]

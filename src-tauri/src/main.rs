@@ -15,7 +15,7 @@ use comrade_core::logger::{log, Level};
 use comrade_core::history::{title_for, ChatMessageRow, ChatSession, HistoryStore};
 use comrade_core::memory::{import_chatgpt_json, import_text, migrate_legacy_json, MemoryItem, MemoryStore, ScoredMemory};
 use comrade_core::paths;
-use comrade_core::prefs::{self, BrowserInfo, BrowserPrefs, Prefs};
+use comrade_core::prefs::{self, Prefs};
 use comrade_core::task_state::{TaskState, TaskStatus};
 use comrade_core::tools::{build_tools, coding};
 use comrade_core::voice::capture::{list_input_devices, list_output_devices, AudioDeviceInfo};
@@ -434,7 +434,7 @@ async fn start_voice_input(
         vad_min_speech_ms: prefs.voice.vad.min_speech_ms,
         tts_voice: prefs.voice.tts.voice.clone(),
         tts_speed: prefs.voice.tts.speed,
-        num_threads: 2,
+        num_threads: prefs.voice.runtime.num_threads,
     })
     .await
     .map_err(|e| truncate_err(e, 300))?;
@@ -451,11 +451,15 @@ async fn start_voice_input(
             VoiceRuntimeConfig {
                 silence_ms: prefs.voice.vad.silence_ms,
                 min_speech_ms: prefs.voice.vad.min_speech_ms,
+                max_utterance_ms: prefs.voice.runtime.max_utterance_ms,
                 vad_threshold: prefs.voice.vad.threshold,
+                decode_every_frames: prefs.voice.runtime.decode_every_frames,
+                chunk_max_chars: prefs.voice.runtime.chunk_max_chars,
+                chunk_min_merge: prefs.voice.runtime.chunk_min_merge,
                 tts_voice: prefs.voice.tts.voice.clone(),
                 tts_speed: prefs.voice.tts.speed,
+                num_threads: prefs.voice.runtime.num_threads,
                 speak: prefs.voice.autoplay,
-                ..VoiceRuntimeConfig::default()
             },
             one_shot,
         )
@@ -634,10 +638,130 @@ async fn system_coding_agents() -> Result<Vec<comrade_core::prefs::CodingAgentIn
     Ok(comrade_core::prefs::detect_coding_agents())
 }
 
-/// Browsers installed on this machine (for onboarding + Settings).
+/// Navigate Comrade's own in-app browser (bundled Chromium) to a URL.
+/// Used by the in-app browser pane's address bar — same tab the agent drives.
 #[tauri::command]
-async fn system_browsers() -> Result<Vec<BrowserInfo>, String> {
-    Ok(prefs::detect_browsers())
+async fn browser_open(url: String) -> Result<serde_json::Value, String> {
+    use comrade_core::tools::browser_driver;
+    let url = url.trim().to_string();
+    if url.is_empty() {
+        return Err("EMPTY_URL: no URL provided.".into());
+    }
+    let port = browser_driver::ensure_chromium().await.map_err(|m| trim_msg(m, 400))?;
+    let (requested, final_url) =
+        browser_driver::page_navigate(port, &url).await.map_err(|m| trim_msg(m, 400))?;
+    let title = browser_driver::page_title(port)
+        .await
+        .map(|(t, _)| t)
+        .unwrap_or_default();
+    Ok(serde_json::json!({ "requested": requested, "url": final_url, "title": title }))
+}
+
+#[derive(Serialize)]
+struct BrowserPaneState {
+    running: bool,
+    url: String,
+    title: String,
+}
+
+/// Snapshot for the in-app browser pane (never fails — placeholders when down).
+#[tauri::command]
+async fn browser_state() -> Result<BrowserPaneState, String> {
+    use comrade_core::tools::browser_driver;
+    Ok(state_from_snapshot(browser_driver::state_snapshot().await))
+}
+
+fn state_from_snapshot(snap: serde_json::Value) -> BrowserPaneState {
+    BrowserPaneState {
+        running: snap.get("running").and_then(|v| v.as_bool()).unwrap_or(false),
+        url: snap.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        title: snap.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+    }
+}
+
+/// Make sure the built-in browser is installed and running (installs itself
+/// on first use — one-time download with progress via
+/// `browser_provision_status`). Used when the in-app pane opens.
+#[tauri::command]
+async fn browser_ensure() -> Result<BrowserPaneState, String> {
+    use comrade_core::tools::browser_driver;
+    let port = browser_driver::ensure_chromium().await.map_err(|m| trim_msg(m, 400))?;
+    let url = browser_driver::current_url(port).await.unwrap_or_default();
+    let title = browser_driver::page_title(port)
+        .await
+        .map(|(t, _)| t)
+        .unwrap_or_default();
+    Ok(BrowserPaneState { running: true, url, title })
+}
+
+/// Self-install progress for the built-in browser
+/// ({installed, phase, downloaded, total, error}).
+#[tauri::command]
+async fn browser_provision_status() -> Result<serde_json::Value, String> {
+    use comrade_core::tools::provision;
+    Ok(provision::status_json())
+}
+
+/// Live screenshot of the in-app browser tab as a data URL (PNG).
+#[tauri::command]
+async fn browser_screenshot() -> Result<String, String> {
+    use base64::Engine as _;
+    use comrade_core::tools::browser_driver;
+    let bytes = browser_driver::screenshot_bytes().await.map_err(|m| trim_msg(m, 400))?;
+    Ok(format!(
+        "data:image/png;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(&bytes)
+    ))
+}
+
+/// Stop the bundled Chromium (in-app browser pane goes idle).
+#[tauri::command]
+async fn browser_close() -> Result<bool, String> {
+    use comrade_core::tools::browser_driver;
+    Ok(matches!(
+        browser_driver::close_chromium().await,
+        browser_driver::CloseOutcome::Closed
+    ))
+}
+
+/// Step back in the in-app browser history (pane toolbar).
+#[tauri::command]
+async fn browser_back() -> Result<serde_json::Value, String> {
+    use comrade_core::tools::browser_driver;
+    let port = browser_driver::ensure_chromium().await.map_err(|m| trim_msg(m, 400))?;
+    let url = browser_driver::cdp_eval_via_active(port, "history.back()")
+        .await
+        .map_err(|m| trim_msg(m, 400))?;
+    let _ = url;
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    let cur = browser_driver::current_url(port).await.unwrap_or_default();
+    Ok(serde_json::json!({ "url": cur }))
+}
+
+/// Step forward in the in-app browser history (pane toolbar).
+#[tauri::command]
+async fn browser_forward() -> Result<serde_json::Value, String> {
+    use comrade_core::tools::browser_driver;
+    let port = browser_driver::ensure_chromium().await.map_err(|m| trim_msg(m, 400))?;
+    let _ = browser_driver::cdp_eval_via_active(port, "history.forward()")
+        .await
+        .map_err(|m| trim_msg(m, 400))?;
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    let cur = browser_driver::current_url(port).await.unwrap_or_default();
+    Ok(serde_json::json!({ "url": cur }))
+}
+
+/// Reload the in-app browser tab (pane toolbar).
+#[tauri::command]
+async fn browser_reload() -> Result<serde_json::Value, String> {
+    use comrade_core::tools::browser_driver;
+    let port = browser_driver::ensure_chromium().await.map_err(|m| trim_msg(m, 400))?;
+    let url = browser_driver::page_reload(port).await.map_err(|m| trim_msg(m, 400))?;
+    Ok(serde_json::json!({ "url": url }))
+}
+
+fn trim_msg(msg: String, n: usize) -> String {
+    msg.chars().take(n).collect()
 }
 
 #[tauri::command]
@@ -650,15 +774,6 @@ async fn get_prefs() -> Result<Prefs, String> {
 async fn save_prefs(prefs: Prefs) -> Result<Prefs, String> {
     prefs::save(&prefs).map_err(|e| truncate_err(e, 300))?;
     Ok(prefs::load())
-}
-
-/// Apply a browser choice immediately without saving unrelated settings.
-#[tauri::command]
-async fn save_browser_prefs(browser: BrowserPrefs) -> Result<Prefs, String> {
-    let mut prefs = prefs::load();
-    prefs.browser = browser;
-    prefs::save(&prefs).map_err(|e| truncate_err(e, 300))?;
-    Ok(prefs)
 }
 
 #[derive(Serialize)]
@@ -945,6 +1060,23 @@ fn main() {
                     Some(&serde_json::json!({ "detected": ids, "default": default })),
                 );
             });
+            // The browser is a core feature: start its one-time self-install
+            // in the background so it is ready before first use.
+            tauri::async_runtime::spawn(async move {
+                match comrade_core::tools::provision::ensure_provisioned().await {
+                    Ok(exe) => log(
+                        Level::Info,
+                        "BOOT",
+                        "built-in browser ready",
+                        Some(&serde_json::json!({ "exe": exe.to_string_lossy() })),
+                    ),
+                    Err(e) => {
+                        let msg: String = e.chars().take(200).collect();
+                        log(Level::Warn, "BOOT", "built-in browser install deferred; will retry on first use",
+                            Some(&serde_json::json!({ "error": msg })));
+                    }
+                }
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -968,11 +1100,18 @@ fn main() {
             history_get,
             history_delete,
             history_rename,
-            system_browsers,
             system_coding_agents,
+            browser_open,
+            browser_state,
+            browser_ensure,
+            browser_provision_status,
+            browser_screenshot,
+            browser_close,
+            browser_back,
+            browser_forward,
+            browser_reload,
             get_prefs,
-            save_prefs,
-            save_browser_prefs
+            save_prefs
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Comrade");

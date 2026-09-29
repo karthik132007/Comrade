@@ -36,11 +36,15 @@ Linux/macOS:  $COMRADE_HOME, else $XDG_CONFIG_HOME/comrade-agent, else ~/.config
 Windows:      %APPDATA%/comrade-agent
 
 comrade-agent/
-  comrade.conf          preferences (browser, voice, coding agents)
+  comrade.conf          preferences (in-app browser pane, voice, coding agents)
   comrade-memory.db   SQLite vector memory (auto-moved from the old
                       ~/.local/share/com.comrade.desktop/ on first run)
   history.db          chat sessions + transcripts (☰ sidebar: browse, reopen, delete)
-  browser-profile/    single shared profile for the selected browser (override: COMRADE_PROFILE_DIR)
+  browser/            Comrade's own bundled Chromium — installed automatically
+                      on first launch / first browser use (one-time download,
+                      progress in the in-app pane; override: COMRADE_CHROMIUM_BIN;
+                      offline fallback: ./scripts/fetch-chromium.sh)
+  browser-profile/    its single isolated profile (override: COMRADE_PROFILE_DIR)
   webview/            webview cache/storage (was ~/.local/share/com.comrade.desktop/)
   sysroot/ + shim/    vendored webkit (rootless Linux dev only)
 ```
@@ -88,12 +92,9 @@ Useful commands: `cargo check --workspace`, `cargo clippy --workspace`,
 
 ## Notes
 
-- First launch shows onboarding: pick the browser Comrade drives from the ones
-  detected on your machine (Brave/Chrome/Chromium/Edge/Opera/Vivaldi, incl.
-  flatpak), and tick which coding agents it may use (all enabled by default).
-  Everything lives in `comrade.conf` and can be changed in
-  Settings → Preferences. Browser, profile, headless mode, and debug-port changes
-  save automatically; the next task waits for that save to finish.
+- First launch shows onboarding: tick which coding agents Comrade may use
+  (all enabled by default). Everything lives in `comrade.conf` and can be
+  changed in Settings. The browser needs no setup — it is bundled.
 - Coding tasks route to your default enabled agent (`coding.executeTask`):
   opencode, Claude Code, Codex, Copilot CLI, Qwen Code have real adapters;
   others appear for tracking until their CLIs support non-interactive runs.
@@ -104,11 +105,16 @@ Useful commands: `cargo check --workspace`, `cargo clippy --workspace`,
   `docs/VOICE.md` for architecture, models, tests, and troubleshooting.
 - DeepSeek validates function names strictly (`^[a-zA-Z0-9_-]+$`), so dotted
   tool names go on the wire as `namespace_tool` and are decoded back.
-- Browser tools use the selected Chromium browser and reuse one tab across
-  navigation, reading, and clicking. A browser connection failure stops the task
-  with setup guidance instead of opening the system-default browser.
-- For Chrome 136+, select **Isolated Comrade profile** and sign into that Chrome
-  window as needed. [Chrome disables remote debugging of its normal profile](https://developer.chrome.com/blog/remote-debugging-port).
-  Existing debugging connections are used only when their process matches the
-  selected browser; ordinary personal browser windows are left running.
+- Browser: Comrade drives its own bundled Chromium
+  (`comrade-agent/browser/`, single isolated profile — your system browsers
+  are never touched). The browser is a core feature, not an add-on: the app
+  installs it itself on first launch / first browser use (one-time download,
+  live progress in the pane), so there is nothing to set up. It always runs
+  headless, so nothing ever opens outside the app: the only visible surface
+  is the resizable in-app browser pane (🌐 in the header, auto-shown on
+  browser use), rendering live views of the same tab the agent drives. Drag
+  the divider to resize; the address bar, back/forward/reload, and refresh
+  controls drive that same tab. One tab is reused across navigation, reading,
+  and clicking. If the self-install itself fails (e.g. offline), the task
+  reports it honestly instead of opening another browser.
 - No system tray / wake-word yet — push-to-talk via the mic button.
