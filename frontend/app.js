@@ -39,6 +39,22 @@
   var subtitle = document.getElementById('subtitle');
   var form = document.getElementById('composer');
   var input = document.getElementById('input');
+  var modelPick = document.getElementById('model-pick');
+  var SRV_CHAT_MODELS = [
+    'nvidia/nemotron-3.5-lightning',
+    'deepseek-flash',
+    'openai/gpt-oss-120b',
+    'google/gemma-4-31b-it',
+  ];
+
+  // Per-message model: remembered across reloads, sent verbatim each message.
+  try {
+    var savedModel = window.localStorage.getItem('comrade-model');
+    if (savedModel && SRV_CHAT_MODELS.indexOf(savedModel) >= 0 && modelPick) modelPick.value = savedModel;
+  } catch (e) { /* noop */ }
+  if (modelPick) modelPick.addEventListener('change', function () {
+    try { window.localStorage.setItem('comrade-model', modelPick.value); } catch (e) { /* noop */ }
+  });
   var messagesEl = document.getElementById('messages');
   var taskPanel = document.getElementById('task-panel');
   var taskTitle = document.getElementById('task-title');
@@ -149,7 +165,8 @@
     addMessage('user', text);
     resetTaskPanel(text);
     currentResponseEl = null;
-    invoke('send_message', { text: text, sessionId: currentSessionId }).then(function (res) {
+    invoke('send_message', { text: text, sessionId: currentSessionId, model: modelPick ? modelPick.value : null }).then(function (res) {
+      messageStarting = false;
       if (!res) return;
       if (res.session_id) { setSession(res.session_id); refreshChatList(); }
       if (res.status === 'done' || res.status === 'running') return;
@@ -309,6 +326,10 @@
       setState(ev.status === 'done' ? 'idle' : 'error');
       if (browserIsOpen) refreshBrowser();
       if (ev.status !== 'done' && ev.error) addMessage('comrade', 'Error: ' + ev.error);
+      else if (ev.status === 'done' && ev.result && !currentResponseEl) {
+        // No tokens streamed (e.g. non-streaming fallback): render the result.
+        currentResponseEl = addMessage('comrade', ev.result);
+      }
     }
   }
 
@@ -360,6 +381,18 @@
   var modelProgress = document.getElementById('model-progress');
   var modelDownloadActive = false;
   var currentVoicePrefs = null;
+  // Service backend controls (Settings → Service).
+  var srvEnabled = document.getElementById('srv-enabled');
+  var srvUrl = document.getElementById('srv-url');
+  var srvKey = document.getElementById('srv-key');
+  var srvLlm = document.getElementById('srv-llm');
+  var srvEmb = document.getElementById('srv-emb');
+  var srvDim = document.getElementById('srv-dim');
+  var srvStt = document.getElementById('srv-stt');
+  var srvTts = document.getElementById('srv-tts');
+  var srvTest = document.getElementById('srv-test');
+  var srvStatus = document.getElementById('srv-status');
+  var voiceBackend = document.getElementById('voice-backend');
   var memSearch = document.getElementById('mem-search');
   var memRefresh = document.getElementById('mem-refresh');
   var memCount = document.getElementById('mem-count');
@@ -392,8 +425,19 @@
   function refreshAppInfo() {
     invoke('app_info', {}).then(function (info) {
       var kinds = (info.memory_kinds || []).map(function (k) { return k[0] + ':' + k[1]; }).join(' ');
-      modelInfo.textContent = info.provider + ' \u00b7 ' + info.model +
-        '  |  memories: ' + info.memory_count + (kinds ? ' (' + kinds + ')' : '');
+      var backend = info.backend === 'service' ? 'service' : 'direct';
+      var line = backend + ' · ' + info.provider + ' · ' + info.model +
+        '  |  voice: ' + (info.voice_backend || 'local');
+      if (info.backend === 'service' && info.server_url) line += ' (' + info.server_url + ')';
+      line += '  |  memories: ' + info.memory_count + (kinds ? ' (' + kinds + ')' : '');
+      modelInfo.textContent = line;
+      // Composer picker follows the active brain model unless the user picked one.
+      try {
+        if (modelPick && !window.localStorage.getItem('comrade-model') &&
+            info.model && SRV_CHAT_MODELS.indexOf(info.model) >= 0) {
+          modelPick.value = info.model;
+        }
+      } catch (e) { /* noop */ }
     }).catch(function (err) {
       modelInfo.textContent = 'unavailable: ' + errMsg(err);
     });
@@ -919,7 +963,7 @@
       return invoke('save_prefs', { prefs: {
         browser: (existing && existing.browser) || { auto_show: true, width_pct: 45 },
         voice: {
-          autoplay: true, enabled: true, mic: v.mic || '',
+          autoplay: true, enabled: true, mic: v.mic || '', backend: 'server',
           stt: v.stt || { engine: 'sherpa-onnx', model: 'zipformer-en-20M-int8', language: 'en', sample_rate: 16000 },
           vad: v.vad || { threshold: 0.5, silence_ms: 700, min_speech_ms: 250 },
           tts: v.tts || { engine: 'kokoro', voice: '0', speed: 1.0 },
@@ -929,6 +973,7 @@
         llm: (existing && existing.llm) || { provider: 'deepseek', model: 'deepseek-flash' },
         agent: (existing && existing.agent) || { max_steps: 15, timeout_ms: 120000 },
         memory: (existing && existing.memory) || { embedding_model: 'openai/text-embedding-3-small', embedding_dim: 1536 },
+        server: (existing && existing.server) || { enabled: false, base_url: '', api_key: '', llm_model: 'deepseek-flash', embedding_model: 'comrade-embed', embedding_dim: 1536, stt_model: 'comrade-stt', tts_voice: 'default' },
       } });
     }).then(function () {
       onboardingEl.hidden = true;
@@ -943,6 +988,7 @@
     voiceSilence.value = v.vad ? v.vad.silence_ms : 700;
     voiceTtsVoice.value = v.tts ? v.tts.voice : '0';
     voiceTtsSpeed.value = v.tts ? v.tts.speed : 1.0;
+    if (voiceBackend) voiceBackend.value = (v.backend === 'local') ? 'local' : 'server';
     invoke('get_audio_devices', {}).then(function (devs) {
       voiceMic.innerHTML = '';
       var def = document.createElement('option');
@@ -999,6 +1045,64 @@
     });
   });
 
+  var SRV_LLM_MODELS = [
+    'nvidia/nemotron-3.5-lightning',
+    'deepseek-flash',
+    'openai/gpt-oss-120b',
+    'google/gemma-4-31b-it',
+  ];
+  var SRV_DEFAULT_LLM = 'deepseek-flash';
+
+  function normSrvLlm(v) {
+    v = (v || '').trim();
+    return SRV_LLM_MODELS.indexOf(v) >= 0 ? v : SRV_DEFAULT_LLM;
+  }
+
+  function fillServerSettings(s) {
+    s = s || {};
+    if (srvEnabled) srvEnabled.checked = s.enabled === true;
+    if (srvUrl) srvUrl.value = s.base_url || '';
+    if (srvKey) srvKey.value = s.api_key || '';
+    if (srvLlm) srvLlm.value = normSrvLlm(s.llm_model);
+    if (srvEmb) srvEmb.value = s.embedding_model || 'comrade-embed';
+    if (srvDim) srvDim.value = s.embedding_dim || 1536;
+    if (srvStt) srvStt.value = s.stt_model || 'comrade-stt';
+    if (srvTts) srvTts.value = s.tts_voice || 'default';
+    if (srvStatus) srvStatus.textContent = '';
+  }
+
+  function serverPrefsForSave() {
+    return {
+      enabled: !!(srvEnabled && srvEnabled.checked),
+      base_url: (srvUrl && srvUrl.value.trim()) || '',
+      api_key: (srvKey && srvKey.value) || '',
+      llm_model: normSrvLlm(srvLlm && srvLlm.value),
+      embedding_model: (srvEmb && srvEmb.value.trim()) || 'comrade-embed',
+      embedding_dim: parseInt(srvDim && srvDim.value, 10) || 1536,
+      stt_model: (srvStt && srvStt.value.trim()) || 'comrade-stt',
+      tts_voice: (srvTts && srvTts.value.trim()) || 'default',
+    };
+  }
+
+  if (srvTest) srvTest.addEventListener('click', function () {
+    if (srvStatus) srvStatus.textContent = 'probing server...';
+    invoke('server_status', {}).then(function (r) {
+      if (srvStatus) srvStatus.textContent = r + ' — loading models...';
+      return invoke('server_models', {});
+    }).then(function (m) {
+      var ids = [];
+      var data = (m && m.data) || [];
+      data.forEach(function (entry) {
+        if (entry && entry.id) ids.push(entry.id);
+      });
+      var shown = ids.slice(0, 12).join(', ') + (ids.length > 12 ? ' …(+' + (ids.length - 12) + ' more)' : '');
+      if (srvStatus) srvStatus.textContent = (srvStatus.textContent || '').replace(' — loading models...', '') +
+        (ids.length ? '  |  models: ' + shown : '  |  no models listed.');
+    }).catch(function (err) {
+      if (srvStatus) srvStatus.textContent = 'unreachable: ' + errMsg(err);
+    });
+  });
+
   function voicePrefsForSave() {
     var base = currentVoicePrefs || {};
     var vad = base.vad || {};
@@ -1009,6 +1113,7 @@
       autoplay: prefAutoplay.checked,
       enabled: base.enabled !== false,
       mic: voiceMic.value || '',
+      backend: (voiceBackend && voiceBackend.value === 'server') ? 'server' : 'local',
       stt: {
         engine: stt.engine || 'sherpa-onnx',
         model: stt.model || 'zipformer-en-20M-int8',
@@ -1048,6 +1153,7 @@
       prefAutoplay.checked = !(prefs.voice && prefs.voice.autoplay === false);
       currentVoicePrefs = prefs.voice || null;
       fillVoiceSettings(prefs.voice || {});
+      fillServerSettings(prefs.server || {});
       refreshModelStatus();
       prefFile.textContent = 'Stored in comrade.conf inside the comrade-agent home folder. The browser needs no setup — it is bundled and lives only inside this app.';
     }).catch(function (err) {
@@ -1162,6 +1268,7 @@
         llm: (existing && existing.llm) || { provider: 'deepseek', model: 'deepseek-flash' },
         agent: (existing && existing.agent) || { max_steps: 15, timeout_ms: 120000 },
         memory: (existing && existing.memory) || { embedding_model: 'openai/text-embedding-3-small', embedding_dim: 1536 },
+        server: serverPrefsForSave(),
       } });
     }).then(function () {
       prefStatus.textContent = 'saved to comrade.conf.';

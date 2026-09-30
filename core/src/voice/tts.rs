@@ -107,6 +107,20 @@ impl SpeechSynth for SherpaKokoro {
     }
 }
 
+/// No-op synth for server-voice engines: TTS runs on the server per
+/// sentence chunk (see manager.rs), so the local slot stays inert.
+pub struct NoopSynth;
+
+impl SpeechSynth for NoopSynth {
+    fn synthesize(&mut self, _text: &str) -> anyhow::Result<TtsPcm> {
+        anyhow::bail!("local TTS disabled in server-voice mode")
+    }
+
+    fn sample_rate(&self) -> u32 {
+        24000
+    }
+}
+
 /// Scripted synth for tests: 0.1 s of tone per character (capped).
 pub struct FakeSynth {
     pub calls: Vec<String>,

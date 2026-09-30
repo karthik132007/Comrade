@@ -9,19 +9,21 @@ use std::time::Duration;
 
 use comrade_core::agent::{Agent, AgentCallbacks, AgentDeps};
 use comrade_core::config;
-use comrade_core::llm::factory::{create_configured, embedding_key};
-use comrade_core::llm::{Embedder, OpenRouterEmbedder, OpenRouterProvider};
+use comrade_core::llm::factory::{create_backends, embedding_dim};
+use comrade_core::llm::Embedder;
 use comrade_core::logger::{log, Level};
+use comrade_core::service::{AnyEmbedder, AnyLlm, ServiceClient};
 use comrade_core::history::{title_for, ChatMessageRow, ChatSession, HistoryStore};
 use comrade_core::memory::{import_chatgpt_json, import_text, migrate_legacy_json, MemoryItem, MemoryStore, ScoredMemory};
 use comrade_core::paths;
 use comrade_core::prefs::{self, Prefs};
 use comrade_core::task_state::{TaskState, TaskStatus};
 use comrade_core::tools::{build_tools, coding};
+use comrade_core::tools::types::Tool;
 use comrade_core::voice::capture::{list_input_devices, list_output_devices, AudioDeviceInfo};
 use comrade_core::voice::manager::{
-    ensure_shared_engines, AgentOutcome, AgentRunner, SharedEngines,
-    VoiceController, VoiceEvent, VoiceHooks, VoiceState,
+    ensure_server_engines, ensure_shared_engines, AgentOutcome, AgentRunner, ServerVoice,
+    SharedEngines, VoiceController, VoiceEvent, VoiceHooks, VoiceState,
 };
 use comrade_core::voice::models::models_dir;
 use serde::Serialize;
@@ -30,13 +32,15 @@ use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder
 type Shared = Arc<AppState>;
 
 struct AppState {
-    agent: Agent<OpenRouterProvider, OpenRouterEmbedder>,
+    tools: Vec<Arc<dyn Tool>>,
+    cwd: PathBuf,
     memory: Arc<std::sync::Mutex<MemoryStore>>,
     history: Arc<std::sync::Mutex<HistoryStore>>,
-    embedder: Arc<OpenRouterEmbedder>,
+    embedder: Arc<AnyEmbedder>,
     provider: String,
     model: String,
     embedding_model: String,
+    server: Option<ServiceClient>,
     voice_engines: std::sync::Mutex<Option<SharedEngines>>,
     voice_session: std::sync::Mutex<Option<VoiceController>>,
     model_download: AtomicBool,
@@ -213,7 +217,7 @@ impl AgentRunner for VoiceAgentRunner {
                 cancel: hooks.cancel.clone(),
             };
             let (task, new_sid) =
-                execute_task(&self.app, &self.shared, &transcript, sid, &cb).await;
+                execute_task(&self.app, &self.shared, &transcript, sid, None, &cb).await;
             *self.session.lock().unwrap() = Some(new_sid);
             let ok = task.status == TaskStatus::Done;
             let text = task
@@ -312,11 +316,48 @@ async fn persist_turn(shared: &Shared, sid: &str, user_text: &str, task: &TaskSt
     let _ = h.touch(sid);
 }
 
+/// Build the agent from live config on every task, so switching between
+/// direct APIs and the service server (Settings → Service, or .env) takes
+/// effect immediately — no restart needed. Tools/memory/cwd are shared;
+/// only the LLM + embedder backends rebind.
+fn build_live_agent(shared: &Shared, model_override: Option<String>) -> Agent<AnyLlm, AnyEmbedder> {
+    let root = config::find_project_root();
+    let live = config::load_config(&root);
+    let (llm_backend, embed_backend) = create_backends(&live);
+    // Per-message model pick (composer dropdown): exact allowlist id, and
+    // only in service mode — direct mode keeps its configured model.
+    let model = if live.use_service() {
+        match model_override.map(|m| comrade_core::service::normalize_llm_model(&m)) {
+            Some(m) => m,
+            None => live.server_llm_model.clone(),
+        }
+    } else {
+        live.llm_model.clone()
+    };
+    log(
+        Level::Agent,
+        "backend",
+        if live.use_service() { "service" } else { "direct" },
+        Some(&serde_json::json!({ "model": model })),
+    );
+    Agent::new(AgentDeps {
+        llm: Arc::new(llm_backend),
+        embedder: Arc::new(embed_backend),
+        tools: shared.tools.clone(),
+        memory: shared.memory.clone(),
+        cwd: shared.cwd.clone(),
+        model: Some(model),
+        max_steps: live.max_steps,
+        timeout_ms: live.timeout_ms,
+    })
+}
+
 async fn execute_task<C: AgentCallbacks>(
     app: &AppHandle,
     shared: &Shared,
     text: &str,
     session_id: Option<String>,
+    model: Option<String>,
     cb: &C,
 ) -> (TaskState, String) {
     log(Level::Info, "USER", &text.chars().take(300).collect::<String>(), None);
@@ -333,7 +374,7 @@ async fn execute_task<C: AgentCallbacks>(
         }
         None => create_session(shared, text),
     };
-    let task = shared.agent.run_task(text, cb).await;
+    let task = build_live_agent(shared, model).run_task(text, cb).await;
     emit(app, serde_json::json!({ "type": "state", "state": "idle" }));
     emit(
         app,
@@ -370,6 +411,7 @@ async fn send_message(
     state: State<'_, Shared>,
     text: String,
     session_id: Option<String>,
+    model: Option<String>,
 ) -> Result<TaskSummary, String> {
     let text = text.trim().to_string();
     if text.is_empty() {
@@ -382,12 +424,48 @@ async fn send_message(
         .map_err(|_| "A task is already running. Cancel it first.".to_string())?;
     shared.cancel.store(false, Ordering::SeqCst);
     let cb = Callbacks { app: app.clone(), shared: shared.clone() };
-    let (task, sid) = execute_task(&app, &shared, &text, session_id, &cb).await;
+    let (task, sid) = execute_task(&app, &shared, &text, session_id, model, &cb).await;
     Ok(TaskSummary {
         status: task.status.as_str().to_string(),
         result: task.result,
         error: task.error,
         session_id: sid,
+    })
+}
+
+/// Resolve server-voice config for this session: voice backend set to
+/// `server` in Settings plus a configured service server. Returns None for
+/// fully local voice (on-device models required).
+fn cfg_server_voice(shared: &Shared, prefs: &Prefs) -> Option<ServerVoice> {
+    if prefs.voice.backend.trim().to_lowercase() != "server" {
+        return None;
+    }
+    // Prefer the startup client; fall back to live prefs (+env key) so
+    // enabling the server in Settings works without a restart. An empty
+    // URL means the built-in backend (never shown in UI or conf).
+    let client = shared.server.clone().or_else(|| {
+        let base_url = comrade_core::service::resolve_server_url(&prefs.server.base_url);
+        let api_key = std::env::var("COMRADE_SERVER_KEY")
+            .ok()
+            .filter(|k| !k.trim().is_empty())
+            .unwrap_or_else(|| prefs.server.api_key.clone());
+        Some(ServiceClient::new(comrade_core::service::ServiceConfig {
+            base_url,
+            api_key,
+            llm_model: prefs.server.llm_model.clone(),
+            embedding_model: prefs.server.embedding_model.clone(),
+            embedding_dim: prefs.server.embedding_dim,
+            stt_model: prefs.server.stt_model.clone(),
+            tts_voice: prefs.server.tts_voice.clone(),
+            timeout_secs: 120,
+        }))
+    })?;
+    let tts_voice = prefs.server.tts_voice.clone();
+    Some(ServerVoice {
+        language: prefs.voice.stt.language.clone(),
+        tts_voice: if tts_voice.trim().is_empty() { "default".into() } else { tts_voice },
+        tts_speed: prefs.voice.tts.speed,
+        client,
     })
 }
 
@@ -413,31 +491,47 @@ async fn start_voice_input(
     if !prefs.voice.enabled {
         return Err("Voice is disabled in Settings.".into());
     }
-    let base = models_dir();
-    if !vm::all_ready(&base) {
-        let missing: Vec<String> = vm::required_packs()
-            .iter()
-            .flat_map(|p| {
-                vm::missing_files(&base, p).into_iter().map(|f| format!("{}/{}", p.id, f))
-            })
-            .collect();
-        emit(&app, serde_json::json!({ "type": "voice-models", "ready": false, "missing": missing }));
-        return Err(format!(
-            "Voice models incomplete: {}. Open Settings → Download to resume.",
-            missing.join(", ")
-        ));
+    // Server voice: STT/TTS via the service server, energy VAD, no downloads.
+    // Local voice: on-device sherpa-onnx models (downloaded once).
+    let wants_server_voice = prefs.voice.backend.trim().to_lowercase() == "server";
+    let server_voice = cfg_server_voice(&shared, &prefs);
+    if wants_server_voice && server_voice.is_none() {
+        return Err(
+            "Server voice selected but no service server is configured. Set it in Settings → Service."
+                .into(),
+        );
     }
-    let engines = ensure_shared_engines(&shared.voice_engines, EngineBuildConfig {
-        models_base: base,
-        vad_threshold: prefs.voice.vad.threshold,
-        vad_silence_ms: prefs.voice.vad.silence_ms,
-        vad_min_speech_ms: prefs.voice.vad.min_speech_ms,
-        tts_voice: prefs.voice.tts.voice.clone(),
-        tts_speed: prefs.voice.tts.speed,
-        num_threads: prefs.voice.runtime.num_threads,
-    })
-    .await
-    .map_err(|e| truncate_err(e, 300))?;
+    let engines = if server_voice.is_some() {
+        ensure_server_engines(&shared.voice_engines, prefs.voice.vad.threshold)
+            .await
+            .map_err(|e| truncate_err(e, 300))?
+    } else {
+        let base = models_dir();
+        if !vm::all_ready(&base) {
+            let missing: Vec<String> = vm::required_packs()
+                .iter()
+                .flat_map(|p| {
+                    vm::missing_files(&base, p).into_iter().map(|f| format!("{}/{}", p.id, f))
+                })
+                .collect();
+            emit(&app, serde_json::json!({ "type": "voice-models", "ready": false, "missing": missing }));
+            return Err(format!(
+                "Voice models incomplete: {}. Open Settings → Download to resume, or switch Voice backend to Server.",
+                missing.join(", ")
+            ));
+        }
+        ensure_shared_engines(&shared.voice_engines, EngineBuildConfig {
+            models_base: base,
+            vad_threshold: prefs.voice.vad.threshold,
+            vad_silence_ms: prefs.voice.vad.silence_ms,
+            vad_min_speech_ms: prefs.voice.vad.min_speech_ms,
+            tts_voice: prefs.voice.tts.voice.clone(),
+            tts_speed: prefs.voice.tts.speed,
+            num_threads: prefs.voice.runtime.num_threads,
+        })
+        .await
+        .map_err(|e| truncate_err(e, 300))?
+    };
     let runner = Arc::new(VoiceAgentRunner {
         app: app.clone(),
         shared: shared.clone(),
@@ -460,6 +554,7 @@ async fn start_voice_input(
                 tts_speed: prefs.voice.tts.speed,
                 num_threads: prefs.voice.runtime.num_threads,
                 speak: prefs.voice.autoplay,
+                server: server_voice,
             },
             one_shot,
         )
@@ -614,6 +709,9 @@ struct AppInfo {
     provider: String,
     model: String,
     embedding_model: String,
+    backend: String,
+    voice_backend: String,
+    server_url: String,
     onboarded: bool,
     memory_count: i64,
     memory_kinds: Vec<(String, i64)>,
@@ -621,15 +719,93 @@ struct AppInfo {
 
 #[tauri::command]
 async fn app_info(state: State<'_, Shared>) -> Result<AppInfo, String> {
+    // Live config so the Brain line reflects Settings immediately.
+    // The built-in backend URL is never exposed to the UI: server_url is
+    // only populated when a custom URL was explicitly configured.
+    let live = config::load_config(&config::find_project_root());
+    let custom_url = live.server_url.trim().trim_end_matches('/')
+        != comrade_core::service::COMRADE_DEFAULT_SERVER_URL.trim_end_matches('/');
+    let (provider, model, embedding_model, backend, server_url) = if live.use_service() {
+        (
+            "service".to_string(),
+            live.server_llm_model.clone(),
+            live.server_embedding_model.clone(),
+            "service".to_string(),
+            if custom_url { live.server_url.clone() } else { String::new() },
+        )
+    } else {
+        (
+            state.provider.clone(),
+            state.model.clone(),
+            state.embedding_model.clone(),
+            "direct".to_string(),
+            String::new(),
+        )
+    };
+    let voice_backend =
+        if live.voice_backend == "server" && !live.server_url.trim().is_empty() {
+            "server".to_string()
+        } else {
+            "local".to_string()
+        };
     let mem = state.memory.lock().unwrap();
     Ok(AppInfo {
-        provider: state.provider.clone(),
-        model: state.model.clone(),
-        embedding_model: state.embedding_model.clone(),
+        provider,
+        model,
+        embedding_model,
+        backend,
+        voice_backend,
+        server_url,
         onboarded: prefs::load().onboarded(),
         memory_count: mem.count(),
         memory_kinds: mem.kinds(),
     })
+}
+
+/// Probe the service server (`GET /v1/models`, else `/health`).
+/// Uses live Settings (+env key) so the Test button works before restart.
+#[tauri::command]
+async fn server_status() -> Result<String, String> {
+    let prefs = prefs::load();
+    let base_url = comrade_core::service::resolve_server_url(&prefs.server.base_url);
+    let api_key = std::env::var("COMRADE_SERVER_KEY")
+        .ok()
+        .filter(|k| !k.trim().is_empty())
+        .unwrap_or_else(|| prefs.server.api_key.clone());
+    let client = ServiceClient::new(comrade_core::service::ServiceConfig {
+        base_url,
+        api_key,
+        llm_model: prefs.server.llm_model.clone(),
+        embedding_model: prefs.server.embedding_model.clone(),
+        embedding_dim: prefs.server.embedding_dim,
+        stt_model: prefs.server.stt_model.clone(),
+        tts_voice: prefs.server.tts_voice.clone(),
+        timeout_secs: 120,
+    });
+    client.health().await.map_err(|e| truncate_err(e, 300))
+}
+
+/// Fetch the server routing table (`GET /v1/models`, no secrets) using
+/// live Settings (+env key) so it works before restart.
+#[tauri::command]
+async fn server_models() -> Result<serde_json::Value, String> {
+    let prefs = prefs::load();
+    let base_url = comrade_core::service::resolve_server_url(&prefs.server.base_url);
+    let api_key = std::env::var("COMRADE_SERVER_KEY")
+        .ok()
+        .filter(|k| !k.trim().is_empty())
+        .unwrap_or_else(|| prefs.server.api_key.clone());
+    let client = ServiceClient::new(comrade_core::service::ServiceConfig {
+        base_url,
+        api_key,
+        llm_model: prefs.server.llm_model.clone(),
+        embedding_model: prefs.server.embedding_model.clone(),
+        embedding_dim: prefs.server.embedding_dim,
+        stt_model: prefs.server.stt_model.clone(),
+        tts_voice: prefs.server.tts_voice.clone(),
+        timeout_secs: 120,
+    });
+    client.models().await.map_err(|e| truncate_err(e, 300))
 }
 
 /// Coding agents installed on this machine (for onboarding + Settings).
@@ -963,6 +1139,8 @@ fn main() {
                 Some(&serde_json::json!({
                     "provider": cfg.llm_provider,
                     "model": cfg.llm_model,
+                    "service_mode": cfg.use_service(),
+                    "server_voice": cfg.use_server_voice(),
                     "presence": config::presence(&cfg),
                 })),
             );
@@ -1017,7 +1195,7 @@ fn main() {
                 let _ = std::fs::write(&sentinel, "1");
             }
             let memory: Arc<std::sync::Mutex<MemoryStore>> = Arc::new(std::sync::Mutex::new(
-                MemoryStore::open(&db_path, cfg.embedding_dim)
+                MemoryStore::open(&db_path, embedding_dim(&cfg))
                     .expect("failed to open memory database"),
             ));
             let history: Arc<std::sync::Mutex<HistoryStore>> = Arc::new(std::sync::Mutex::new(
@@ -1047,35 +1225,43 @@ fn main() {
             .into_iter()
             .find(|p| p.exists());
 
-            let llm = Arc::new(create_configured(&cfg));
-            let embedder = Arc::new(OpenRouterEmbedder::new(
-                embedding_key(&cfg),
-                cfg.embedding_model.clone(),
-            ));
+            let (_, embed_backend) = create_backends(&cfg);
+            let embedder = Arc::new(embed_backend);
+            // Brain/model labels + server handle for the Settings UI.
+            let (provider_label, model_label, embedding_label, server) =
+                if cfg.use_service() {
+                    (
+                        "service".to_string(),
+                        cfg.server_llm_model.clone(),
+                        cfg.server_embedding_model.clone(),
+                        Some(ServiceClient::new(cfg.service_config())),
+                    )
+                } else {
+                    (
+                        cfg.llm_provider.clone(),
+                        cfg.llm_model.clone(),
+                        cfg.embedding_model.clone(),
+                        None,
+                    )
+                };
             let tools = build_tools();
             let cwd = app
                 .path()
                 .home_dir()
                 .unwrap_or_else(|_| PathBuf::from("/home/electron"));
-            let agent = Agent::new(AgentDeps {
-                llm,
-                embedder: embedder.clone(),
-                tools,
-                memory: memory.clone(),
-                cwd: cwd.clone(),
-                model: Some(cfg.llm_model.clone()),
-                max_steps: cfg.max_steps,
-                timeout_ms: cfg.timeout_ms,
-            });
+            // Note: the chat brain rebinds from live config on every task
+            // (build_live_agent), so Service/direct switches apply instantly.
 
             app.manage(Arc::new(AppState {
-                agent,
+                tools,
+                cwd,
                 memory: memory.clone(),
                 history: history.clone(),
                 embedder: embedder.clone(),
-                provider: cfg.llm_provider.clone(),
-                model: cfg.llm_model.clone(),
-                embedding_model: cfg.embedding_model.clone(),
+                provider: provider_label,
+                model: model_label,
+                embedding_model: embedding_label,
+                server,
                 voice_engines: std::sync::Mutex::new(None),
                 voice_session: std::sync::Mutex::new(None),
                 model_download: AtomicBool::new(false),
@@ -1153,6 +1339,8 @@ fn main() {
             cancel_task,
             permission_response,
             app_info,
+            server_status,
+            server_models,
             memory_add,
             memory_import_chatgpt,
             memory_list,

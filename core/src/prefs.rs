@@ -11,6 +11,7 @@
  * autoplay = true
  * enabled = true
  * mic =
+ * backend = server   # server (service STT/TTS, no downloads) | local (on-device)
  *
  * [voice.stt]
  * engine = sherpa-onnx
@@ -50,6 +51,16 @@
  * [coding]
  * agents = opencode, claude, copilot
  * default = opencode
+ *
+ * [server]            # Comrade service backend (Settings UI or COMRADE_SERVER_* env)
+ * enabled = false     # true + base_url => LLM/embeddings (+voice when backend=server)
+ * base_url =          # e.g. http://localhost:8000  (ENV COMRADE_SERVER_URL wins)
+ * api_key =           # optional bearer key (ENV COMRADE_SERVER_KEY wins)
+ * llm_model =
+ * embedding_model =
+ * embedding_dim = 1536
+ * stt_model =
+ * tts_voice =
  * ```
  *
  * Browser note: Comrade ships its own dedicated Chromium under
@@ -112,6 +123,10 @@ pub struct VoicePrefs {
     pub enabled: bool,
     /// Microphone device name; empty = system default.
     pub mic: String,
+    /// Speech backend: "server" (service STT/TTS, default, no downloads)
+    /// or "local" (on-device sherpa-onnx).
+    #[serde(default = "default_voice_backend")]
+    pub backend: String,
     pub stt: VoiceSttPrefs,
     pub vad: VoiceVadPrefs,
     pub tts: VoiceTtsPrefs,
@@ -125,6 +140,7 @@ impl Default for VoicePrefs {
             autoplay: true,
             enabled: true,
             mic: String::new(),
+            backend: default_voice_backend(),
             stt: VoiceSttPrefs {
                 engine: "sherpa-onnx".into(),
                 model: "zipformer-en-20M-int8".into(),
@@ -136,6 +152,10 @@ impl Default for VoicePrefs {
             runtime: VoiceRuntimePrefs::default(),
         }
     }
+}
+
+fn default_voice_backend() -> String {
+    "server".into()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,6 +173,61 @@ pub struct LlmPrefs {
     pub provider: String,
     #[serde(default = "default_llm_model")]
     pub model: String,
+}
+
+/// Comrade service server (self-hosted backend for LLM/STT/TTS/embeddings).
+/// When `enabled` with a `base_url`, the app talks to the server instead of
+/// calling DeepSeek/OpenRouter directly. Secrets (api_key) stay in `.env`
+/// when set there: ENV/COMRADE_SERVER_* > .env > this file.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerPrefs {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub base_url: String,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default = "default_server_llm_model")]
+    pub llm_model: String,
+    #[serde(default = "default_embedding_model")]
+    pub embedding_model: String,
+    #[serde(default = "default_embedding_dim")]
+    pub embedding_dim: usize,
+    #[serde(default = "default_server_stt_model")]
+    pub stt_model: String,
+    #[serde(default = "default_server_tts_voice")]
+    pub tts_voice: String,
+}
+
+fn default_server_llm_model() -> String {
+    crate::service::SERVICE_DEFAULT_LLM_MODEL.into()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_server_stt_model() -> String {
+    "comrade-stt".into()
+}
+
+fn default_server_tts_voice() -> String {
+    "default".into()
+}
+
+impl Default for ServerPrefs {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            base_url: String::new(),
+            api_key: String::new(),
+            llm_model: default_server_llm_model(),
+            embedding_model: default_embedding_model(),
+            embedding_dim: default_embedding_dim(),
+            stt_model: default_server_stt_model(),
+            tts_voice: default_server_tts_voice(),
+        }
+    }
 }
 
 fn default_llm_provider() -> String {
@@ -278,6 +353,8 @@ pub struct Prefs {
     pub agent: AgentPrefs,
     #[serde(default)]
     pub memory: MemoryPrefs,
+    #[serde(default)]
+    pub server: ServerPrefs,
 }
 
     impl Default for Prefs {
@@ -289,6 +366,7 @@ pub struct Prefs {
             llm: LlmPrefs::default(),
             agent: AgentPrefs::default(),
             memory: MemoryPrefs::default(),
+            server: ServerPrefs::default(),
         }
     }
 }
@@ -359,6 +437,10 @@ pub fn parse_conf(text: &str) -> Prefs {
                 }
             }
             ("voice", "mic") => prefs.voice.mic = value,
+            ("voice", "backend") => {
+                let v = value.trim().to_lowercase();
+                prefs.voice.backend = if v == "server" { "server".into() } else { "local".into() };
+            }
             ("voice.stt", "engine") => prefs.voice.stt.engine = value,
             ("voice.stt", "model") => prefs.voice.stt.model = value,
             ("voice.stt", "language") => prefs.voice.stt.language = value,
@@ -453,6 +535,38 @@ pub fn parse_conf(text: &str) -> Prefs {
                     .collect();
             }
             ("coding", "default") => prefs.coding.default = value.trim().to_lowercase(),
+            ("server", "enabled") => {
+                if let Some(b) = parse_bool(&value) {
+                    prefs.server.enabled = b;
+                }
+            }
+            ("server", "base_url") | ("server", "url") => prefs.server.base_url = value,
+            ("server", "api_key") | ("server", "key") => prefs.server.api_key = value,
+            ("server", "llm_model") | ("server", "model") => {
+                if !value.trim().is_empty() {
+                    prefs.server.llm_model = crate::service::normalize_llm_model(&value);
+                }
+            }
+            ("server", "embedding_model") => {
+                if !value.trim().is_empty() {
+                    prefs.server.embedding_model = value;
+                }
+            }
+            ("server", "embedding_dim") => {
+                if let Ok(n) = value.parse::<usize>() {
+                    prefs.server.embedding_dim = n.max(1);
+                }
+            }
+            ("server", "stt_model") => {
+                if !value.trim().is_empty() {
+                    prefs.server.stt_model = value;
+                }
+            }
+            ("server", "tts_voice") => {
+                if !value.trim().is_empty() {
+                    prefs.server.tts_voice = value;
+                }
+            }
             _ => {}
         }
     }
@@ -474,6 +588,7 @@ pub fn render_conf(prefs: &Prefs) -> String {
          autoplay = {}\n\
          enabled = {}\n\
          mic = {}\n\
+         backend = {}\n\
          \n\
          [voice.stt]\n\
          engine = {}\n\
@@ -512,12 +627,23 @@ pub fn render_conf(prefs: &Prefs) -> String {
          \n\
          [coding]\n\
          agents = {}\n\
-         default = {}\n",
+         default = {}\n\
+         \n\
+         [server]\n\
+         enabled = {}\n\
+         base_url = {}\n\
+         api_key = {}\n\
+         llm_model = {}\n\
+         embedding_model = {}\n\
+         embedding_dim = {}\n\
+         stt_model = {}\n\
+         tts_voice = {}\n",
         prefs.browser.auto_show,
         prefs.browser.width_pct,
         prefs.voice.autoplay,
         prefs.voice.enabled,
         prefs.voice.mic,
+        prefs.voice.backend,
         prefs.voice.stt.engine,
         prefs.voice.stt.model,
         prefs.voice.stt.language,
@@ -541,6 +667,14 @@ pub fn render_conf(prefs: &Prefs) -> String {
         prefs.memory.embedding_dim,
         prefs.coding.agents.join(", "),
         prefs.coding.default,
+        prefs.server.enabled,
+        prefs.server.base_url,
+        prefs.server.api_key,
+        prefs.server.llm_model,
+        prefs.server.embedding_model,
+        prefs.server.embedding_dim,
+        prefs.server.stt_model,
+        prefs.server.tts_voice,
     )
 }
 
@@ -614,8 +748,7 @@ mod tests {
     }
 
     #[test]
-    fn conf_new_sections_round_trip() {
-        let prefs = parse_conf("[browser]\nauto_show = false\nwidth_pct = 60\n[llm]\nprovider = openrouter\nmodel = x/y\n[agent]\nmax_steps = 7\ntimeout_ms = 5000\n[memory]\nembedding_model = a/b\nembedding_dim = 42\n[voice.runtime]\nmax_utterance_ms = 5000\ndecode_every_frames = 4\nchunk_max_chars = 99\nchunk_min_merge = 5\nnum_threads = 4\n");
+    fn conf_new_sections_round_trip() {        let prefs = parse_conf("[browser]\nauto_show = false\nwidth_pct = 60\n[llm]\nprovider = openrouter\nmodel = x/y\n[agent]\nmax_steps = 7\ntimeout_ms = 5000\n[memory]\nembedding_model = a/b\nembedding_dim = 42\n[voice.runtime]\nmax_utterance_ms = 5000\ndecode_every_frames = 4\nchunk_max_chars = 99\nchunk_min_merge = 5\nnum_threads = 4\n");
         assert_eq!(prefs.browser.auto_show, false);
         assert_eq!(prefs.browser.width_pct, 60);
         assert_eq!(prefs.llm.provider, "openrouter");
@@ -650,6 +783,37 @@ mod tests {
         assert!(text.contains("[llm]"));
         assert!(text.contains("[agent]"));
         assert!(text.contains("[memory]"));
+    }
+
+    #[test]
+    fn conf_server_section_round_trip() {
+        let prefs = parse_conf("[server]\nenabled = true\nbase_url = http://localhost:8000\napi_key = secret\nllm_model = openai/gpt-oss-120b\nembedding_model = my-emb\nembedding_dim = 768\nstt_model = my-stt\ntts_voice = joe\n[voice]\nbackend = server\n");
+        assert!(prefs.server.enabled);
+        assert_eq!(prefs.server.base_url, "http://localhost:8000");
+        assert_eq!(prefs.server.api_key, "secret");
+        assert_eq!(prefs.server.llm_model, "openai/gpt-oss-120b");
+        assert_eq!(prefs.server.embedding_model, "my-emb");
+        assert_eq!(prefs.server.embedding_dim, 768);
+        assert_eq!(prefs.server.stt_model, "my-stt");
+        assert_eq!(prefs.server.tts_voice, "joe");
+        assert_eq!(prefs.voice.backend, "server");
+        // unknown chat ids fall back to the default; never sent verbatim
+        let prefs = parse_conf("[server]\nllm_model = my-custom-llm\n");
+        assert_eq!(prefs.server.llm_model, "deepseek-flash");
+        // garbage normalizes, service stays on by default (built-in backend)
+        let prefs = parse_conf("[voice]\nbackend = carrier-pigeon\n");
+        assert_eq!(prefs.voice.backend, "local");
+        assert!(Prefs::default().server.enabled);
+        assert!(Prefs::default().server.base_url.is_empty());
+        assert_eq!(Prefs::default().voice.backend, "server");
+        let text = render_conf(&Prefs::default());
+        assert!(text.contains("[server]"));
+        assert!(text.contains("backend = server"));
+        // old confs without the new keys still load (service on, no URL stored)
+        let prefs: Prefs = serde_json::from_str(r#"{"browser":{},"voice":{"autoplay":true,"enabled":true,"mic":"","stt":{"engine":"s","model":"m","language":"en","sample_rate":16000},"vad":{"threshold":0.5,"silence_ms":700,"min_speech_ms":250},"tts":{"engine":"k","voice":"0","speed":1.0}},"coding":{"agents":[],"default":""}}"#).unwrap();
+        assert!(prefs.server.enabled);
+        assert!(prefs.server.base_url.is_empty());
+        assert_eq!(prefs.voice.backend, "server");
     }
 
     #[test]

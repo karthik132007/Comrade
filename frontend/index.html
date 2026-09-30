@@ -70,6 +70,12 @@
 
     <footer>
       <form id="composer">
+        <select id="model-pick" title="Model for this message">
+          <option value="nvidia/nemotron-3.5-lightning">nemotron-3.5-lightning</option>
+          <option value="deepseek-flash">deepseek-flash</option>
+          <option value="openai/gpt-oss-120b">gpt-oss-120b</option>
+          <option value="google/gemma-4-31b-it">gemma-4-31b-it</option>
+        </select>
         <input id="input" type="text" placeholder="Ask Comrade..." autocomplete="off" />
         <button id="send-btn" type="submit">➤</button>
         <button id="mic-btn" type="button" title="Hold to talk, release to send">🎙</button>
@@ -140,7 +146,42 @@
       </div>
       <div id="pref-status" class="muted"></div>
       <div id="pref-file" class="muted"></div>
-      <h3>Voice (100% local)</h3>
+      <h3>Service backend (optional)</h3>
+      <p class="muted">Point Comrade at your own server for LLM, embeddings,
+        STT, and TTS instead of calling cloud APIs directly. The server speaks
+        OpenAI-compatible endpoints (<code>/v1/chat/completions</code>,
+        <code>/v1/embeddings</code>, <code>/v1/audio/transcriptions</code>,
+        <code>/v1/audio/speech</code>). Changes apply immediately (only a
+        changed embedding dim needs a restart).</p>
+      <div class="row checks">
+        <label class="check"><input id="srv-enabled" type="checkbox" /> Use service server</label>
+        <button id="srv-test" type="button">Test</button>
+      </div>
+      <div id="srv-status" class="muted"></div>
+      <label class="muted" for="srv-url">Server URL</label>
+      <input id="srv-url" type="text" placeholder="http://localhost:8000" autocomplete="off" spellcheck="false" />
+      <label class="muted" for="srv-key">API key (optional)</label>
+      <input id="srv-key" type="password" placeholder="bearer key, if your server needs one" autocomplete="off" />
+      <div class="row vgrid">
+        <label class="muted">LLM model
+          <select id="srv-llm">
+            <option value="nvidia/nemotron-3.5-lightning">nvidia/nemotron-3.5-lightning</option>
+            <option value="deepseek-flash">deepseek-flash</option>
+            <option value="openai/gpt-oss-120b">openai/gpt-oss-120b</option>
+            <option value="google/gemma-4-31b-it">google/gemma-4-31b-it</option>
+          </select>
+        </label>
+        <label class="muted">Embedding model <input id="srv-emb" type="text" /></label>
+        <label class="muted">Embedding dim <input id="srv-dim" type="number" min="1" step="1" /></label>
+        <label class="muted">STT model <input id="srv-stt" type="text" /></label>
+        <label class="muted">TTS voice <input id="srv-tts" type="text" /></label>
+      </div>
+      <h3>Voice</h3>
+      <label class="muted" for="voice-backend">Voice backend</label>
+      <select id="voice-backend">
+        <option value="server">server — STT/TTS via the service above (no download)</option>
+        <option value="local">local — on-device models (offline after download)</option>
+      </select>
       <label class="muted" for="voice-mic">Microphone</label>
       <select id="voice-mic"></select>
       <div class="row">

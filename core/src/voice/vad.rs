@@ -184,6 +184,33 @@ impl VadEngine for FakeVad {
     }
 }
 
+/// Model-free energy VAD: RMS over the frame vs a threshold. Used for
+/// server-voice mode so no local VAD download is required, and as a
+/// fallback when the Silero model is missing. Less accurate than Silero
+/// (noisy rooms may false-trigger) but needs zero downloads.
+pub struct EnergyVad {
+    threshold: f32,
+}
+
+impl EnergyVad {
+    pub fn new(threshold: f32) -> Self {
+        Self { threshold: threshold.clamp(0.005, 0.5) }
+    }
+}
+
+impl VadEngine for EnergyVad {
+    fn is_speech(&mut self, frame_16k_mono: &[f32]) -> bool {
+        if frame_16k_mono.is_empty() {
+            return false;
+        }
+        let energy: f32 =
+            frame_16k_mono.iter().map(|v| v * v).sum::<f32>() / frame_16k_mono.len() as f32;
+        energy.sqrt() > self.threshold
+    }
+
+    fn reset(&mut self) {}
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

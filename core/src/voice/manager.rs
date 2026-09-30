@@ -26,10 +26,11 @@ use std::sync::{
 use std::time::Instant;
 
 use crate::logger::{log, Level};
+use crate::service::ServiceClient;
 use crate::voice::chunk::SentenceBuffer;
-use crate::voice::stt::{StreamRecognizer, SherpaOnlineZipformer};
-use crate::voice::tts::{SherpaKokoro, SpeechSynth};
-use crate::voice::vad::{TrackerEvent, UtteranceTracker, VadEngine, SherpaSileroVad};
+use crate::voice::stt::{NoopRecognizer, StreamRecognizer, SherpaOnlineZipformer};
+use crate::voice::tts::{NoopSynth, SherpaKokoro, SpeechSynth};
+use crate::voice::vad::{TrackerEvent, UtteranceTracker, VadEngine, EnergyVad, SherpaSileroVad};
 
 /// Central voice state. No scattered booleans; UI derives from this.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -100,6 +101,16 @@ pub trait AgentRunner: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = AgentOutcome> + Send + 'a>>;
 }
 
+/// Server speech config: STT (utterance upload) + TTS (per sentence chunk)
+/// go to the service server instead of local sherpa-onnx models.
+#[derive(Clone)]
+pub struct ServerVoice {
+    pub client: ServiceClient,
+    pub language: String,
+    pub tts_voice: String,
+    pub tts_speed: f32,
+}
+
 pub struct VoiceRuntimeConfig {
     pub silence_ms: u32,
     pub min_speech_ms: u32,
@@ -113,6 +124,8 @@ pub struct VoiceRuntimeConfig {
     pub num_threads: i32,
     /// Speak replies aloud. Off = agent still runs, text only.
     pub speak: bool,
+    /// Set = server STT/TTS (local models optional). None = fully local.
+    pub server: Option<ServerVoice>,
 }
 
 impl Default for VoiceRuntimeConfig {
@@ -129,6 +142,7 @@ impl Default for VoiceRuntimeConfig {
             tts_speed: 1.0,
             num_threads: 2,
             speak: true,
+            server: None,
         }
     }
 }
@@ -230,14 +244,30 @@ fn set_state(ctx: &SessionCtx, state: &Mutex<VoiceState>, next: VoiceState) {
 }
 
 /// Synthesize one chunk off-thread (Kokoro blocks), honoring generation.
+/// With `server` set, TTS goes to the service server instead (no local model).
 async fn synth_chunk(
     engines: SharedEngines,
     text: String,
     gen: u64,
     current_gen: &AtomicU64,
     index: usize,
+    server: Option<ServerVoice>,
 ) -> Option<(Vec<f32>, u32, u64)> {
     let started = Instant::now();
+    if let Some(srv) = server {
+        match srv.client.synthesize(&text, &srv.tts_voice, srv.tts_speed).await {
+            Ok(pcm) => {
+                if current_gen.load(Ordering::SeqCst) != gen {
+                    return None; // interrupted while synthesizing
+                }
+                return Some((pcm.samples, pcm.sample_rate, started.elapsed().as_millis() as u64));
+            }
+            Err(e) => {
+                log(Level::Warn, "VOICE", "server tts chunk failed", Some(&serde_json::json!({ "error": format!("{e}").chars().take(160).collect::<String>() })));
+                return None;
+            }
+        }
+    }
     let out = tokio::task::spawn_blocking(move || {
         let mut engines = engines.lock().unwrap();
         engines.tts.synthesize(&text).map(|pcm| (pcm.samples, pcm.sample_rate))
@@ -295,7 +325,9 @@ async fn speak_text(
         let idx = *chunk_index_base;
         *chunk_index_base += 1;
         let chars = chunk.chars().count();
-        if let Some((samples, rate, latency)) = synth_chunk(engines, chunk, my_gen, gen, idx).await {
+        if let Some((samples, rate, latency)) =
+            synth_chunk(engines, chunk, my_gen, gen, idx, ctx.cfg.server.clone()).await
+        {
             if metrics.tts_first_audio_ms.is_none() {
                 metrics.tts_first_audio_ms = Some(session_t0.elapsed().as_millis() as u64);
                 log(
@@ -413,6 +445,10 @@ async fn run_turn(
     let mut frames_since_decode = 0usize;
     let mut last_partial = String::new();
     let mut utterance_active = false;
+    // Server-STT mode: buffer raw utterance PCM for upload on endpoint.
+    // (Local partials/decode are skipped; transcript arrives at finalize.)
+    let server_voice = ctx.cfg.server.clone();
+    let mut utterance_pcm: Vec<f32> = Vec::new();
     let mut last_level_emit = Instant::now() - std::time::Duration::from_secs(1);
     let turn_t0 = Instant::now();
     // Diagnostics: what the mic/VAD actually saw this turn.
@@ -479,6 +515,7 @@ async fn run_turn(
                             engines.stt.reset();
                         }
                         utterance_active = false;
+                        utterance_pcm.clear();
                     }
                     Some(TrackerEvent::EndpointSilence) | Some(TrackerEvent::EndpointTooLong) => {
                         diag_reason = "vad-endpoint";
@@ -487,6 +524,10 @@ async fn run_turn(
                     None => {}
                 }
                 if !utterance_active {
+                    continue;
+                }
+                if server_voice.is_some() {
+                    utterance_pcm.extend_from_slice(&frame);
                     continue;
                 }
                 {
@@ -519,8 +560,23 @@ async fn run_turn(
         }
     }
 
-    // Endpoint reached: finalize.
-    let final_text = {
+    // Endpoint reached: finalize (server upload or local streaming decode).
+    let final_text = if let Some(srv) = &server_voice {
+        if utterance_pcm.is_empty() {
+            String::new()
+        } else {
+            match srv.client.transcribe(&utterance_pcm, &srv.language).await {
+                Ok(t) => t,
+                Err(e) => {
+                    let msg: String = format!("{e}").chars().take(160).collect();
+                    log(Level::Warn, "VOICE", "server stt failed",
+                        Some(&serde_json::json!({ "error": msg })));
+                    emit(ctx, VoiceEvent::Error { message: format!("Voice transcription failed: {msg}") });
+                    String::new()
+                }
+            }
+        }
+    } else {
         let mut engines = ctx.engines.lock().unwrap();
         engines.stt.finalize()
     };
@@ -755,6 +811,35 @@ pub async fn ensure_shared_engines(
     *slot.lock().unwrap() = Some(shared.clone());
     let ms = t0.elapsed().as_millis() as u64;
     log(Level::Info, "VOICE", "engines ready", Some(&serde_json::json!({ "init_ms": ms })));
+    Ok(shared)
+}
+
+/// Build engines for server-voice mode: energy VAD (no model file),
+/// inert local STT/TTS slots (speech runs on the server), real playback.
+/// Needs zero downloads — local models are optional in this mode.
+pub async fn ensure_server_engines(
+    slot: &Mutex<Option<SharedEngines>>,
+    vad_threshold: f32,
+) -> anyhow::Result<SharedEngines> {
+    if let Some(engines) = slot.lock().unwrap().clone() {
+        return Ok(engines);
+    }
+    // Map the Silero-scale pref (0.1-0.9) onto an RMS threshold.
+    let energy_threshold = 0.01 + vad_threshold.clamp(0.1, 0.9) * 0.05;
+    let engines = tokio::task::spawn_blocking(move || -> anyhow::Result<Engines> {
+        let playback = Arc::new(CpalPlayback::open_default(24000)?) as Arc<dyn Playback>;
+        Ok(Engines {
+            vad: Box::new(EnergyVad::new(energy_threshold)),
+            stt: Box::new(NoopRecognizer),
+            tts: Box::new(NoopSynth),
+            playback,
+        })
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("server voice engine init failed: {e}"))??;
+    let shared: SharedEngines = Arc::new(std::sync::Mutex::new(engines));
+    *slot.lock().unwrap() = Some(shared.clone());
+    log(Level::Info, "VOICE", "server-voice engines ready (energy VAD, no models)", None);
     Ok(shared)
 }
 

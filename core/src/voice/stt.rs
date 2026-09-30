@@ -198,6 +198,22 @@ impl Drop for SherpaOnlineZipformer {
     }
 }
 
+/// No-op recognizer for server-voice engines: STT runs on the server via
+/// utterance upload (see manager.rs), so the local slot stays inert.
+pub struct NoopRecognizer;
+
+impl StreamRecognizer for NoopRecognizer {
+    fn accept(&mut self, _samples: &[f32]) {}
+    fn decode(&mut self) {}
+    fn partial_text(&mut self) -> String {
+        String::new()
+    }
+    fn finalize(&mut self) -> String {
+        String::new()
+    }
+    fn reset(&mut self) {}
+}
+
 /// Scripted recognizer for manager/state tests (no models).
 pub struct FakeRecognizer {
     partials: Vec<String>,

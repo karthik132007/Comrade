@@ -9,6 +9,7 @@ pub mod memory;
 pub mod paths;
 pub mod permissions;
 pub mod prefs;
+pub mod service;
 pub mod task_state;
 pub mod tools;
 pub mod voice;

@@ -294,6 +294,14 @@ footer { padding: 12px 20px 16px; border-top: 1px solid var(--line); }
 
 #send-btn { border-color: var(--accent); color: var(--accent); }
 
+#model-pick {
+  background: var(--panel); color: var(--text);
+  border: 1px solid var(--line); border-radius: 10px; padding: 0 6px; cursor: pointer;
+  font-size: 12px; max-width: 172px; outline: none;
+}
+
+#model-pick:focus { border-color: var(--accent); }
+
 #mic-btn.live { border-color: var(--warn); color: var(--warn); animation: pulse 0.7s infinite; }
 
 #conv-btn.live { border-color: var(--ok); color: var(--ok); animation: pulse 1.4s infinite; }
