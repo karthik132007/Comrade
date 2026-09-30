@@ -577,9 +577,16 @@
   var browserReloadBtn = document.getElementById('browser-reload');
   var browserShotBtn = document.getElementById('browser-shot');
   var browserHideBtn = document.getElementById('browser-hide');
+  var browserKeys = document.getElementById('browser-keys');
   var browserIsOpen = false;
   var browserAutoShow = true;
   var browserRefreshing = false;
+  // Last known page size (CSS px) for mapping image clicks onto the page.
+  var browserPageW = 0;
+  var browserPageH = 0;
+  var browserInteractTimer = null;
+  var browserWheelDebt = { x: 0, y: 0 };
+  var browserWheelTimer = null;
 
   function clampWidth(pct) {
     pct = Math.round(Number(pct) || 45);
@@ -690,9 +697,10 @@
         return null;
       }
       if (browserView) browserView.classList.remove('idle');
-      return invoke('browser_screenshot', {});
-    }).then(function (dataUrl) {
-      if (dataUrl && browserImg) browserImg.src = dataUrl;
+      return invoke('browser_frame', {});
+    }).then(function (frame) {
+      if (frame && frame.data_url && browserImg) browserImg.src = frame.data_url;
+      if (frame && frame.width > 0) { browserPageW = frame.width; browserPageH = frame.height; }
       if (browserStatus) browserStatus.textContent = '';
     }).catch(function (err) {
       var msg = errMsg(err);
@@ -743,6 +751,78 @@
       if (browserStatus) browserStatus.textContent = 'Open failed: ' + errMsg(err);
     });
   });
+
+  // --- Direct interaction: the view is live. Clicks, typing, and wheel
+  // events on the image drive the same bundled Chromium the agent uses. ---
+  function interactRefreshSoon(ms) {
+    if (browserInteractTimer) clearTimeout(browserInteractTimer);
+    browserInteractTimer = setTimeout(refreshBrowser, ms || 450);
+  }
+
+  function imageToPage(ev) {
+    if (!browserImg || !browserPageW || !browserImg.clientWidth) return null;
+    var r = browserImg.getBoundingClientRect ? browserImg.getBoundingClientRect() : null;
+    var dx = (r && ev.clientX != null) ? ev.clientX - r.left : (ev.offsetX || 0);
+    var dy = (r && ev.clientY != null) ? ev.clientY - r.top : (ev.offsetY || 0);
+    var scale = browserPageW / browserImg.clientWidth;
+    return { x: Math.round(dx * scale), y: Math.round(dy * scale) };
+  }
+
+  if (browserImg) browserImg.addEventListener('click', function (ev) {
+    var pt = imageToPage(ev);
+    if (!pt) return;
+    if (browserStatus) browserStatus.textContent = 'clicking…';
+    invoke('browser_click_at', { x: pt.x, y: pt.y }).then(function (r) {
+      if (r && r.url && browserUrl) browserUrl.value = r.url;
+      // Route subsequent keystrokes into the page (e.g. a focused field).
+      if (browserKeys) browserKeys.focus();
+      interactRefreshSoon(450);
+    }).catch(function (err) { if (browserStatus) browserStatus.textContent = 'Click failed: ' + errMsg(err); });
+  });
+
+  if (browserView) browserView.addEventListener('wheel', function (ev) {
+    if (!browserIsOpen) return;
+    ev.preventDefault();
+    browserWheelDebt.x += ev.deltaX || 0;
+    browserWheelDebt.y += ev.deltaY || 0;
+    if (browserWheelTimer) return;
+    browserWheelTimer = setTimeout(function () {
+      browserWheelTimer = null;
+      var dx = Math.round(browserWheelDebt.x);
+      var dy = Math.round(browserWheelDebt.y);
+      browserWheelDebt.x = 0; browserWheelDebt.y = 0;
+      if (!dx && !dy) return;
+      invoke('browser_scroll', { x: dx, y: dy }).then(function () {
+        interactRefreshSoon(350);
+      }).catch(function () { /* keep the last good frame */ });
+    }, 120);
+  }, { passive: false });
+
+  var SPECIAL_KEYS = {
+    Enter: 'Enter', Tab: 'Tab', Escape: 'Escape', Esc: 'Escape',
+    Backspace: 'Backspace', Delete: 'Delete', ArrowLeft: 'ArrowLeft',
+    ArrowUp: 'ArrowUp', ArrowRight: 'ArrowRight', ArrowDown: 'ArrowDown',
+    Home: 'Home', End: 'End', PageUp: 'PageUp', PageDown: 'PageDown',
+  };
+
+  if (browserKeys) {
+    browserKeys.addEventListener('keydown', function (ev) {
+      var key = SPECIAL_KEYS[ev.key];
+      if (!key) return;
+      ev.preventDefault();
+      invoke('browser_press_key', { key: key }).then(function () {
+        interactRefreshSoon(key === 'Enter' ? 600 : 400);
+      }).catch(function (err) { if (browserStatus) browserStatus.textContent = 'Key failed: ' + errMsg(err); });
+    });
+    browserKeys.addEventListener('input', function () {
+      var text = browserKeys.value;
+      if (!text) return;
+      browserKeys.value = '';
+      invoke('browser_type_text', { text: text }).then(function () {
+        interactRefreshSoon(900);
+      }).catch(function (err) { if (browserStatus) browserStatus.textContent = 'Type failed: ' + errMsg(err); });
+    });
+  }
 
   // Drag the divider to resize the pane (in-app only).
   (function wireDivider() {

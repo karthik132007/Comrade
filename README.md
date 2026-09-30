@@ -112,7 +112,9 @@ Useful commands: `cargo check --workspace`, `cargo clippy --workspace`,
   live progress in the pane), so there is nothing to set up. It always runs
   headless, so nothing ever opens outside the app: the only visible surface
   is the resizable in-app browser pane (🌐 in the header, auto-shown on
-  browser use), rendering live views of the same tab the agent drives. Drag
+  browser use): a live view of the same tab the agent drives. It is fully
+  interactive — click the page to press buttons, links, and focus fields,
+  type to fill them, scroll with the wheel. Drag
   the divider to resize; the address bar, back/forward/reload, and refresh
   controls drive that same tab. One tab is reused across navigation, reading,
   and clicking. If the self-install itself fails (e.g. offline), the task

@@ -286,3 +286,78 @@ async fn live_self_install_provisions_and_drives_browser() {
         None => std::env::remove_var("COMRADE_CHROMIUM_BIN"),
     }
 }
+
+
+async fn rect_of(port: u16, sel: &str) -> serde_json::Value {
+    let raw = browser_driver::cdp_eval_via_active(
+        port,
+        &format!(
+            "JSON.stringify((()=>{{const r=document.querySelector('{sel}').getBoundingClientRect();\
+              return {{x:r.x,y:r.y,w:r.width,h:r.height}};}})())"
+        ),
+    )
+    .await
+    .expect("element rect");
+    serde_json::from_str::<serde_json::Value>(&raw).expect("rect json")
+}
+
+/// In-app pane interaction: CDP mouse clicks press real page buttons and
+/// typed text lands in focused fields (trusted input, not JS clicks).
+#[tokio::test]
+#[ignore]
+async fn live_mouse_click_and_type_drive_the_page() {
+    let context = TestContext::new("interaction").await;
+    let port = browser_driver::ensure_chromium()
+        .await
+        .expect("launch bundled Chromium");
+    let path = context.home.join("click.html");
+    std::fs::write(
+        &path,
+        "<!doctype html><title>ready</title>\
+         <button id=b style='position:absolute;left:100px;top:80px;width:120px;height:40px' onclick=\"document.title='clicked'\">go</button>\
+         <input id=f style='position:absolute;left:100px;top:200px;width:200px' value=''>",
+    )
+    .unwrap();
+    let url = reqwest::Url::from_file_path(path).unwrap().to_string();
+    browser_driver::page_navigate(port, &url)
+        .await
+        .expect("navigate");
+    let (vw, vh) = browser_driver::viewport_metrics(port)
+        .await
+        .expect("viewport metrics");
+    assert!(vw > 0.0 && vh > 0.0, "viewport must be readable");
+
+    let b = rect_of(port, "#b").await;
+    let bx = b["x"].as_f64().unwrap() + b["w"].as_f64().unwrap() / 2.0;
+    let by = b["y"].as_f64().unwrap() + b["h"].as_f64().unwrap() / 2.0;
+    browser_driver::mouse_click(port, bx, by)
+        .await
+        .expect("click button");
+    let (title, _) = browser_driver::page_title(port).await.expect("title");
+    assert_eq!(title, "clicked", "real mouse click must press the button");
+
+    let f = rect_of(port, "#f").await;
+    browser_driver::mouse_click(
+        port,
+        f["x"].as_f64().unwrap() + 10.0,
+        f["y"].as_f64().unwrap() + 10.0,
+    )
+    .await
+    .expect("focus field");
+    browser_driver::insert_text(port, "hello")
+        .await
+        .expect("type");
+    let value = browser_driver::cdp_eval_via_active(port, "document.querySelector('#f').value")
+        .await
+        .expect("field value");
+    assert_eq!(value, "hello", "typed text must land in the focused field");
+
+    // Out-of-range clicks are rejected, not sent to the page.
+    assert!(browser_driver::mouse_click(port, -5.0, 10.0).await.is_err());
+    assert!(browser_driver::mouse_click(port, f64::NAN, 10.0).await.is_err());
+
+    assert_eq!(
+        browser_driver::close_chromium().await,
+        browser_driver::CloseOutcome::Closed
+    );
+}

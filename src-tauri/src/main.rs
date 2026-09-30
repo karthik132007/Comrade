@@ -714,6 +714,68 @@ async fn browser_screenshot() -> Result<String, String> {
     ))
 }
 
+#[derive(Serialize)]
+struct BrowserFrame {
+    data_url: String,
+    width: f64,
+    height: f64,
+}
+
+/// One interactive frame for the in-app pane: screenshot plus the page's CSS
+/// viewport size, so UI clicks map 1:1 onto page coordinates.
+#[tauri::command]
+async fn browser_frame() -> Result<BrowserFrame, String> {
+    use base64::Engine as _;
+    use comrade_core::tools::browser_driver;
+    let frame = browser_driver::capture_frame().await.map_err(|m| trim_msg(m, 400))?;
+    Ok(BrowserFrame {
+        data_url: format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(&frame.png)
+        ),
+        width: frame.viewport_w,
+        height: frame.viewport_h,
+    })
+}
+
+/// Click at page coordinates in the in-app browser (pane interaction).
+#[tauri::command]
+async fn browser_click_at(x: f64, y: f64) -> Result<serde_json::Value, String> {
+    use comrade_core::tools::browser_driver;
+    let port = browser_driver::ensure_chromium().await.map_err(|m| trim_msg(m, 400))?;
+    browser_driver::mouse_click(port, x, y).await.map_err(|m| trim_msg(m, 400))?;
+    let url = browser_driver::current_url(port).await.unwrap_or_default();
+    Ok(serde_json::json!({ "url": url }))
+}
+
+/// Type into the focused element of the in-app browser (pane interaction).
+#[tauri::command]
+async fn browser_type_text(text: String) -> Result<serde_json::Value, String> {
+    use comrade_core::tools::browser_driver;
+    let port = browser_driver::ensure_chromium().await.map_err(|m| trim_msg(m, 400))?;
+    browser_driver::insert_text(port, &text).await.map_err(|m| trim_msg(m, 400))?;
+    Ok(serde_json::json!({ "typed": text.len() }))
+}
+
+/// Press a key in the in-app browser (pane interaction).
+#[tauri::command]
+async fn browser_press_key(key: String) -> Result<serde_json::Value, String> {
+    use comrade_core::tools::browser_driver;
+    let port = browser_driver::ensure_chromium().await.map_err(|m| trim_msg(m, 400))?;
+    browser_driver::page_press(port, key.trim()).await.map_err(|m| trim_msg(m, 400))?;
+    Ok(serde_json::json!({ "key": key }))
+}
+
+/// Scroll the in-app browser by pixels (pane wheel interaction).
+#[tauri::command]
+async fn browser_scroll(x: f64, y: f64) -> Result<serde_json::Value, String> {
+    use comrade_core::tools::browser_driver;
+    let port = browser_driver::ensure_chromium().await.map_err(|m| trim_msg(m, 400))?;
+    let (sx, sy) =
+        browser_driver::page_scroll(port, x.round() as i64, y.round() as i64).await.map_err(|m| trim_msg(m, 400))?;
+    Ok(serde_json::json!({ "scrollX": sx, "scrollY": sy }))
+}
+
 /// Stop the bundled Chromium (in-app browser pane goes idle).
 #[tauri::command]
 async fn browser_close() -> Result<bool, String> {
@@ -1106,6 +1168,11 @@ fn main() {
             browser_ensure,
             browser_provision_status,
             browser_screenshot,
+            browser_frame,
+            browser_click_at,
+            browser_type_text,
+            browser_press_key,
+            browser_scroll,
             browser_close,
             browser_back,
             browser_forward,

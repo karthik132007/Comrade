@@ -110,6 +110,7 @@ pub fn status_json() -> serde_json::Value {
 /// Concurrent callers serialize on one install; the binary is verified with
 /// `--version` before success is reported.
 pub async fn ensure_provisioned() -> Result<std::path::PathBuf, String> {
+    retire_legacy_shell();
     if let Some(exe) = crate::paths::bundled_chromium_exe() {
         set_phase(Phase::Done);
         return Ok(exe);
@@ -132,6 +133,40 @@ pub async fn ensure_provisioned() -> Result<std::path::PathBuf, String> {
         }
     }
     out
+}
+
+/// Move a broken self-installed binary aside so the next resolve provisions
+/// a fresh one. Only touches files inside our own `browser/` dir — explicit
+/// COMRADE_CHROMIUM_BIN overrides and anything else are never quarantined.
+/// Returns true when something was actually moved.
+pub fn quarantine_owned(exe: &str) -> bool {
+    let dir = crate::paths::browser_dir();
+    let path = std::path::Path::new(exe);
+    let owned = path.starts_with(&dir) && !exe.is_empty();
+    if !owned {
+        return false;
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let backup = dir.join(format!(".broken-{stamp}"));
+    std::fs::rename(path, &backup).is_ok()
+}
+
+/// Remove the legacy single-file headless-shell binary, if present.
+/// An earlier self-installer revision shipped `browser/chrome-headless-shell`,
+/// which crashes on startup (ICU data / SIGTRAP) on real machines — yet it
+/// still passes `--version`, so only an explicit retirement gets rid of it.
+/// Runs before every resolve: with no usable full build left, the normal
+/// install path provisions full `chrome` right after. Explicit
+/// COMRADE_CHROMIUM_BIN overrides are never touched.
+fn retire_legacy_shell() {
+    let legacy = crate::paths::browser_dir().join("chrome-headless-shell");
+    // remove_file deletes symlinks themselves without following them.
+    if std::fs::symlink_metadata(&legacy).is_ok() {
+        let _ = std::fs::remove_file(&legacy);
+    }
 }
 
 async fn install() -> Result<std::path::PathBuf, String> {
@@ -296,5 +331,47 @@ mod tests {
         assert!(v.get("phase").and_then(|v| v.as_str()).is_some());
         assert!(v.get("downloaded").and_then(|v| v.as_u64()).is_some());
         assert!(v.get("total").and_then(|v| v.as_u64()).is_some());
+    }
+
+    #[test]
+    fn legacy_shell_is_retired_not_resolved() {
+        let _lock = crate::env_lock();
+        // Scratch home with ONLY the old crashing headless-shell build:
+        // resolve must refuse it so the full build is provisioned instead.
+        let dir = std::env::temp_dir().join("comrade-legacy-shell-test");
+        let _ = std::fs::create_dir_all(dir.join("browser"));
+        std::fs::write(dir.join("browser/chrome-headless-shell"), "fake").unwrap();
+        let old = std::env::var_os("COMRADE_HOME");
+        std::env::set_var("COMRADE_HOME", &dir);
+        std::env::remove_var("COMRADE_CHROMIUM_BIN");
+        retire_legacy_shell();
+        assert!(!dir.join("browser/chrome-headless-shell").exists());
+        assert!(crate::paths::bundled_chromium_exe().is_none());
+        match old {
+            Some(v) => std::env::set_var("COMRADE_HOME", v),
+            None => std::env::remove_var("COMRADE_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn quarantine_moves_owned_binaries_aside() {
+        let _lock = crate::env_lock();
+        let dir = std::env::temp_dir().join("comrade-quarantine-test");
+        let _ = std::fs::create_dir_all(dir.join("browser"));
+        let old = std::env::var_os("COMRADE_HOME");
+        std::env::set_var("COMRADE_HOME", &dir);
+        let victim = dir.join("browser/chrome");
+        std::fs::write(&victim, "fake").unwrap();
+        assert!(quarantine_owned(&victim.to_string_lossy()));
+        assert!(!victim.exists());
+        // Outside our dir: never touch.
+        assert!(!quarantine_owned("/usr/bin/whatever"));
+        assert!(!quarantine_owned(""));
+        match old {
+            Some(v) => std::env::set_var("COMRADE_HOME", v),
+            None => std::env::remove_var("COMRADE_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

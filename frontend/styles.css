@@ -164,9 +164,12 @@ body.browser-open #chat-col { flex-basis: calc(100% - var(--browser-w, 45%) - 8p
   border: 1px solid var(--line); border-radius: 8px; min-height: 120px;
   display: flex; align-items: flex-start; justify-content: center;
 }
-#browser-img { width: 100%; height: auto; display: block; border-radius: 7px; }
+#browser-img { width: 100%; height: auto; display: block; border-radius: 7px; cursor: pointer; user-select: none; -webkit-user-select: none; }
 #browser-img:not([src]) { display: none; }
 #browser-view.idle { background: var(--bg); min-height: 200px; }
+/* Hidden input that captures keystrokes for the page (focused on click). */
+#browser-keys { position: absolute; width: 1px; height: 1px; opacity: 0; border: none; padding: 0; pointer-events: none; }
+#browser-view { position: relative; }
 #browser-status { padding: 0 10px 8px; font-size: 11px; min-height: 16px; }
 
 #hero { text-align: center; margin: 24px 0; }

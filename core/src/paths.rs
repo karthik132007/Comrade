@@ -74,17 +74,16 @@ pub fn browser_dir() -> PathBuf {
 }
 
 /// Candidate executables for the bundled Chromium, in preference order.
-/// Overridable for tests via COMRADE_CHROMIUM_BIN. Covers both the minimal
-/// headless-shell build (Linux) and full `chrome` builds (macOS/Windows)
-/// as unpacked by the self-installer (see tools::provision).
+/// Overridable for tests via COMRADE_CHROMIUM_BIN. Full `chrome` builds
+/// only: the minimal `chrome-headless-shell` is deliberately NOT listed —
+/// it crashes on startup (ICU data / SIGTRAP) in common setups, so a
+/// leftover shell binary must never resolve (see retire_legacy_shell).
 pub fn bundled_chromium_candidates() -> Vec<PathBuf> {
     let dir = browser_dir();
     let mut out = vec![
-        dir.join("chrome-headless-shell"),
         dir.join("chrome"),
         dir.join("chrome-linux64").join("chrome"),
         dir.join("chrome-linux").join("chrome"),
-        dir.join("headless_shell"),
     ];
     if std::env::consts::OS == "windows" {
         out.push(dir.join("chrome.exe"));
@@ -169,7 +168,7 @@ mod tests {
 
     #[test]
     fn home_resolution_is_consolidated() {
-        // Sequential in one test: env mutation is process-global.
+        let _lock = crate::env_lock();
         std::env::set_var("COMRADE_HOME", "/tmp/x-comrade-test-home");
         assert_eq!(comrade_home(), PathBuf::from("/tmp/x-comrade-test-home"));
         assert_eq!(
@@ -185,6 +184,7 @@ mod tests {
 
     #[test]
     fn bundled_chromium_override_wins() {
+        let _lock = crate::env_lock();
         let exe = std::env::current_exe().unwrap();
         std::env::set_var("COMRADE_CHROMIUM_BIN", exe.to_string_lossy().to_string());
         assert_eq!(bundled_chromium_exe(), Some(exe));

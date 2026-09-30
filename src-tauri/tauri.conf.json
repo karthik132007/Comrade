@@ -12,7 +12,7 @@
   "app": {
     "withGlobalTauri": true,
     "security": {
-      "csp": "default-src 'self' ipc: http://ipc.localhost; script-src 'self'; style-src 'self'; media-src 'self' data: blob:; connect-src ipc: http://ipc.localhost"
+      "csp": "default-src 'self' ipc: http://ipc.localhost; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; media-src 'self' data: blob:; connect-src ipc: http://ipc.localhost"
     }
   },
   "bundle": {

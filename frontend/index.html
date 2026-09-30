@@ -63,7 +63,7 @@
           <button id="browser-hide" type="button" title="Hide browser">✕</button>
         </div>
         <div id="browser-title" class="muted">Comrade's browser — shown only here, inside the app.</div>
-        <div id="browser-view" class="idle"><img id="browser-img" alt="In-app browser view" /></div>
+        <div id="browser-view" class="idle"><img id="browser-img" alt="In-app browser view" /><input id="browser-keys" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" aria-label="Type into the in-app browser" /></div>
         <div id="browser-status" class="muted"></div>
       </aside>
     </main>
@@ -121,7 +121,9 @@
       <h3>In-app browser</h3>
       <p class="muted">Comrade drives its own bundled Chromium — nothing to
         install or pick, and it never opens outside this app. The pane shows
-        exactly what the agent sees; drag the divider to resize it.</p>
+        exactly what the agent sees; drag the divider to resize it.
+        Click the page to press buttons and focus fields, type to fill them,
+        scroll with the wheel — you and the agent share the same tab.</p>
       <div class="row checks">
         <label class="check"><input id="pref-autoshow" type="checkbox" /> Auto-show on browser use</label>
         <label class="check"><input id="pref-autoplay" type="checkbox" /> Voice autoplay</label>

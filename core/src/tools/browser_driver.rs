@@ -33,10 +33,13 @@ use serde_json::Value;
 // ---------------------------------------------------------------------------
 
 struct ManagedBrowser {
-    /// Always launched by us (killed on close). Nothing is ever attached to:
-    /// there is no user browser to attach to by design.
+    /// Launched by us (killed on close) vs adopted healthy orphan from an
+    /// earlier app run (never killed by us — detached on close, re-adopted
+    /// on next launch).
     child: Option<tokio::process::Child>,
     port: u16,
+    /// Absolute path of our bundled executable (ownership checks).
+    exe: String,
     page_id: Option<String>,
 }
 
@@ -50,6 +53,51 @@ static MANAGED: OnceLock<tokio::sync::Mutex<BrowserState>> = OnceLock::new();
 
 fn managed_lock() -> &'static tokio::sync::Mutex<BrowserState> {
     MANAGED.get_or_init(|| tokio::sync::Mutex::new(BrowserState::default()))
+}
+
+/// Adopt a healthy live instance of OUR browser holding OUR profile lock —
+/// typically an orphan that outlived its app process (app restart, crash).
+/// Only adopts when the lock holder's command line proves it is our own
+/// bundled executable running our own profile; anything else is refused.
+/// Returns its DevTools port, read from Chrome's DevToolsActivePort file.
+async fn adopt_orphan(exe_key: &str, profile: &std::path::Path) -> Option<u16> {
+    let pid = holder_is_ours(exe_key, profile)?;
+    // Preferred: the port the holder itself was started with.
+    let cmd = process_command(pid);
+    if let Some(port) = debug_port_from_cmd(&cmd) {
+        if http_ok(&format!("{}/json/version", debugger_url(port))).await {
+            return Some(port);
+        }
+    }
+    // Fallback: Chrome's DevToolsActivePort file in the profile dir.
+    let content = std::fs::read_to_string(profile.join("DevToolsActivePort")).ok()?;
+    let port: u16 = content.lines().next()?.trim().parse().ok()?;
+    http_ok(&format!("{}/json/version", debugger_url(port))).await.then_some(port)
+}
+
+/// `--remote-debugging-port=NNN` from a holder command line, if present.
+fn debug_port_from_cmd(cmd: &str) -> Option<u16> {
+    cmd.split_whitespace()
+        .find_map(|arg| arg.strip_prefix("--remote-debugging-port="))
+        .and_then(|n| n.parse().ok())
+        .filter(|&p| p != 0)
+}
+
+/// The process holding the profile lock, if it is verifiably our own
+/// bundled browser on our own profile. None otherwise (stale lock, or
+/// something we must never touch).
+fn holder_is_ours(exe_key: &str, profile: &std::path::Path) -> Option<u32> {
+    let pid = lock_holder_pid(profile)?;
+    let cmd = process_command(pid);
+    let profile_arg = format!("--user-data-dir={}", profile.to_string_lossy());
+    (cmd.contains(exe_key) && cmd.contains(&profile_arg)).then_some(pid)
+}
+
+/// An adopted (not launched) instance is reusable while its process is still
+/// ours and its DevTools endpoint still answers.
+async fn adopted_alive(exe_key: &str, profile: &std::path::Path, port: u16) -> bool {
+    holder_is_ours(exe_key, profile).is_some()
+        && http_ok(&format!("{}/json/version", debugger_url(port))).await
 }
 
 fn free_port() -> anyhow::Result<u16> {
@@ -125,15 +173,22 @@ pub async fn ensure_chromium() -> Result<u16, String> {
     let exe_key = exe.to_string_lossy().to_string();
     let profile = profile_dir();
     let profile_key = profile.to_string_lossy().to_string();
-    let mut guard = managed_lock().lock().await;
+    // Option-wrapped so the self-heal path can release the lock before the
+    // (possibly long) re-provision + relaunch.
+    let mut slot = Some(managed_lock().lock().await);
+    let guard = slot.as_mut().unwrap();
 
-    // Reuse the live instance while its process is still ours and answering.
+    // Reuse the live instance while its process is still ours and answering
+    // (launched children via wait(); adopted orphans via ownership + HTTP).
     if let Some(m) = guard.browser.as_mut() {
         let usable = match m.child.as_mut() {
-            Some(child) => child.try_wait().map(|s| s.is_none()).unwrap_or(false),
-            None => false,
+            Some(child) => {
+                child.try_wait().map(|s| s.is_none()).unwrap_or(false)
+                    && http_ok(&format!("{}/json/version", debugger_url(m.port))).await
+            }
+            None => adopted_alive(&m.exe, &profile, m.port).await,
         };
-        if usable && http_ok(&format!("{}/json/version", debugger_url(m.port))).await {
+        if usable {
             return Ok(m.port);
         }
         if let Some(mut child) = m.child.take() {
@@ -152,29 +207,72 @@ pub async fn ensure_chromium() -> Result<u16, String> {
         return Err(format!("PROFILE_FAILED: cannot create browser profile: {e}"));
     }
 
+    // Fast path for the common restart case: our previous browser is still
+    // alive and holding the profile (healthy orphan). Adopt it instead of
+    // spawning into a locked profile and fighting over it.
+    if lock_held(&profile) {
+        if let Some(port) = adopt_orphan(&exe_key, &profile).await {
+            guard.browser = Some(ManagedBrowser { child: None, exe: exe_key, port, page_id: None });
+            return Ok(port);
+        }
+    }
+
     let port = free_port().map_err(|e| format!("PORT_FAILED: {e}"))?;
     let result = match spawn_and_settle(&exe_key, &launch_args(port, &profile_key), port).await {
         Ok(child) => {
-            guard.browser = Some(ManagedBrowser { child: Some(child), port, page_id: None });
+            guard.browser = Some(ManagedBrowser { child: Some(child), exe: exe_key, port, page_id: None });
             Ok(port)
         }
         Err(code) => {
             let locked_exit = code.starts_with("EXITED:21") || lock_held(&profile);
             let hung = code.starts_with("NO_DEVTOOLS");
             if locked_exit || hung {
-                // Our isolated profile is ours to reclaim (orphan from an
-                // earlier agent run).
+                // Prefer adoption again (holder may have appeared since):
+                // only a dead or unreachable holder gets killed + relaunched.
+                if let Some(port) = adopt_orphan(&exe_key, &profile).await {
+                    guard.browser = Some(ManagedBrowser { child: None, exe: exe_key, port, page_id: None });
+                    return Ok(port);
+                }
                 kill_stale_profile_holders(&profile_key).await;
                 if lock_holder_pid(&profile).is_none() {
                     clear_stale_locks(&profile);
                 }
                 retry_launch(&exe_key, &profile_key, &mut guard.browser).await
+            } else if code.starts_with("EXITED") && super::provision::quarantine_owned(&exe_key) {
+                // A binary we installed ourselves that dies instantly is
+                // corrupt or an incompatible legacy build (e.g. the retired
+                // headless-shell): quarantine it, re-provision once, retry.
+                // NLL: `guard` is not used after this point in the arm.
+                slot.take();
+                let exe = bundled_exe().await?;
+                let exe_key = exe.to_string_lossy().to_string();
+                let mut healed = managed_lock().lock().await;
+                healed.failed_launch = None;
+                let port = free_port().map_err(|e| format!("PORT_FAILED: {e}"))?;
+                match spawn_and_settle(&exe_key, &launch_args(port, &profile_key), port).await {
+                    Ok(mut child) => {
+                        // Another task may have launched while we re-provisioned:
+                        // prefer the instance already in the slot when live.
+                        let slot_live = healed.browser.as_mut().is_some_and(|m| {
+                            m.child.as_mut().map(|c| c.try_wait().map(|s| s.is_none()).unwrap_or(false)).unwrap_or(false)
+                        });
+                        if slot_live {
+                            let _ = child.kill().await;
+                            Ok(healed.browser.as_ref().map(|m| m.port).unwrap_or(port))
+                        } else {
+                            healed.browser = Some(ManagedBrowser { child: Some(child), exe: exe_key, port, page_id: None });
+                            Ok(port)
+                        }
+                    }
+                    Err(code) => Err(friendly_launch_error(&exe_key, &code)),
+                }
             } else {
                 Err(friendly_launch_error(&exe_key, &code))
             }
         }
     };
-    if let Err(error) = &result {
+    // The self-heal arm returned already (and released the lock via slot.take()).
+    if let (Err(error), Some(guard)) = (&result, slot.as_mut()) {
         guard.failed_launch = Some((error.clone(), Instant::now()));
     }
     result
@@ -206,7 +304,7 @@ async fn retry_launch(
     let args = launch_args(port, profile_key);
     match spawn_and_settle(&exe_owned, &args, port).await {
         Ok(child) => {
-            *slot = Some(ManagedBrowser { child: Some(child), port, page_id: None });
+            *slot = Some(ManagedBrowser { child: Some(child), exe: exe_owned, port, page_id: None });
             Ok(port)
         }
         Err(code) => Err(friendly_launch_error(&exe_owned, &code)),
@@ -215,6 +313,18 @@ async fn retry_launch(
 
 fn friendly_launch_error(exe: &str, code: &str) -> String {
     if let Some(n) = code.strip_prefix("EXITED:") {
+        // 21 almost always means the profile is still locked: name the
+        // holder so the message is actionable instead of cryptic.
+        if n == "21" {
+            let holder = lock_holder_pid(&profile_dir())
+                .map(|pid| format!(" (held by live process pid {pid})"))
+                .unwrap_or_default();
+            return format!(
+                "LAUNCH_FAILED: bundled Chromium exited with 21{holder}: its profile is still in use. \
+                 Close any other Comrade window holding the browser, then retry — a healthy previous \
+                 instance is adopted automatically, otherwise it is reclaimed."
+            );
+        }
         format!("LAUNCH_FAILED: bundled Chromium exited immediately with {n} ({exe}; check missing libs).")
     } else if let Some(detail) = code.strip_prefix("NO_DEVTOOLS:") {
         format!("LAUNCH_FAILED: {detail}")
@@ -340,11 +450,19 @@ pub async fn close_chromium() -> CloseOutcome {
     }
 }
 
-/// DevTools port of the running instance, if any.
+/// DevTools port of the running instance, if any (launched or adopted).
 pub async fn managed_port() -> Option<u16> {
     let guard = managed_lock().lock().await;
     let m = guard.browser.as_ref()?;
-    m.child.is_some().then_some(m.port)
+    match m.child.is_some() {
+        true => Some(m.port),
+        // Don't await network while holding the lock: copy out and check after.
+        false => {
+            let (exe, port) = (m.exe.clone(), m.port);
+            drop(guard);
+            adopted_alive(&exe, &profile_dir(), port).await.then_some(port)
+        }
+    }
 }
 
 /// Best-effort snapshot for the in-app pane: running flag + current URL/title.
@@ -363,7 +481,20 @@ pub async fn state_snapshot() -> serde_json::Value {
 
 /// Raw PNG bytes of the current tab (for the in-app pane live view).
 pub async fn screenshot_bytes() -> Result<Vec<u8>, String> {
+    Ok(capture_frame().await?.png)
+}
+
+/// One live frame for the interactive in-app pane: screenshot PNG plus the
+/// page's CSS viewport size, so UI clicks/scrolls map 1:1 onto the page.
+pub struct Frame {
+    pub png: Vec<u8>,
+    pub viewport_w: f64,
+    pub viewport_h: f64,
+}
+
+pub async fn capture_frame() -> Result<Frame, String> {
     let port = ensure_chromium().await?;
+    let (viewport_w, viewport_h) = viewport_metrics(port).await.unwrap_or((1280.0, 860.0));
     let page = active_page(port).await?;
     let res = cdp_call(&page.ws_url, "Page.captureScreenshot", serde_json::json!({ "format": "png" })).await?;
     let b64 = res
@@ -371,9 +502,58 @@ pub async fn screenshot_bytes() -> Result<Vec<u8>, String> {
         .and_then(|d| d.as_str())
         .ok_or_else(|| "SCREENSHOT_FAILED: browser returned no image data.".to_string())?;
     use base64::Engine as _;
-    base64::engine::general_purpose::STANDARD
+    let png = base64::engine::general_purpose::STANDARD
         .decode(b64)
-        .map_err(|e| format!("SCREENSHOT_FAILED: bad image data: {e}"))
+        .map_err(|e| format!("SCREENSHOT_FAILED: bad image data: {e}"))?;
+    Ok(Frame { png, viewport_w, viewport_h })
+}
+
+/// CSS viewport size (`window.innerWidth/innerHeight`) of the active tab.
+/// The pane scales image clicks by these so they land on the right element.
+pub async fn viewport_metrics(port: u16) -> Result<(f64, f64), String> {
+    let page = active_page(port).await?;
+    let v = cdp_eval(&page.ws_url, "({w: window.innerWidth, h: window.innerHeight})").await?;
+    let w = v.get("w").and_then(|n| n.as_f64()).unwrap_or(0.0);
+    let h = v.get("h").and_then(|n| n.as_f64()).unwrap_or(0.0);
+    if w > 0.0 && h > 0.0 {
+        Ok((w, h))
+    } else {
+        Err("VIEWPORT_UNKNOWN: could not read the page size.".to_string())
+    }
+}
+
+/// Click at CSS-pixel coordinates in the active tab (from the in-app pane).
+/// Real trusted input via CDP: hits buttons, links, and focuses fields.
+pub async fn mouse_click(port: u16, x: f64, y: f64) -> Result<(), String> {
+    if !x.is_finite() || !y.is_finite() || x < 0.0 || y < 0.0 || x > 10000.0 || y > 10000.0 {
+        return Err(format!("BAD_COORDS: click position out of range ({x}, {y})."));
+    }
+    let page = active_page(port).await?;
+    let base = serde_json::json!({ "x": x, "y": y });
+    let mut moved = base.clone();
+    moved["type"] = serde_json::Value::String("mouseMoved".into());
+    cdp_call(&page.ws_url, "Input.dispatchMouseEvent", moved).await?;
+    for kind in ["mousePressed", "mouseReleased"] {
+        let mut ev = base.clone();
+        ev["type"] = serde_json::Value::String(kind.into());
+        ev["button"] = serde_json::Value::String("left".into());
+        ev["clickCount"] = serde_json::Value::Number(1.into());
+        cdp_call(&page.ws_url, "Input.dispatchMouseEvent", ev).await?;
+    }
+    Ok(())
+}
+
+/// Type text into whatever is focused in the active tab (in-app pane keys).
+pub async fn insert_text(port: u16, text: &str) -> Result<(), String> {
+    if text.is_empty() {
+        return Ok(());
+    }
+    if text.len() > 200 {
+        return Err("TEXT_TOO_LONG: type at most 200 characters at a time.".to_string());
+    }
+    let page = active_page(port).await?;
+    cdp_call(&page.ws_url, "Input.insertText", serde_json::json!({ "text": text })).await?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -791,6 +971,7 @@ mod tests {
 
     #[tokio::test]
     async fn bundled_exe_honors_override() {
+        let _lock = crate::env_lock();
         let exe = std::env::current_exe().unwrap();
         std::env::set_var("COMRADE_CHROMIUM_BIN", exe.to_string_lossy().to_string());
         assert!(bundled_exe().await.is_ok());
@@ -814,6 +995,17 @@ mod tests {
         assert!(args.iter().any(|arg| arg == "--headless=new"), "nothing may open outside the app: {args:?}");
         assert!(args.iter().any(|arg| arg.starts_with("--user-data-dir=/tmp/comrade-test-profile")));
         assert!(!args.iter().any(|arg| arg.contains("remote-debugging-port=0")));
+    }
+
+    #[test]
+    fn debug_port_parses_from_holder_cmdline() {
+        assert_eq!(
+            debug_port_from_cmd("/x/chrome --remote-debugging-port=44897 --user-data-dir=/y"),
+            Some(44897)
+        );
+        assert_eq!(debug_port_from_cmd("/x/chrome --headless"), None);
+        assert_eq!(debug_port_from_cmd("/x/chrome --remote-debugging-port=0"), None);
+        assert_eq!(debug_port_from_cmd(""), None);
     }
 
     #[test]

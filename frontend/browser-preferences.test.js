@@ -18,7 +18,8 @@
     this.style = { setProperty: function () {} };
     this.classList = { add: function () {}, remove: function () {}, toggle: function () {} };
     this.textContent = '';
-    this.selectedIndex = -1;
+    this.clientWidth = 0;
+    this.clientHeight = 0;
     this._value = '';
     this.hidden = false;
   }
@@ -57,7 +58,7 @@
   };
   Element.prototype.querySelector = function (selector) { return this.querySelectorAll(selector)[0] || null; };
   Element.prototype.scrollIntoView = Element.prototype.focus = function () {};
-  Element.prototype.getBoundingClientRect = function () { return { right: 1000, width: 1000 }; };
+  Element.prototype.getBoundingClientRect = function () { return { left: 0, top: 0, right: 1000, width: 1000 }; };
   Element.prototype.removeAttribute = function () {};
 
   function boot(saved, opts) {
@@ -102,6 +103,11 @@
           if (command === 'browser_state') return Promise.resolve({ running: true, url: 'https://example.com', title: 'Example' });
           if (command === 'browser_screenshot') return Promise.resolve('data:image/png;base64,AAA');
           if (command === 'browser_open') return Promise.resolve({ url: args.url, title: 'T' });
+          if (command === 'browser_frame') return Promise.resolve({ data_url: 'data:image/png;base64,AAA', width: 1280, height: 860 });
+          if (command === 'browser_click_at') return Promise.resolve({ url: 'https://example.com' });
+          if (command === 'browser_type_text') return Promise.resolve({ typed: (args.text || '').length });
+          if (command === 'browser_press_key') return Promise.resolve({ key: args.key });
+          if (command === 'browser_scroll') return Promise.resolve({ scrollX: 0, scrollY: 100 });
           if (command === 'browser_back' || command === 'browser_forward' || command === 'browser_reload') {
             return Promise.resolve({ url: 'https://example.com' });
           }
@@ -147,10 +153,10 @@
     await flush();
     assert(s.elements['browser-pane'].hidden === false, 'Browser step must auto-show the in-app pane');
     assert(s.count('browser_state') >= 1, 'Pane must fetch browser state on auto-show');
-    assert(s.count('browser_screenshot') >= 1, 'Pane must render a live screenshot on auto-show');
+    assert(s.count('browser_frame') >= 1, 'Pane must render a live frame on auto-show');
 
     // 3. Address bar drives the same bundled tab; non-browser steps don't touch the pane.
-    var shots = s.count('browser_screenshot');
+    var shots = s.count('browser_frame');
     s.elements['browser-url'].value = 'example.org';
     s.elements['browser-form'].dispatch('submit');
     await flush();
@@ -159,7 +165,7 @@
       'Address bar must send the typed URL to the bundled tab');
     s.fire('agent-event', { type: 'step', label: 'terminal.execute command="ls"', status: 'done' });
     await flush();
-    assert(s.count('browser_screenshot') === shots + 1, 'Only the address-bar refresh may add exactly one screenshot');
+    assert(s.count('browser_frame') === shots + 1, 'Only the address-bar refresh may add exactly one frame');
     s.fire('agent-event', { type: 'done', status: 'done' });
     await flush();
 
@@ -181,7 +187,32 @@
       'Pane must show install progress, got: ' + s.elements['browser-status'].textContent);
     assert(s.count('browser_provision_status') === 0, 'Progress polls on a timer, not in a burst');
 
-    report('PASS: instant task start, browser-mode auto-show, address-bar navigation, pane toggle, self-install progress');
+    // 6. Direct interaction: clicks map onto page coords, keys and wheel forward.
+    s = await boot();
+    await flush();
+    s.elements['browser-btn'].dispatch('click');
+    await flush();
+    assert(s.elements['browser-pane'].hidden === false, 'Pane must open for interaction');
+    s.elements['browser-img'].clientWidth = 640;
+    s.elements['browser-img'].dispatch('click', { clientX: 320, clientY: 160, offsetX: 320, offsetY: 160, preventDefault: function () {} });
+    await flush();
+    var clicks = s.calls.filter(function (c) { return c.command === 'browser_click_at'; });
+    assert(clicks.length === 1, 'Clicking the view must click the page');
+    assert(clicks[0].args.x === 640 && clicks[0].args.y === 320,
+      'Clicks must scale to page coords, got ' + JSON.stringify(clicks[0].args));
+    s.elements['browser-keys'].value = 'hi';
+    s.elements['browser-keys'].dispatch('input');
+    await flush();
+    var types = s.calls.filter(function (c) { return c.command === 'browser_type_text'; });
+    assert(types.length === 1 && types[0].args.text === 'hi', 'Typing must forward text to the page');
+    s.elements['browser-keys'].dispatch('keydown', { key: 'Enter', preventDefault: function () {} });
+    await flush();
+    assert(s.count('browser_press_key') === 1, 'Special keys must forward to the page');
+    s.elements['browser-view'].dispatch('wheel', { deltaX: 0, deltaY: 200, preventDefault: function () {} });
+    await new Promise(function (r) { setTimeout(r, 250); });
+    assert(s.count('browser_scroll') === 1, 'Wheel must scroll the page');
+
+    report('PASS: instant task start, browser-mode auto-show, address-bar navigation, pane toggle, self-install progress, direct interaction');
     // Install-progress polling uses a real timer that the mock never
     // completes — exit explicitly instead of hanging on it.
     if (typeof process !== 'undefined') process.exit(0);
