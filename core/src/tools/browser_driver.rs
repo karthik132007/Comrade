@@ -15,17 +15,16 @@
  * system browser and never reads any user profile. The bundled Chromium
  * always runs headless (`--headless=new`), so no window ever opens outside
  * the app — the only visible surface is the resizable in-app browser pane,
- * which renders live screenshots of this same instance (same tabs, same
- * session). Tabs are managed via the HTTP DevTools endpoints
- * (`/json/list`, `/json/new`); page automation goes over a per-call
- * WebSocket (`tokio-tungstenite`). One tab is reused across navigation,
- * reading, and clicking.
+ * which receives live compositor frames of this same instance (same tabs, same
+ * session), streamed via CDP with decode acknowledgements. Tabs are managed
+ * via the HTTP DevTools endpoints (`/json/list`, `/json/new`); page automation
+ * uses a persistent, multiplexed WebSocket (`tokio-tungstenite`). One tab is
+ * reused across navigation, reading, and clicking.
  */
 
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 
 // ---------------------------------------------------------------------------
@@ -41,6 +40,8 @@ struct ManagedBrowser {
     /// Absolute path of our bundled executable (ownership checks).
     exe: String,
     page_id: Option<String>,
+    page: Option<PageTarget>,
+    checked_at: Instant,
 }
 
 #[derive(Default)]
@@ -120,11 +121,13 @@ pub async fn bundled_exe() -> Result<std::path::PathBuf, String> {
     super::provision::ensure_provisioned().await
 }
 
+fn devtools_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| reqwest::Client::builder().timeout(Duration::from_secs(5)).build().expect("DevTools HTTP client"))
+}
+
 async fn http_ok(url: &str) -> bool {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build();
-    let Ok(client) = client else { return false };
+    let client = devtools_client();
     client
         .get(url)
         .send()
@@ -153,8 +156,7 @@ fn launch_args(port: u16, profile: &str) -> Vec<String> {
         "--remote-allow-origins=*".to_string(),
         format!("--user-data-dir={profile}"),
         "--headless=new".to_string(),
-        "--disable-gpu".to_string(),
-        "--no-first-run".to_string(),
+                "--no-first-run".to_string(),
         "--no-default-browser-check".to_string(),
         "--disable-dev-shm-usage".to_string(),
         "--no-sandbox".to_string(),
@@ -184,11 +186,14 @@ pub async fn ensure_chromium() -> Result<u16, String> {
         let usable = match m.child.as_mut() {
             Some(child) => {
                 child.try_wait().map(|s| s.is_none()).unwrap_or(false)
-                    && http_ok(&format!("{}/json/version", debugger_url(m.port))).await
+                    && (m.checked_at.elapsed() < Duration::from_secs(2)
+                        || http_ok(&format!("{}/json/version", debugger_url(m.port))).await)
             }
-            None => adopted_alive(&m.exe, &profile, m.port).await,
+            None => m.checked_at.elapsed() < Duration::from_secs(2)
+                || adopted_alive(&m.exe, &profile, m.port).await,
         };
         if usable {
+            if m.checked_at.elapsed() >= Duration::from_secs(2) { m.checked_at = Instant::now(); }
             return Ok(m.port);
         }
         if let Some(mut child) = m.child.take() {
@@ -212,7 +217,7 @@ pub async fn ensure_chromium() -> Result<u16, String> {
     // spawning into a locked profile and fighting over it.
     if lock_held(&profile) {
         if let Some(port) = adopt_orphan(&exe_key, &profile).await {
-            guard.browser = Some(ManagedBrowser { child: None, exe: exe_key, port, page_id: None });
+            guard.browser = Some(ManagedBrowser { child: None, exe: exe_key, port, page_id: None, page: None, checked_at: Instant::now() });
             return Ok(port);
         }
     }
@@ -220,7 +225,7 @@ pub async fn ensure_chromium() -> Result<u16, String> {
     let port = free_port().map_err(|e| format!("PORT_FAILED: {e}"))?;
     let result = match spawn_and_settle(&exe_key, &launch_args(port, &profile_key), port).await {
         Ok(child) => {
-            guard.browser = Some(ManagedBrowser { child: Some(child), exe: exe_key, port, page_id: None });
+            guard.browser = Some(ManagedBrowser { child: Some(child), exe: exe_key, port, page_id: None, page: None, checked_at: Instant::now() });
             Ok(port)
         }
         Err(code) => {
@@ -230,7 +235,7 @@ pub async fn ensure_chromium() -> Result<u16, String> {
                 // Prefer adoption again (holder may have appeared since):
                 // only a dead or unreachable holder gets killed + relaunched.
                 if let Some(port) = adopt_orphan(&exe_key, &profile).await {
-                    guard.browser = Some(ManagedBrowser { child: None, exe: exe_key, port, page_id: None });
+                    guard.browser = Some(ManagedBrowser { child: None, exe: exe_key, port, page_id: None, page: None, checked_at: Instant::now() });
                     return Ok(port);
                 }
                 kill_stale_profile_holders(&profile_key).await;
@@ -260,7 +265,7 @@ pub async fn ensure_chromium() -> Result<u16, String> {
                             let _ = child.kill().await;
                             Ok(healed.browser.as_ref().map(|m| m.port).unwrap_or(port))
                         } else {
-                            healed.browser = Some(ManagedBrowser { child: Some(child), exe: exe_key, port, page_id: None });
+                            healed.browser = Some(ManagedBrowser { child: Some(child), exe: exe_key, port, page_id: None, page: None, checked_at: Instant::now() });
                             Ok(port)
                         }
                     }
@@ -304,7 +309,7 @@ async fn retry_launch(
     let args = launch_args(port, profile_key);
     match spawn_and_settle(&exe_owned, &args, port).await {
         Ok(child) => {
-            *slot = Some(ManagedBrowser { child: Some(child), exe: exe_owned, port, page_id: None });
+            *slot = Some(ManagedBrowser { child: Some(child), exe: exe_owned, port, page_id: None, page: None, checked_at: Instant::now() });
             Ok(port)
         }
         Err(code) => Err(friendly_launch_error(&exe_owned, &code)),
@@ -474,8 +479,7 @@ pub async fn state_snapshot() -> serde_json::Value {
     if !http_ok(&format!("{}/json/version", debugger_url(port))).await {
         return serde_json::json!({ "running": false, "url": "", "title": "" });
     }
-    let url = current_url(port).await.unwrap_or_default();
-    let title = page_title(port).await.map(|(t, _)| t).unwrap_or_default();
+    let (title, url) = page_title(port).await.unwrap_or_default();
     serde_json::json!({ "running": true, "url": url, "title": title })
 }
 
@@ -548,8 +552,8 @@ pub async fn insert_text(port: u16, text: &str) -> Result<(), String> {
     if text.is_empty() {
         return Ok(());
     }
-    if text.len() > 200 {
-        return Err("TEXT_TOO_LONG: type at most 200 characters at a time.".to_string());
+    if text.len() > 65536 {
+        return Err("TEXT_TOO_LONG: paste at most 64 KiB at a time.".to_string());
     }
     let page = active_page(port).await?;
     cdp_call(&page.ws_url, "Input.insertText", serde_json::json!({ "text": text })).await?;
@@ -569,10 +573,7 @@ struct PageTarget {
 }
 
 async fn list_targets(port: u16) -> Result<Vec<PageTarget>, String> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|e| format!("CDP_HTTP: {e}"))?;
+    let client = devtools_client();
     let resp = client
         .get(format!("{}/json/list", debugger_url(port)))
         .send()
@@ -601,10 +602,7 @@ async fn list_targets(port: u16) -> Result<Vec<PageTarget>, String> {
 }
 
 async fn new_tab(port: u16, url: &str) -> Result<PageTarget, String> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|e| format!("CDP_HTTP: {e}"))?;
+    let client = devtools_client();
     let resp = client
         .put(format!("{}/json/new?{}", debugger_url(port), url_query(url)))
         .send()
@@ -644,16 +642,39 @@ async fn active_page(port: u16) -> Result<PageTarget, String> {
     // This lock also prevents concurrent first calls from creating two tabs.
     let mut guard = managed_lock().lock().await;
     let session = guard.browser.as_mut().filter(|m| m.port == port);
+    if let Some(page) = session.as_ref().and_then(|m| m.page.as_ref()) {
+        let page = page.clone();
+        drop(guard);
+        super::cdp_transport::session(&page.ws_url).await?.protect().await?;
+        return Ok(page);
+    }
     let targets = list_targets(port).await?;
     let remembered = session.as_ref().and_then(|m| m.page_id.as_deref());
     let target = match choose_page(&targets, remembered) {
         Some(target) => target.clone(),
         None => new_tab(port, "about:blank").await?,
     };
+    super::cdp_transport::session(&target.ws_url).await?.protect().await?;
     if let Some(session) = session {
         session.page_id = Some(target.id.clone());
+        session.page = Some(target.clone());
     }
     Ok(target)
+}
+
+/// Apply protection preferences to the running tab without restarting Chromium.
+pub async fn set_adblock_enabled(enabled: bool) -> Result<(), String> {
+    super::adblock::set_enabled(enabled);
+    let page = managed_lock().lock().await.browser.as_ref().and_then(|m| m.page.clone());
+    if let Some(page) = page {
+        // Wake the isolated cosmetic world through the shared DOM. The binding
+        // then removes or rebuilds styles according to the current preference.
+        cdp_eval(&page.ws_url, "window.dispatchEvent(new Event('__comradeAdblockRefresh')); document.querySelectorAll('iframe').forEach(f => { try { f.contentWindow.dispatchEvent(new Event('__comradeAdblockRefresh')); } catch (_) {} });").await?;
+        if !enabled {
+            cdp_eval(&page.ws_url, "document.getElementById('__comradeAdblockStyle')?.remove()").await?;
+        }
+    }
+    Ok(())
 }
 
 fn choose_page<'a>(targets: &'a [PageTarget], remembered: Option<&str>) -> Option<&'a PageTarget> {
@@ -663,37 +684,22 @@ fn choose_page<'a>(targets: &'a [PageTarget], remembered: Option<&str>) -> Optio
         .or_else(|| targets.first())
 }
 
-/// Raw CDP round-trip: connect, send one method, wait for the matching id.
+/// Reuse a multiplexed target connection; page events flow independently of commands.
 pub async fn cdp_call(ws_url: &str, method: &str, params: Value) -> Result<Value, String> {
-    let (mut ws, _) = tokio_tungstenite::connect_async(ws_url)
-        .await
-        .map_err(|e| format!("CDP_WS: connect failed: {e}"))?;
-    let msg = serde_json::json!({ "id": 1, "method": method, "params": params });
-    ws.send(tokio_tungstenite::tungstenite::Message::Text(msg.to_string().into()))
-        .await
-        .map_err(|e| format!("CDP_WS: send failed: {e}"))?;
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
-        if Instant::now() > deadline {
-            return Err("CDP_TIMEOUT: no reply from browser within 20s.".to_string());
+    let result = match super::cdp_transport::session(ws_url).await {
+        Ok(session) => session.call(method, params).await,
+        Err(error) => Err(error),
+    };
+    if result.as_ref().err().is_some_and(|e| e.starts_with("CDP_CLOSED") || e.starts_with("CDP_WS")) {
+        let mut managed = managed_lock().lock().await;
+        if let Some(browser) = managed.browser.as_mut() {
+            if browser.page.as_ref().is_some_and(|p| p.ws_url == ws_url) {
+                browser.page = None;
+                browser.checked_at = Instant::now() - Duration::from_secs(3);
+            }
         }
-        let next = tokio::time::timeout(deadline - Instant::now(), ws.next())
-            .await
-            .map_err(|_| "CDP_TIMEOUT: no reply from browser within 20s.".to_string())?;
-        let Some(Ok(msg)) = next else { continue };
-        let text = match msg {
-            tokio_tungstenite::tungstenite::Message::Text(t) => t.to_string(),
-            _ => continue,
-        };
-        let Ok(val) = serde_json::from_str::<Value>(&text) else { continue };
-        if val.get("id").and_then(|v| v.as_u64()) != Some(1) {
-            continue; // event broadcast, not our reply.
-        }
-        if let Some(err) = val.get("error") {
-            return Err(format!("CDP_ERROR: {err}"));
-        }
-        return Ok(val.get("result").cloned().unwrap_or(Value::Null));
     }
+    result
 }
 
 fn js_string(s: &str) -> String {
@@ -772,6 +778,21 @@ pub async fn page_navigate(port: u16, url: &str) -> Result<(String, String), Str
     Ok((target, final_url))
 }
 
+/// Navigation for the human toolbar returns as soon as Chromium accepts it.
+pub async fn page_navigate_interactive(port: u16, url: &str) -> Result<(String, String), String> {
+    let page = active_page(port).await?;
+    let target = normalize_url(url);
+    if target.is_empty() {
+        return Err("EMPTY_URL: no URL provided.".to_string());
+    }
+    let res = cdp_call(&page.ws_url, "Page.navigate", serde_json::json!({ "url": target })).await?;
+    if let Some(err) = res.get("errorText").and_then(|e| e.as_str()) {
+        return Err(format!("NAVIGATE_FAILED: {err}"));
+    }
+    let final_url = current_url(port).await.unwrap_or(target.clone());
+    Ok((target, final_url))
+}
+
 pub async fn current_url(port: u16) -> Result<String, String> {
     let page = active_page(port).await?;
     let v = cdp_eval(&page.ws_url, "location.href").await?;
@@ -795,16 +816,9 @@ pub async fn page_reload(port: u16) -> Result<String, String> {
 
 pub async fn page_title(port: u16) -> Result<(String, String), String> {
     let page = active_page(port).await?;
-    let title = cdp_eval(&page.ws_url, "document.title")
-        .await?
-        .as_str()
-        .unwrap_or("")
-        .to_string();
-    let url = cdp_eval(&page.ws_url, "location.href")
-        .await
-        .ok()
-        .and_then(|v| v.as_str().map(|s| s.to_string()))
-        .unwrap_or_default();
+    let state = cdp_eval(&page.ws_url, "({title: document.title, url: location.href})").await?;
+    let title = state["title"].as_str().unwrap_or("").to_string();
+    let url = state["url"].as_str().unwrap_or("").to_string();
     Ok((title, url))
 }
 
@@ -866,65 +880,45 @@ pub async fn page_type(port: u16, selector: &str, text: &str) -> Result<(), Stri
     }
 }
 
-fn key_codes(key: &str) -> Option<(u8, i32)> {
-    Some(match key {
-        "Enter" => ("Enter".len() as u8, 13),
-        _ => return None,
-    })
+/// Agent key presses use the same input pipeline as the visible pane.
+pub async fn page_press(port: u16, key: &str) -> Result<(), String> {
+    page_press_with_modifiers(port, key, 0).await
 }
 
-/// Press a key: special keys via CDP Input, text via insertText.
-pub async fn page_press(port: u16, key: &str) -> Result<(), String> {
+pub async fn page_press_with_modifiers(port: u16, key: &str, modifiers: i64) -> Result<(), String> {
     let key = key.trim();
-    if key.is_empty() {
-        return Err("EMPTY_KEY: no key provided.".to_string());
-    }
+    if key.is_empty() { return Err("EMPTY_KEY: no key provided.".into()); }
     let page = active_page(port).await?;
-    // Single printable char (or space) → insertText is the faithful path.
-    if key.chars().count() == 1 {
-        cdp_call(&page.ws_url, "Input.insertText", serde_json::json!({ "text": key })).await?;
+    let modifiers = modifiers & 15;
+    if key.chars().count() == 1 && modifiers & 7 == 0 {
+        cdp_call(&page.ws_url, "Input.insertText", serde_json::json!({"text": key})).await?;
         return Ok(());
     }
-    // Named keys via raw key events.
-    let (code, windows_code) = match key {
-        "Enter" => ("Enter", 13),
-        "Tab" => ("Tab", 9),
-        "Escape" | "Esc" => ("Escape", 27),
-        "Backspace" => ("Backspace", 8),
-        "Delete" => ("Delete", 46),
-        "ArrowLeft" => ("ArrowLeft", 37),
-        "ArrowUp" => ("ArrowUp", 38),
-        "ArrowRight" => ("ArrowRight", 39),
-        "ArrowDown" => ("ArrowDown", 40),
-        "Home" => ("Home", 36),
-        "End" => ("End", 35),
-        "PageUp" => ("PageUp", 33),
-        "PageDown" => ("PageDown", 34),
-        _ => {
-            // "a", "A", "1" handled above; anything else: try it as literal text
-            // when it looks like text, else fail with a helpful message.
-            if key.len() <= 8 {
-                cdp_call(&page.ws_url, "Input.insertText", serde_json::json!({ "text": key })).await?;
-                return Ok(());
-            }
-            return Err(format!(
-                "UNKNOWN_KEY: {key:?}. Use a single character or one of Enter, Tab, Escape, Backspace, Delete, ArrowLeft/Up/Right/Down, Home, End, PageUp, PageDown."
-            ));
+    let windows_code = match key {
+        "Enter" => 13, "Tab" => 9, "Escape" | "Esc" => 27,
+        "Backspace" => 8, "Delete" => 46, "ArrowLeft" => 37,
+        "ArrowUp" => 38, "ArrowRight" => 39, "ArrowDown" => 40,
+        "Home" => 36, "End" => 35, "PageUp" => 33, "PageDown" => 34,
+        _ if key.len() == 1 && key.is_ascii() => key.to_ascii_uppercase().as_bytes()[0] as i32,
+        _ if key.len() <= 8 && modifiers == 0 => {
+            cdp_call(&page.ws_url, "Input.insertText", serde_json::json!({"text": key})).await?;
+            return Ok(());
         }
+        _ => return Err(format!("UNKNOWN_KEY: {key:?}")),
     };
-    let _ = key_codes("Enter"); // keep helper referenced for future key maps.
-    for kind in ["rawKeyDown", "char", "keyUp"] {
-        let mut params = serde_json::json!({ "type": kind, "key": code, "windowsVirtualKeyCode": windows_code });
-        if kind != "char" {
-            params["code"] = Value::String(code.to_string());
-        } else if code == "Enter" {
-            params["text"] = Value::String("\r".to_string());
+    let code = if key.len() == 1 && key.chars().all(|c| c.is_ascii_alphabetic()) {
+        format!("Key{}", key.to_ascii_uppercase())
+    } else { key.to_string() };
+    for kind in ["rawKeyDown", "keyUp"] {
+        cdp_call(&page.ws_url, "Input.dispatchKeyEvent", serde_json::json!({
+            "type": kind, "key": key, "code": code,
+            "windowsVirtualKeyCode": windows_code, "modifiers": modifiers,
+        })).await?;
+        if kind == "rawKeyDown" && key == "Enter" && modifiers & 7 == 0 {
+            cdp_call(&page.ws_url, "Input.dispatchKeyEvent", serde_json::json!({
+                "type": "char", "key": "Enter", "text": "\r", "windowsVirtualKeyCode": 13, "modifiers": modifiers,
+            })).await?;
         }
-        // keyUp must not carry text.
-        if kind == "keyUp" {
-            params.as_object_mut().map(|o| o.remove("text"));
-        }
-        cdp_call(&page.ws_url, "Input.dispatchKeyEvent", params).await?;
     }
     Ok(())
 }
@@ -964,6 +958,123 @@ pub async fn page_screenshot(port: u16) -> Result<std::path::PathBuf, String> {
     Ok(path)
 }
 
+
+/// Change the actual Chromium viewport to match the pane rather than scaling
+/// a fixed desktop screenshot into a small column. Stream dimensions remain
+/// CSS pixels (deviceScaleFactor=1), so input can be mapped without guessing.
+pub async fn resize_viewport(ws_url: &str, width: u32, height: u32) -> Result<(), String> {
+    cdp_call(ws_url, "Emulation.setDeviceMetricsOverride", serde_json::json!({
+        "width": width.clamp(240, 1920), "height": height.clamp(120, 1440),
+        "deviceScaleFactor": 1, "mobile": false,
+    })).await?;
+    Ok(())
+}
+
+#[derive(Clone, serde::Serialize)]
+pub struct StreamFrame {
+    pub session_id: i64,
+    pub data_url: String,
+    pub width: f64,
+    pub height: f64,
+}
+
+pub struct Screencast {
+    pub ws_url: String,
+    events: tokio::sync::broadcast::Receiver<std::sync::Arc<Value>>,
+}
+
+pub async fn start_screencast(width: u32, height: u32) -> Result<Screencast, String> {
+    let port = ensure_chromium().await?;
+    let page = active_page(port).await?;
+    let session = super::cdp_transport::session(&page.ws_url).await?;
+    let events = session.subscribe();
+    cdp_call(&page.ws_url, "Page.enable", serde_json::json!({})).await?;
+    resize_viewport(&page.ws_url, width, height).await?;
+    cdp_call(&page.ws_url, "Page.startScreencast", serde_json::json!({
+        "format": "jpeg", "quality": 80, "maxWidth": 1920, "maxHeight": 1440, "everyNthFrame": 1,
+    })).await?;
+    Ok(Screencast { ws_url: page.ws_url, events })
+}
+
+impl Screencast {
+    pub async fn next_frame(&mut self) -> Result<StreamFrame, String> {
+        loop {
+            let event = match self.events.recv().await {
+                Ok(event) => event,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(_) => return Err("CDP_CLOSED: browser stream ended".into()),
+            };
+            match event["method"].as_str() {
+                Some("Comrade.disconnected") => return Err("CDP_CLOSED: browser stream ended".into()),
+                Some("Page.screencastFrame") => {
+                    let params = &event["params"];
+                    let Some(data) = params["data"].as_str() else { continue };
+                    let Some(session_id) = params["sessionId"].as_i64() else { continue };
+                    let metadata = &params["metadata"];
+                    return Ok(StreamFrame {
+                        session_id,
+                        // Forward Chromium's JPEG directly. No PNG capture,
+                        // disk write, base64 decode/re-encode, or metadata RPC.
+                        data_url: format!("data:image/jpeg;base64,{data}"),
+                        width: metadata["deviceWidth"].as_f64().unwrap_or(1280.0),
+                        height: metadata["deviceHeight"].as_f64().unwrap_or(860.0),
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+pub async fn acknowledge_frame(ws_url: &str, session_id: i64) -> Result<(), String> {
+    cdp_call(ws_url, "Page.screencastFrameAck", serde_json::json!({ "sessionId": session_id })).await?;
+    Ok(())
+}
+pub async fn stop_screencast(ws_url: &str) -> Result<(), String> {
+    cdp_call(ws_url, "Page.stopScreencast", serde_json::json!({})).await?;
+    Ok(())
+}
+
+/// Trusted pointer events, including hover, drag and scrolling nested panes.
+/// These enter Blink's input pipeline instead of evaluating window.scrollBy.
+pub async fn pointer_event(port: u16, mut event: Value) -> Result<(), String> {
+    let kind = event["type"].as_str().unwrap_or("");
+    if !matches!(kind, "mouseMoved" | "mousePressed" | "mouseReleased" | "mouseWheel") {
+        return Err("BAD_POINTER: unsupported event type".into());
+    }
+    for coordinate in ["x", "y"] {
+        let value = event[coordinate].as_f64().unwrap_or(f64::NAN);
+        if !value.is_finite() || !(0.0..=10000.0).contains(&value) {
+            return Err("BAD_POINTER: coordinates out of range".into());
+        }
+    }
+    if kind == "mouseWheel" {
+        for axis in ["deltaX", "deltaY"] {
+            let value = event[axis].as_f64().unwrap_or(0.0);
+            event[axis] = serde_json::json!(value.clamp(-10000.0, 10000.0));
+        }
+    }
+    let page = active_page(port).await?;
+    cdp_call(&page.ws_url, "Input.dispatchMouseEvent", event).await?;
+    Ok(())
+}
+
+/// Toolbar navigation returns immediately; the live stream shows progress.
+pub async fn history_interactive(port: u16, forward: bool) -> Result<(), String> {
+    let page = active_page(port).await?;
+    let history = cdp_call(&page.ws_url, "Page.getNavigationHistory", serde_json::json!({})).await?;
+    let current = history["currentIndex"].as_i64().unwrap_or(0);
+    let index = if forward { current + 1 } else { current - 1 };
+    if let Some(entry) = history["entries"].as_array().and_then(|entries| usize::try_from(index).ok().and_then(|i| entries.get(i))) {
+        cdp_call(&page.ws_url, "Page.navigateToHistoryEntry", serde_json::json!({"entryId": entry["id"]})).await?;
+    }
+    Ok(())
+}
+pub async fn reload_interactive(port: u16) -> Result<(), String> {
+    let page = active_page(port).await?;
+    cdp_call(&page.ws_url, "Page.reload", serde_json::json!({})).await?;
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {

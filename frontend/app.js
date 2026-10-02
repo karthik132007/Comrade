@@ -1,5 +1,9 @@
-/* Comrade frontend (vanilla JS). Talks to the Rust backend via Tauri IPC only. */
-(function () {
+import { createBrowserStream } from './browser-stream';
+
+/* Tauri IPC controller. React owns the shell; this controller owns the dynamic
+   transcript, task steps, history, and backend-driven preference fields.
+   Initialize once after the React shell has mounted. */
+export function initializeComrade() {
   'use strict';
 
   var tauri = (window.__TAURI__ && window.__TAURI__.core) || null;
@@ -108,7 +112,7 @@
     uiState = s;
     pill.className = 'pill ' + s;
     statusText.textContent = STATE_LABEL[s];
-    orb.className = 'orb ' + s;
+    orb.className = 'hero-mark orb ' + s;
   }
 
   function syncConvClass() {
@@ -116,6 +120,7 @@
   }
 
   function addMessage(role, text) {
+    document.body.classList.add('has-messages');
     var div = document.createElement('div');
     div.className = 'msg ' + role;
     var r = document.createElement('div');
@@ -155,6 +160,18 @@
     for (var i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
     return String(Math.abs(h));
   }
+
+  input.addEventListener('keydown', function (ev) {
+    if (ev.key === 'Enter' && !ev.shiftKey && !ev.isComposing) {
+      ev.preventDefault();
+      form.requestSubmit();
+    }
+  });
+  document.addEventListener('keydown', function (ev) {
+    if ((ev.metaKey || ev.ctrlKey) && ev.key.toLowerCase() === 'n' && settingsEl.hidden && onboardingEl.hidden && permModal.hidden) {
+      ev.preventDefault(); newChat();
+    }
+  });
 
   form.addEventListener('submit', function (ev) {
     ev.preventDefault();
@@ -344,7 +361,7 @@
     tauriEvent.listen('voice-event', function (e) { onVoiceEvent(e.payload); });
     tauriEvent.listen('permission-request', function (e) { onPermissionRequest(e.payload); });
   } else {
-    addMessage('comrade', 'Backend bridge unavailable (not running inside Comrade).');
+    document.getElementById('hint').textContent = 'Browser preview · Launch the desktop app to chat, use voice, and access your local memory.';
   }
 
   function answerPerm(approved) {
@@ -361,7 +378,6 @@
 
   var settingsEl = document.getElementById('settings');
   var settingsBtn = document.getElementById('settings-btn');
-  var settingsClose = document.getElementById('settings-close');
   var modelInfo = document.getElementById('model-info');
   var memText = document.getElementById('mem-text');
   var memKind = document.getElementById('mem-kind');
@@ -411,16 +427,21 @@
   }
 
   function openSettings() {
-    settingsEl.hidden = false;
+    setSettingsOpen(true);
     refreshAppInfo();
     refreshMemList();
   }
 
+  function setSettingsOpen(open) {
+    if (window.dispatchEvent) window.dispatchEvent(new CustomEvent('comrade:settings', { detail: open }));
+    else settingsEl.hidden = !open;
+  }
+
   settingsBtn.addEventListener('click', function () {
     if (settingsEl.hidden) openSettings();
-    else settingsEl.hidden = true;
+    else setSettingsOpen(false);
   });
-  settingsClose.addEventListener('click', function () { settingsEl.hidden = true; });
+
 
   function refreshAppInfo() {
     invoke('app_info', {}).then(function (info) {
@@ -542,9 +563,11 @@
     setSession(null);
     clearMessages();
     taskPanel.hidden = true;
-    greeting.textContent = 'Hey, Comrade.';
-    subtitle.textContent = 'How can I help you?';
+    greeting.textContent = 'What’s on your mind?';
+    subtitle.textContent = 'Think it through. Build it out. Make it happen.';
+    document.body.classList.remove('has-messages');
     refreshChatList();
+    if (browserPrimary) revealChat(true, true);
     input.focus();
   }
 
@@ -623,6 +646,152 @@
   var browserHideBtn = document.getElementById('browser-hide');
   var browserKeys = document.getElementById('browser-keys');
   var browserIsOpen = false;
+  var browserPrimary = false;
+  var chatPinned = false;
+  var chatRevealed = false;
+  var chatLatched = false;
+  var chatHideTimer = null;
+  var windowFullscreen = false;
+  var fullscreenBusy = false;
+  var chatWorkspace = document.getElementById('chat-workspace');
+  var chatRevealBtn = document.getElementById('chat-reveal');
+  var chatPinBtn = document.getElementById('chat-pin');
+  var chatCloseBtn = document.getElementById('chat-close');
+  var browserExpandBtn = document.getElementById('browser-expand');
+  var browserFullscreenBtn = document.getElementById('browser-fullscreen');
+
+  function renderBrowserLayout() {
+    document.body.classList.toggle('browser-primary', browserPrimary);
+    document.body.classList.toggle('chat-pinned', browserPrimary && chatPinned);
+    document.body.classList.toggle('chat-revealed', browserPrimary && chatRevealed);
+    chatWorkspace.inert = browserPrimary && !chatPinned && !chatRevealed;
+    browserDivider.hidden = !browserIsOpen || browserPrimary;
+    browserExpandBtn.setAttribute('aria-pressed', String(browserPrimary));
+    browserExpandBtn.setAttribute('aria-label', browserPrimary ? 'Return to chat view' : 'Make browser the main view');
+    browserExpandBtn.title = browserPrimary ? 'Return to chat view' : 'Make browser the main view';
+    chatRevealBtn.setAttribute('aria-expanded', String(chatPinned || chatRevealed));
+    chatPinBtn.setAttribute('aria-pressed', String(chatPinned));
+    chatPinBtn.setAttribute('aria-label', chatPinned ? 'Float chat over browser' : 'Pin chat beside browser');
+    chatPinBtn.title = chatPinned ? 'Float chat over browser' : 'Pin chat beside browser';
+  }
+  function revealChat(open, latch) {
+    clearTimeout(chatHideTimer);
+    chatRevealed = !!open;
+    chatLatched = !!open && !!latch;
+    renderBrowserLayout();
+  }
+  function scheduleChatHide() {
+    clearTimeout(chatHideTimer);
+    chatHideTimer = setTimeout(function () {
+      if (!chatPinned && !chatLatched && !chatWorkspace.contains(document.activeElement)) revealChat(false);
+    }, 220);
+  }
+  function setBrowserPrimary(primary) {
+    browserPrimary = !!primary;
+    if (browserPrimary && !browserIsOpen) setBrowserOpen(true);
+    chatRevealed = false;
+    chatLatched = false;
+    clearTimeout(chatHideTimer);
+    renderBrowserLayout();
+    try { window.localStorage.setItem('comrade-browser-primary', browserPrimary ? '1' : '0'); } catch (e) {}
+    if (browserPrimary) browserExpandBtn.focus();
+  }
+  async function setWindowFullscreen(fullscreen) {
+    if (fullscreenBusy) return;
+    fullscreenBusy = true;
+    try {
+      var desktopWindow = window.__TAURI__ && window.__TAURI__.window;
+      if (desktopWindow) await desktopWindow.getCurrentWindow().setFullscreen(fullscreen);
+      else if (fullscreen) await document.documentElement.requestFullscreen();
+      else if (document.fullscreenElement) await document.exitFullscreen();
+      windowFullscreen = fullscreen;
+      browserFullscreenBtn.setAttribute('aria-pressed', String(fullscreen));
+      browserFullscreenBtn.setAttribute('aria-label', fullscreen ? 'Exit fullscreen' : 'Enter fullscreen');
+      browserFullscreenBtn.title = fullscreen ? 'Exit fullscreen (F11)' : 'Fullscreen (F11)';
+    } catch (error) {
+      browserStatus.textContent = 'Could not change fullscreen: ' + error.message;
+    } finally { fullscreenBusy = false; }
+  }
+  browserExpandBtn.addEventListener('click', function () { setBrowserPrimary(!browserPrimary); });
+  browserFullscreenBtn.addEventListener('click', function () {
+    if (!windowFullscreen) setBrowserPrimary(true);
+    setWindowFullscreen(!windowFullscreen);
+  });
+  chatRevealBtn.addEventListener('mouseenter', function () { if (!chatPinned && !chatLatched) revealChat(true); });
+  chatRevealBtn.addEventListener('mouseleave', scheduleChatHide);
+  chatRevealBtn.addEventListener('focus', function () { if (browserPrimary) revealChat(true); });
+  chatRevealBtn.addEventListener('click', function () {
+    if (chatPinned) { chatPinned = false; revealChat(false); }
+    else revealChat(!chatLatched, !chatLatched);
+    persistChatLayout();
+  });
+  chatWorkspace.addEventListener('mouseenter', function () { clearTimeout(chatHideTimer); });
+  chatWorkspace.addEventListener('mouseleave', scheduleChatHide);
+  chatWorkspace.addEventListener('focusout', scheduleChatHide);
+  function persistChatLayout() {
+    try { window.localStorage.setItem('comrade-chat-pinned', chatPinned ? '1' : '0'); } catch (e) {}
+  }
+  chatPinBtn.addEventListener('click', function () {
+    chatPinned = !chatPinned;
+    revealChat(true, true);
+    persistChatLayout();
+  });
+  chatCloseBtn.addEventListener('click', function () {
+    chatPinned = false;
+    revealChat(false);
+    persistChatLayout();
+    browserExpandBtn.focus();
+  });
+  document.addEventListener('keydown', function (event) {
+    if (event.key === 'F11' && browserIsOpen) {
+      event.preventDefault();
+      if (!windowFullscreen) setBrowserPrimary(true);
+      setWindowFullscreen(!windowFullscreen);
+    } else if (event.key === 'Escape' && browserPrimary && document.getElementById('settings').hidden && document.getElementById('perm-modal').hidden) {
+      if ((chatRevealed || chatPinned) && !windowFullscreen) {
+        chatPinned = false;
+        revealChat(false);
+        persistChatLayout();
+        browserExpandBtn.focus();
+      } else {
+        setWindowFullscreen(false);
+        setBrowserPrimary(false);
+      }
+    }
+  });
+  document.addEventListener('fullscreenchange', function () {
+    if (!document.fullscreenElement && !(window.__TAURI__ && window.__TAURI__.window)) {
+      windowFullscreen = false;
+      browserFullscreenBtn.setAttribute('aria-pressed', 'false');
+      browserFullscreenBtn.setAttribute('aria-label', 'Enter fullscreen');
+      browserFullscreenBtn.title = 'Fullscreen (F11)';
+    }
+  });
+
+  var browserMetadataTimer = null;
+  var browserReconnectTimer = null;
+  var browserInputQueue = Promise.resolve();
+  function queueBrowserInput(command, args) {
+    var operation = browserInputQueue.then(function () { return invoke(command, args); });
+    browserInputQueue = operation.catch(function () {});
+    return operation;
+  }
+  function paneDimensions() {
+    return { width: Math.max(240, Math.round(browserView.clientWidth || 640)), height: Math.max(120, Math.round(browserView.clientHeight || 640)) };
+  }
+  var browserStream = createBrowserStream({
+    invoke: invoke, tauri: tauri, image: browserImg,
+    onFrame: function (frame) {
+      browserPageW = frame.width; browserPageH = frame.height;
+      browserView.classList.remove('idle');
+      browserStatus.textContent = '';
+    },
+    onError: function (error) {
+      browserStatus.textContent = 'Reconnecting browser…';
+      if (browserReconnectTimer) clearTimeout(browserReconnectTimer);
+      if (browserIsOpen && !document.hidden) browserReconnectTimer = setTimeout(function () { ensureBrowserReady(); }, 1000);
+    },
+  });
   var browserAutoShow = true;
   var browserRefreshing = false;
   // Last known page size (CSS px) for mapping image clicks onto the page.
@@ -653,9 +822,16 @@
     browserIsOpen = !!open;
     document.body.classList.toggle('browser-open', browserIsOpen);
     if (browserPane) browserPane.hidden = !browserIsOpen;
-    if (browserDivider) browserDivider.hidden = !browserIsOpen;
+    if (!browserIsOpen && browserPrimary) { setBrowserPrimary(false); if (windowFullscreen) setWindowFullscreen(false); }
+    renderBrowserLayout();
     try { window.localStorage.setItem('comrade-browser-open', browserIsOpen ? '1' : '0'); } catch (e) { /* noop */ }
-    if (browserIsOpen && refresh !== false) ensureBrowserReady();
+    if (browserMetadataTimer) { clearInterval(browserMetadataTimer); browserMetadataTimer = null; }
+    if (browserReconnectTimer) { clearTimeout(browserReconnectTimer); browserReconnectTimer = null; }
+    if (!browserIsOpen) { browserStream.stop(); stopInstallPoll(); }
+    if (browserIsOpen && refresh !== false && !document.hidden) ensureBrowserReady();
+    if (browserIsOpen && browserStream.supported) {
+      browserMetadataTimer = setInterval(function () { if (!document.hidden && browserStream.active) refreshBrowser(); }, 1000);
+    }
   }
 
   // Browser self-install: the built-in Chromium downloads itself once
@@ -709,6 +885,11 @@
       st = st || {};
       if (st.url && browserUrl) browserUrl.value = st.url;
       if (st.title && browserTitle) browserTitle.textContent = st.title + (st.url ? ' — ' + st.url : '');
+      if (!browserIsOpen || document.hidden) return false;
+      if (browserStream.supported) {
+        var size = paneDimensions();
+        return browserStream.start(size.width, size.height).then(function (ok) { refreshBrowser(); return ok; });
+      }
       refreshBrowser();
       return true;
     }).catch(function (err) {
@@ -730,7 +911,7 @@
   function refreshBrowser() {
     if (browserRefreshing) return;
     browserRefreshing = true;
-    if (browserStatus) browserStatus.textContent = 'updating…';
+    if (!browserStream.active && browserStatus) browserStatus.textContent = 'updating…';
     invoke('browser_state', {}).then(function (st) {
       st = st || {};
       if (st.url && browserUrl && document.activeElement !== browserUrl) browserUrl.value = st.url;
@@ -741,7 +922,7 @@
         return null;
       }
       if (browserView) browserView.classList.remove('idle');
-      return invoke('browser_frame', {});
+      return browserStream.active ? null : invoke('browser_frame', {});
     }).then(function (frame) {
       if (frame && frame.data_url && browserImg) browserImg.src = frame.data_url;
       if (frame && frame.width > 0) { browserPageW = frame.width; browserPageH = frame.height; }
@@ -798,9 +979,10 @@
 
   // --- Direct interaction: the view is live. Clicks, typing, and wheel
   // events on the image drive the same bundled Chromium the agent uses. ---
-  function interactRefreshSoon(ms) {
-    if (browserInteractTimer) clearTimeout(browserInteractTimer);
-    browserInteractTimer = setTimeout(refreshBrowser, ms || 450);
+  function interactRefreshSoon() {
+    if (browserStream.active) return; // Chromium pushes visual changes without another RPC.
+    if (browserInteractTimer) return;
+    browserInteractTimer = setTimeout(function () { browserInteractTimer = null; refreshBrowser(); }, 16);
   }
 
   function imageToPage(ev) {
@@ -813,22 +995,67 @@
   }
 
   if (browserImg) browserImg.addEventListener('click', function (ev) {
+    if (browserStream.active) return;
     var pt = imageToPage(ev);
     if (!pt) return;
     if (browserStatus) browserStatus.textContent = 'clicking…';
-    invoke('browser_click_at', { x: pt.x, y: pt.y }).then(function (r) {
+    queueBrowserInput('browser_click_at', { x: pt.x, y: pt.y }).then(function (r) {
       if (r && r.url && browserUrl) browserUrl.value = r.url;
       // Route subsequent keystrokes into the page (e.g. a focused field).
       if (browserKeys) browserKeys.focus();
-      interactRefreshSoon(450);
+      interactRefreshSoon();
     }).catch(function (err) { if (browserStatus) browserStatus.textContent = 'Click failed: ' + errMsg(err); });
   });
+
+  var pointerMove = null, pointerMoveTimer = null;
+  function pointerPayload(ev, kind) {
+    var point = imageToPage(ev);
+    if (!point) return null;
+    return { type: kind, x: Math.max(0, Math.min(browserPageW - 1, point.x)), y: Math.max(0, Math.min(browserPageH - 1, point.y)),
+      button: ['left', 'middle', 'right'][ev.button] || 'none', buttons: ev.buttons || 0,
+      modifiers: (ev.altKey ? 1 : 0) | (ev.ctrlKey ? 2 : 0) | (ev.metaKey ? 4 : 0) | (ev.shiftKey ? 8 : 0),
+      clickCount: kind === 'mouseMoved' ? 0 : (ev.detail || 1) };
+  }
+  function flushPointerMove() {
+    if (pointerMoveTimer) { clearTimeout(pointerMoveTimer); pointerMoveTimer = null; }
+    if (pointerMove) { var event = pointerMove; pointerMove = null; queueBrowserInput('browser_pointer', { event: event }).catch(function () {}); }
+  }
+  if (browserImg) {
+    browserImg.addEventListener('pointerdown', function (ev) {
+      if (!browserStream.active) return;
+      var event = pointerPayload(ev, 'mousePressed'); if (!event) return;
+      ev.preventDefault(); flushPointerMove();
+      if (browserImg.setPointerCapture) browserImg.setPointerCapture(ev.pointerId);
+      queueBrowserInput('browser_pointer', { event: event }).catch(function (err) { browserStatus.textContent = errMsg(err); });
+    });
+    browserImg.addEventListener('pointerup', function (ev) {
+      if (!browserStream.active) return;
+      var event = pointerPayload(ev, 'mouseReleased'); if (!event) return;
+      ev.preventDefault(); flushPointerMove();
+      queueBrowserInput('browser_pointer', { event: event }).catch(function (err) { browserStatus.textContent = errMsg(err); });
+      browserKeys.focus();
+    });
+    browserImg.addEventListener('pointercancel', function (ev) {
+      if (!browserStream.active) return;
+      var event = pointerPayload(ev, 'mouseReleased');
+      if (event) { event.buttons = 0; queueBrowserInput('browser_pointer', { event: event }).catch(function () {}); }
+    });
+    browserImg.addEventListener('pointermove', function (ev) {
+      if (!browserStream.active) return;
+      pointerMove = pointerPayload(ev, 'mouseMoved');
+      if (!pointerMoveTimer) pointerMoveTimer = setTimeout(flushPointerMove, 32);
+    });
+    browserImg.addEventListener('contextmenu', function (ev) { if (browserStream.active) ev.preventDefault(); });
+  }
 
   if (browserView) browserView.addEventListener('wheel', function (ev) {
     if (!browserIsOpen) return;
     ev.preventDefault();
-    browserWheelDebt.x += ev.deltaX || 0;
-    browserWheelDebt.y += ev.deltaY || 0;
+    var factor = ev.deltaMode === 1 ? 16 : ev.deltaMode === 2 ? (browserPageH || 640) : 1;
+    browserWheelDebt.x += (ev.deltaX || 0) * factor;
+    browserWheelDebt.y += (ev.deltaY || 0) * factor;
+    browserWheelDebt.modifiers = (ev.altKey ? 1 : 0) | (ev.ctrlKey ? 2 : 0) | (ev.metaKey ? 4 : 0) | (ev.shiftKey ? 8 : 0);
+    browserWheelDebt.point = imageToPage(ev) || { x: browserPageW / 2, y: browserPageH / 2 };
     if (browserWheelTimer) return;
     browserWheelTimer = setTimeout(function () {
       browserWheelTimer = null;
@@ -836,10 +1063,13 @@
       var dy = Math.round(browserWheelDebt.y);
       browserWheelDebt.x = 0; browserWheelDebt.y = 0;
       if (!dx && !dy) return;
-      invoke('browser_scroll', { x: dx, y: dy }).then(function () {
-        interactRefreshSoon(350);
+      var request = browserStream.active
+        ? queueBrowserInput('browser_pointer', { event: { type: 'mouseWheel', x: browserWheelDebt.point.x, y: browserWheelDebt.point.y, deltaX: dx, deltaY: dy, modifiers: browserWheelDebt.modifiers } })
+        : queueBrowserInput('browser_scroll', { x: dx, y: dy });
+      request.then(function () {
+        interactRefreshSoon();
       }).catch(function () { /* keep the last good frame */ });
-    }, 120);
+    }, 16);
   }, { passive: false });
 
   var SPECIAL_KEYS = {
@@ -851,19 +1081,20 @@
 
   if (browserKeys) {
     browserKeys.addEventListener('keydown', function (ev) {
-      var key = SPECIAL_KEYS[ev.key];
+      if (ev.isComposing) return;
+      var key = SPECIAL_KEYS[ev.key] || ((ev.ctrlKey || ev.metaKey || ev.altKey) && ev.key.length === 1 ? ev.key : null);
       if (!key) return;
       ev.preventDefault();
-      invoke('browser_press_key', { key: key }).then(function () {
-        interactRefreshSoon(key === 'Enter' ? 600 : 400);
+      queueBrowserInput('browser_press_key', { key: key, modifiers: (ev.altKey ? 1 : 0) | (ev.ctrlKey ? 2 : 0) | (ev.metaKey ? 4 : 0) | (ev.shiftKey ? 8 : 0) }).then(function () {
+        interactRefreshSoon();
       }).catch(function (err) { if (browserStatus) browserStatus.textContent = 'Key failed: ' + errMsg(err); });
     });
     browserKeys.addEventListener('input', function () {
       var text = browserKeys.value;
       if (!text) return;
       browserKeys.value = '';
-      invoke('browser_type_text', { text: text }).then(function () {
-        interactRefreshSoon(900);
+      queueBrowserInput('browser_type_text', { text: text }).then(function () {
+        interactRefreshSoon();
       }).catch(function (err) { if (browserStatus) browserStatus.textContent = 'Type failed: ' + errMsg(err); });
     });
   }
@@ -892,6 +1123,23 @@
     });
   })();
 
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden) browserStream.stop();
+    else if (browserIsOpen) ensureBrowserReady();
+  });
+  window.addEventListener && window.addEventListener('pagehide', function () { browserStream.stop(); });
+  if (typeof ResizeObserver !== 'undefined') {
+    var resizeTimer;
+    new ResizeObserver(function () {
+      if (resizeTimer) clearTimeout(resizeTimer);
+      if (!browserIsOpen || !browserStream.active) return;
+      resizeTimer = setTimeout(function () {
+        var size = paneDimensions();
+        browserStream.resize(size.width, size.height).catch(function () {});
+      }, 80);
+    }).observe(browserView);
+  }
+
   // Restore pane size/open state from the last session immediately.
   try {
     var savedW = window.localStorage.getItem('comrade-browser-width');
@@ -904,6 +1152,7 @@
   var obContinue = document.getElementById('ob-continue');
   var obStatus = document.getElementById('ob-status');
   var prefAutoshow = document.getElementById('pref-autoshow');
+  var prefAdblock = document.getElementById('pref-adblock');
   var prefAutoplay = document.getElementById('pref-autoplay');
   var prefSave = document.getElementById('pref-save');
   var prefStatus = document.getElementById('pref-status');
@@ -923,7 +1172,7 @@
       var auto = prefAutoshow ? prefAutoshow.checked : true;
       invoke('get_prefs', {}).then(function (existing) {
         existing = existing || {};
-        existing.browser = { auto_show: auto, width_pct: width };
+        existing.browser = Object.assign({}, existing.browser, { auto_show: auto, width_pct: width, adblock_enabled: prefAdblock ? prefAdblock.checked : true });
         return invoke('save_prefs', { prefs: existing });
       }).then(function () {
         if (prefStatus) prefStatus.textContent = 'Browser pane settings saved.';
@@ -933,6 +1182,7 @@
     }, 400);
   }
 
+  if (prefAdblock) prefAdblock.addEventListener('change', persistBrowserPrefs);
   if (prefAutoshow) prefAutoshow.addEventListener('change', function () {
     browserAutoShow = prefAutoshow.checked;
     persistBrowserPrefs();
@@ -946,6 +1196,7 @@
   if (paneOpenBtn) paneOpenBtn.addEventListener('click', function () { setBrowserOpen(true); });
   if (paneShotBtn) paneShotBtn.addEventListener('click', function () { setBrowserOpen(true); refreshBrowser(); });
   if (paneCloseBtn) paneCloseBtn.addEventListener('click', function () {
+    browserStream.stop();
     invoke('browser_close', {}).then(function () {
       if (browserStatus) browserStatus.textContent = 'Browser stopped.';
       if (browserImg) browserImg.removeAttribute('src');
@@ -1149,13 +1400,14 @@
       var bp = prefs.browser || {};
       browserAutoShow = bp.auto_show !== false;
       if (prefAutoshow) prefAutoshow.checked = browserAutoShow;
+      if (prefAdblock) prefAdblock.checked = bp.adblock_enabled !== false;
       applyBrowserWidth(bp.width_pct || 45, false);
       prefAutoplay.checked = !(prefs.voice && prefs.voice.autoplay === false);
       currentVoicePrefs = prefs.voice || null;
       fillVoiceSettings(prefs.voice || {});
       fillServerSettings(prefs.server || {});
       refreshModelStatus();
-      prefFile.textContent = 'Stored in comrade.conf inside the comrade-agent home folder. The browser needs no setup — it is bundled and lives only inside this app.';
+      prefFile.textContent = 'Preferences are stored locally on this device.';
     }).catch(function (err) {
       prefStatus.textContent = 'failed: ' + errMsg(err);
     });
@@ -1262,6 +1514,7 @@
         browser: {
           auto_show: prefAutoshow ? prefAutoshow.checked : true,
           width_pct: clampWidth(prefBwidth ? prefBwidth.value : 45),
+          adblock_enabled: prefAdblock ? prefAdblock.checked : true,
         },
         voice: voicePrefsForSave(),
         coding: { agents: agents, default: codeDefault.value || agents[0] },
@@ -1287,11 +1540,16 @@
   // boot: sidebar open, list chats, restore last session
   toggleSidebar(true);
   try {
-    if (window.localStorage.getItem('comrade-browser-open') === '1') setBrowserOpen(true, false);
+    chatPinned = window.localStorage.getItem('comrade-chat-pinned') === '1';
+    if (window.localStorage.getItem('comrade-browser-open') === '1') {
+      setBrowserOpen(true);
+      if (window.localStorage.getItem('comrade-browser-primary') === '1') setBrowserPrimary(true);
+    }
   } catch (e) { /* noop */ }
   invoke('get_prefs', {}).then(function (prefs) {
     var bp = (prefs && prefs.browser) || {};
     browserAutoShow = bp.auto_show !== false;
+    if (prefAdblock) prefAdblock.checked = bp.adblock_enabled !== false;
     if (bp.width_pct) applyBrowserWidth(bp.width_pct, false);
   }).catch(function () { /* pane keeps local defaults */ });
   invoke('app_info', {}).then(function (info) {
@@ -1315,4 +1573,4 @@
   });
 
   setState('idle');
-})();
+}

@@ -1,0 +1,23 @@
+{
+  "name": "comrade-desktop",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "vite --config vite.config.mjs",
+    "build": "vite build --config vite.config.mjs",
+    "preview": "vite preview --config vite.config.mjs",
+    "tauri": "tauri",
+    "test": "node frontend/browser-preferences.test.js && node frontend/browser-stream.test.cjs",
+    "test:ui": "playwright test"
+  },
+  "dependencies": {
+    "lucide-react": "^0.468.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.63.0",
+    "@tauri-apps/cli": "^2.0.0",
+    "vite": "^8.3.2"
+  }
+}

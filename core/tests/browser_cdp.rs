@@ -361,3 +361,161 @@ async fn live_mouse_click_and_type_drive_the_page() {
         browser_driver::CloseOutcome::Closed
     );
 }
+
+/// End-to-end stream against a real isolated Chromium, including nested wheel
+/// input, viewport reflow, and stop/restart. No external websites or accounts.
+#[tokio::test]
+#[ignore]
+async fn live_stream_reflows_and_delivers_input_without_snapshot_polling() {
+    let context = TestContext::new("stream").await;
+    let port = browser_driver::ensure_chromium().await.unwrap();
+    let path = context.home.join("stream.html");
+    std::fs::write(&path, "<!doctype html><title>stream</title><style>body{margin:0}#scroll{position:absolute;left:20px;top:20px;width:250px;height:180px;overflow:auto}#inside{height:2000px;background:linear-gradient(red,blue)}</style><div id=scroll><div id=inside></div></div><input id=field style='position:absolute;left:300px;top:20px'>").unwrap();
+    let url = reqwest::Url::from_file_path(path).unwrap().to_string();
+    browser_driver::page_navigate(port, &url).await.unwrap();
+    let start = std::time::Instant::now();
+    let mut stream = browser_driver::start_screencast(640, 480).await.unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(5), stream.next_frame()).await.unwrap().unwrap();
+    assert!(first.data_url.starts_with("data:image/jpeg;base64,"));
+    assert_eq!((first.width, first.height), (640.0, 480.0));
+    println!("stream initial frame: {:?}, JPEG payload {} bytes", start.elapsed(), first.data_url.len());
+    browser_driver::acknowledge_frame(&stream.ws_url, first.session_id).await.unwrap();
+    assert_eq!(browser_driver::viewport_metrics(port).await.unwrap(), (640.0, 480.0));
+
+    // Scrolling must hit the nested element underneath the pointer; the old
+    // window.scrollBy path could never scroll this page's inner panel.
+    let action = std::time::Instant::now();
+    browser_driver::pointer_event(port, serde_json::json!({"type":"mouseWheel", "x":100, "y":100, "deltaX":0, "deltaY":300})).await.unwrap();
+    let mut scrolled = false;
+    for _ in 0..20 {
+        let v = browser_driver::cdp_eval_via_active(port, "String(document.querySelector('#scroll').scrollTop)").await.unwrap();
+        if v.parse::<f64>().unwrap_or(0.0) > 0.0 { scrolled = true; break; }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(scrolled, "trusted wheel should scroll nested panel");
+    let changed = tokio::time::timeout(Duration::from_secs(3), stream.next_frame()).await.unwrap().unwrap();
+    browser_driver::acknowledge_frame(&stream.ws_url, changed.session_id).await.unwrap();
+    println!("wheel dispatch + page scroll + next frame: {:?}", action.elapsed());
+
+    browser_driver::mouse_click(port, 330.0, 30.0).await.unwrap();
+    browser_driver::insert_text(port, "streamed input").await.unwrap();
+    assert_eq!(browser_driver::cdp_eval_via_active(port, "document.querySelector('#field').value").await.unwrap(), "streamed input");
+    browser_driver::page_press_with_modifiers(port, "a", 2).await.unwrap();
+    let pasted = "long paste ".repeat(50);
+    browser_driver::insert_text(port, &pasted).await.unwrap();
+    assert_eq!(browser_driver::cdp_eval_via_active(port, "document.querySelector('#field').value").await.unwrap(), pasted);
+    browser_driver::resize_viewport(&stream.ws_url, 800, 600).await.unwrap();
+    assert_eq!(browser_driver::viewport_metrics(port).await.unwrap(), (800.0, 600.0));
+    let mut resized = false;
+    for _ in 0..10 {
+        let frame = tokio::time::timeout(Duration::from_secs(3), stream.next_frame()).await.unwrap().unwrap();
+        browser_driver::acknowledge_frame(&stream.ws_url, frame.session_id).await.unwrap();
+        if (frame.width, frame.height) == (800.0, 600.0) { resized = true; break; }
+    }
+    assert!(resized, "stream frame metadata must follow resized viewport");
+    browser_driver::stop_screencast(&stream.ws_url).await.unwrap();
+    let mut restarted = browser_driver::start_screencast(480, 360).await.unwrap();
+    let frame = tokio::time::timeout(Duration::from_secs(3), restarted.next_frame()).await.unwrap().unwrap();
+    assert_eq!((frame.width, frame.height), (480.0, 360.0));
+    browser_driver::acknowledge_frame(&restarted.ws_url, frame.session_id).await.unwrap();
+    browser_driver::stop_screencast(&restarted.ws_url).await.unwrap();
+
+    // Report the connection overhead on the exact same target and page.
+    // This baseline reproduces the old per-command WebSocket transport.
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    let repeats = 30;
+    let baseline = std::time::Instant::now();
+    for _ in 0..repeats {
+        let (mut ws, _) = tokio_tungstenite::connect_async(&restarted.ws_url).await.unwrap();
+        ws.send(Message::Text(serde_json::json!({"id":1,"method":"Runtime.evaluate","params":{"expression":"1+1","returnByValue":true}}).to_string().into())).await.unwrap();
+        while let Some(Ok(Message::Text(text))) = ws.next().await {
+            let result: Value = serde_json::from_str(&text).unwrap();
+            if result["id"] == 1 { break; }
+        }
+        let _ = ws.close(None).await;
+    }
+    let baseline_elapsed = baseline.elapsed();
+    let persistent = std::time::Instant::now();
+    for _ in 0..repeats {
+        let value = browser_driver::cdp_eval_via_active(port, "String(1+1)").await.unwrap();
+        assert_eq!(value, "2");
+    }
+    println!("{repeats} commands: old reconnect transport {:?}; persistent transport {:?}", baseline_elapsed, persistent.elapsed());
+    assert_eq!(browser_driver::close_chromium().await, browser_driver::CloseOutcome::Closed);
+}
+
+/// Every network assertion uses a local fixture: blocked requests must never
+/// reach the server, normal scripts must execute, and CSS hides dynamic ads.
+#[tokio::test]
+#[ignore]
+async fn live_adblock_blocks_before_download_and_can_be_disabled() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let context = TestContext::new("adblock").await;
+    let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.2:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let logged = requests.clone();
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else { break };
+            let logged = logged.clone();
+            tokio::spawn(async move {
+                let mut bytes = vec![0; 8192];
+                let Ok(size) = socket.read(&mut bytes).await else { return };
+                let request = String::from_utf8_lossy(&bytes[..size]);
+                let path = request.split_whitespace().nth(1).unwrap_or("/").to_owned();
+                logged.lock().unwrap().push(path.clone());
+                let (kind, body) = match path.as_str() {
+                    "/" => ("text/html", "<!doctype html><title>shield fixture</title><script src='/normal.js'></script><script src='/banner_ads/blocked.js'></script><div id='ad' class='ad-banner-container'>advert</div><main id='article'>Article content</main>"),
+                    "/normal.js" => ("application/javascript", "window.normalLoaded = true"),
+                    "/banner_ads/blocked.js" => ("application/javascript", "window.adLoaded = true"),
+                    _ => ("text/plain", "fixture"),
+                };
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                let _ = socket.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    let port = browser_driver::ensure_chromium().await.unwrap();
+    let url = format!("http://{address}/");
+    browser_driver::page_navigate(port, &url).await.unwrap();
+    let eval = |script: &'static str| browser_driver::cdp_eval_via_active(port, script);
+    assert_eq!(eval("String(window.normalLoaded === true)").await.unwrap(), "true");
+    assert_eq!(eval("String(window.adLoaded === undefined)").await.unwrap(), "true");
+    assert!(!requests.lock().unwrap().iter().any(|p| p == "/banner_ads/blocked.js"), "blocked script reached server");
+    async fn wait_hidden(port: u16, id: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let expression = format!("getComputedStyle(document.getElementById('{id}')).display");
+            if browser_driver::cdp_eval_via_active(port, &expression).await.unwrap() == "none" { break; }
+            if tokio::time::Instant::now() >= deadline {
+                let target = page_targets(port).await.remove(0);
+                let ws = target["webSocketDebuggerUrl"].as_str().unwrap();
+                let tree = browser_driver::cdp_call(ws, "Page.getFrameTree", serde_json::json!({})).await.unwrap();
+                let world = browser_driver::cdp_call(ws, "Page.createIsolatedWorld", serde_json::json!({"frameId": tree["frameTree"]["frame"]["id"], "worldName": "comrade-adblock"})).await.unwrap();
+                let diagnosis = browser_driver::cdp_call(ws, "Runtime.evaluate", serde_json::json!({"contextId": world["executionContextId"], "expression": "JSON.stringify({installed: globalThis.__comradeCosmeticInstalled, binding: typeof globalThis.__comradeAdblock, style: document.getElementById('__comradeAdblockStyle')?.outerHTML, classes: [...document.querySelector('#ad').classList]})", "returnByValue": true})).await.unwrap();
+                panic!("cosmetic filter did not hide {id}: {diagnosis}");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+    wait_hidden(port, "ad").await;
+    eval("const dynamic = document.createElement('div'); dynamic.id = 'dynamic'; dynamic.className = 'ad-banner-container'; document.body.appendChild(dynamic)").await.unwrap();
+    wait_hidden(port, "dynamic").await;
+    assert_eq!(eval("getComputedStyle(document.getElementById('article')).display").await.unwrap(), "block");
+    browser_driver::set_adblock_enabled(false).await.unwrap();
+    assert_ne!(eval("getComputedStyle(document.getElementById('ad')).display").await.unwrap(), "none");
+    browser_driver::page_navigate(port, &url).await.unwrap();
+    assert_eq!(eval("String(window.adLoaded === true)").await.unwrap(), "true");
+    assert!(requests.lock().unwrap().iter().any(|p| p == "/banner_ads/blocked.js"));
+    requests.lock().unwrap().clear();
+    browser_driver::set_adblock_enabled(true).await.unwrap();
+    browser_driver::page_navigate(port, &url).await.unwrap();
+    assert_eq!(eval("String(window.adLoaded === undefined)").await.unwrap(), "true");
+    assert!(!requests.lock().unwrap().iter().any(|p| p == "/banner_ads/blocked.js"));
+    wait_hidden(port, "ad").await;
+    browser_driver::close_chromium().await;
+    server.abort();
+    drop(context);
+}

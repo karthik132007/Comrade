@@ -60,6 +60,8 @@
   Element.prototype.scrollIntoView = Element.prototype.focus = function () {};
   Element.prototype.getBoundingClientRect = function () { return { left: 0, top: 0, right: 1000, width: 1000 }; };
   Element.prototype.removeAttribute = function () {};
+  Element.prototype.setAttribute = function () {};
+  Element.prototype.contains = function () { return false; };
 
   function boot(saved, opts) {
     opts = opts || {};
@@ -127,7 +129,8 @@
         } },
       },
     };
-    (0, eval)(source);
+    var streamSource = typeof require === 'function' ? require('node:fs').readFileSync('frontend/browser-stream.js', 'utf8') : readFile('frontend/browser-stream.js');
+    (0, eval)(streamSource.replace('export function createBrowserStream', 'function createBrowserStream') + '\n' + source.replace(/import .*?;\n/, '').replace('export function initializeComrade()', 'function initializeComrade()') + '\ninitializeComrade();');
     state.fire = function (name, payload) {
       state.agentHandlers.filter(function (h) { return h.name === name; }).forEach(function (h) { h.fn({ payload: payload }); });
     };

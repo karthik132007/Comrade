@@ -29,6 +29,8 @@ use comrade_core::voice::models::models_dir;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
 
+mod browser_stream;
+
 type Shared = Arc<AppState>;
 
 struct AppState {
@@ -825,7 +827,7 @@ async fn browser_open(url: String) -> Result<serde_json::Value, String> {
     }
     let port = browser_driver::ensure_chromium().await.map_err(|m| trim_msg(m, 400))?;
     let (requested, final_url) =
-        browser_driver::page_navigate(port, &url).await.map_err(|m| trim_msg(m, 400))?;
+        browser_driver::page_navigate_interactive(port, &url).await.map_err(|m| trim_msg(m, 400))?;
     let title = browser_driver::page_title(port)
         .await
         .map(|(t, _)| t)
@@ -924,6 +926,14 @@ async fn browser_click_at(x: f64, y: f64) -> Result<serde_json::Value, String> {
     Ok(serde_json::json!({ "url": url }))
 }
 
+/// Forward trusted hover, drag, click and nested-scroll input to Chromium.
+#[tauri::command]
+async fn browser_pointer(event: serde_json::Value) -> Result<(), String> {
+    use comrade_core::tools::browser_driver;
+    let port = browser_driver::ensure_chromium().await.map_err(|m| trim_msg(m, 400))?;
+    browser_driver::pointer_event(port, event).await
+}
+
 /// Type into the focused element of the in-app browser (pane interaction).
 #[tauri::command]
 async fn browser_type_text(text: String) -> Result<serde_json::Value, String> {
@@ -935,10 +945,10 @@ async fn browser_type_text(text: String) -> Result<serde_json::Value, String> {
 
 /// Press a key in the in-app browser (pane interaction).
 #[tauri::command]
-async fn browser_press_key(key: String) -> Result<serde_json::Value, String> {
+async fn browser_press_key(key: String, modifiers: Option<i64>) -> Result<serde_json::Value, String> {
     use comrade_core::tools::browser_driver;
     let port = browser_driver::ensure_chromium().await.map_err(|m| trim_msg(m, 400))?;
-    browser_driver::page_press(port, key.trim()).await.map_err(|m| trim_msg(m, 400))?;
+    browser_driver::page_press_with_modifiers(port, key.trim(), modifiers.unwrap_or(0)).await.map_err(|m| trim_msg(m, 400))?;
     Ok(serde_json::json!({ "key": key }))
 }
 
@@ -967,11 +977,7 @@ async fn browser_close() -> Result<bool, String> {
 async fn browser_back() -> Result<serde_json::Value, String> {
     use comrade_core::tools::browser_driver;
     let port = browser_driver::ensure_chromium().await.map_err(|m| trim_msg(m, 400))?;
-    let url = browser_driver::cdp_eval_via_active(port, "history.back()")
-        .await
-        .map_err(|m| trim_msg(m, 400))?;
-    let _ = url;
-    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    browser_driver::history_interactive(port, false).await.map_err(|m| trim_msg(m, 400))?;
     let cur = browser_driver::current_url(port).await.unwrap_or_default();
     Ok(serde_json::json!({ "url": cur }))
 }
@@ -981,10 +987,7 @@ async fn browser_back() -> Result<serde_json::Value, String> {
 async fn browser_forward() -> Result<serde_json::Value, String> {
     use comrade_core::tools::browser_driver;
     let port = browser_driver::ensure_chromium().await.map_err(|m| trim_msg(m, 400))?;
-    let _ = browser_driver::cdp_eval_via_active(port, "history.forward()")
-        .await
-        .map_err(|m| trim_msg(m, 400))?;
-    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    browser_driver::history_interactive(port, true).await.map_err(|m| trim_msg(m, 400))?;
     let cur = browser_driver::current_url(port).await.unwrap_or_default();
     Ok(serde_json::json!({ "url": cur }))
 }
@@ -994,7 +997,8 @@ async fn browser_forward() -> Result<serde_json::Value, String> {
 async fn browser_reload() -> Result<serde_json::Value, String> {
     use comrade_core::tools::browser_driver;
     let port = browser_driver::ensure_chromium().await.map_err(|m| trim_msg(m, 400))?;
-    let url = browser_driver::page_reload(port).await.map_err(|m| trim_msg(m, 400))?;
+    browser_driver::reload_interactive(port).await.map_err(|m| trim_msg(m, 400))?;
+    let url = browser_driver::current_url(port).await.unwrap_or_default();
     Ok(serde_json::json!({ "url": url }))
 }
 
@@ -1011,7 +1015,9 @@ async fn get_prefs() -> Result<Prefs, String> {
 #[tauri::command]
 async fn save_prefs(prefs: Prefs) -> Result<Prefs, String> {
     prefs::save(&prefs).map_err(|e| truncate_err(e, 300))?;
-    Ok(prefs::load())
+    let saved = prefs::load();
+    comrade_core::tools::browser_driver::set_adblock_enabled(saved.browser.adblock_enabled).await?;
+    Ok(saved)
 }
 
 #[derive(Serialize)]
@@ -1289,7 +1295,8 @@ fn main() {
             let webview_data = home.join("webview");
             if let Err(e) = WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
                 .title("Comrade")
-                .inner_size(980.0, 760.0)
+                .inner_size(1180.0, 800.0)
+                .min_inner_size(640.0, 560.0)
                 .data_directory(webview_data)
                 .build()
             {
@@ -1357,6 +1364,11 @@ fn main() {
             browser_provision_status,
             browser_screenshot,
             browser_frame,
+            browser_stream::browser_stream_start,
+            browser_stream::browser_stream_stop,
+            browser_stream::browser_stream_ack,
+            browser_stream::browser_stream_resize,
+            browser_pointer,
             browser_click_at,
             browser_type_text,
             browser_press_key,

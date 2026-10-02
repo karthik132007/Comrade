@@ -5,6 +5,7 @@
  * ```ini
  * [browser]
  * auto_show = true   # open the in-app browser pane when a browser tool runs
+ * adblock_enabled = true # Brave Rust engine, EasyList + EasyPrivacy
  * width_pct = 45     # pane width (20-70% of the main area)
  *
  * [voice]
@@ -85,6 +86,9 @@ pub struct BrowserPrefs {
     /// Pane width as % of the main area (clamped 20-70).
     #[serde(default = "default_browser_width")]
     pub width_pct: u32,
+    /// Brave Rust ad and tracker blocking, enabled for old and new installs.
+    #[serde(default = "default_browser_auto_show")]
+    pub adblock_enabled: bool,
 }
 
 fn default_browser_auto_show() -> bool {
@@ -360,7 +364,7 @@ pub struct Prefs {
     impl Default for Prefs {
     fn default() -> Self {
         Self {
-            browser: BrowserPrefs { auto_show: default_browser_auto_show(), width_pct: default_browser_width() },
+            browser: BrowserPrefs { auto_show: default_browser_auto_show(), width_pct: default_browser_width(), adblock_enabled: true },
             voice: VoicePrefs::default(),
             coding: CodingPrefs { agents: vec![], default: String::new() },
             llm: LlmPrefs::default(),
@@ -413,6 +417,9 @@ pub fn parse_conf(text: &str) -> Prefs {
                 if let Some(b) = parse_bool(&value) {
                     prefs.browser.auto_show = b;
                 }
+            }
+            ("browser", "adblock_enabled") => {
+                if let Some(b) = parse_bool(&value) { prefs.browser.adblock_enabled = b; }
             }
             ("browser", "width_pct") => {
                 if let Ok(n) = value.parse::<u32>() {
@@ -583,6 +590,7 @@ pub fn render_conf(prefs: &Prefs) -> String {
          [browser]\n\
          auto_show = {}\n\
          width_pct = {}\n\
+         adblock_enabled = {}\n\
          \n\
          [voice]\n\
          autoplay = {}\n\
@@ -640,6 +648,7 @@ pub fn render_conf(prefs: &Prefs) -> String {
          tts_voice = {}\n",
         prefs.browser.auto_show,
         prefs.browser.width_pct,
+        prefs.browser.adblock_enabled,
         prefs.voice.autoplay,
         prefs.voice.enabled,
         prefs.voice.mic,
@@ -732,12 +741,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn adblock_defaults_on_for_old_configs_and_round_trips_disabled() {
+        assert!(parse_conf("[browser]\nauto_show = false\n").browser.adblock_enabled);
+        let old_json = serde_json::json!({"auto_show": false, "width_pct": 60});
+        assert!(serde_json::from_value::<BrowserPrefs>(old_json).unwrap().adblock_enabled);
+        let prefs = parse_conf("[browser]\nadblock_enabled = false\n");
+        assert!(!prefs.browser.adblock_enabled);
+        assert_eq!(parse_conf(&render_conf(&prefs)), prefs);
+    }
+
+    #[test]
     fn conf_round_trip() {
         let dir = std::env::temp_dir().join("comrade-prefs-test");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join(CONF_NAME);
         let prefs = Prefs {
-            browser: BrowserPrefs { auto_show: false, width_pct: 60 },
+            browser: BrowserPrefs { auto_show: false, width_pct: 60, adblock_enabled: false },
             voice: VoicePrefs { autoplay: false, ..VoicePrefs::default() },
             coding: CodingPrefs { agents: vec!["opencode".into(), "claude".into()], default: "opencode".into() },
             ..Prefs::default()

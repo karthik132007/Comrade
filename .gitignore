@@ -2,3 +2,8 @@ target/
 .env
 .cargo/config.toml
 comrade-memory.json
+
+node_modules/
+dist/
+test-results/
+playwright-report/

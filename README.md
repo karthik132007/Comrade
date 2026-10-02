@@ -5,7 +5,8 @@
 # Comrade — Desktop AI Agent (Rust + Tauri v2)
 
 Local-first personal AI desktop agent. Pure Rust backend (`core` library +
-Tauri shell), vanilla HTML/CSS/JS frontend — no Node, no Electron.
+Tauri shell), React + Vite frontend. Node.js is used for development and builds;
+the shipped app uses the native Tauri webview, with no Electron or Node runtime.
 
 Brain: DeepSeek-direct (`deepseek-flash`, reasoning model). Voice STT/TTS and
 memory embeddings ride on OpenRouter (DeepSeek has no audio/embedding APIs).
@@ -24,7 +25,7 @@ Two stores, two jobs:
 core/            → agent loop, LLM (DeepSeek), STT/TTS + embeddings, tools,
                    vector memory, history, paths
 src-tauri/       → Tauri shell: window, invoke commands, events, approvals
-frontend/        → vanilla UI (window.__TAURI__ bridge only, no secrets)
+frontend/        → React desktop UI, Catppuccin themes, Tauri IPC (no secrets)
 shim/            → rootless WebKit path shim (C, LD_PRELOAD)
 scripts/         → setup-linux.sh (webkit sysroot when sudo is unavailable)
 ```
@@ -58,7 +59,7 @@ raise a modal approval; deny-by-default on 30s timeout.
 
 ## Setup
 
-Install the stable Rust toolchain first. On macOS, install Apple's command-line
+Install Node.js 22.12+ (or 20.19+) and the stable Rust toolchain first. On macOS, install Apple's command-line
 tools and CMake; Tauri uses the system WebKit framework, so the Linux setup
 script is not needed:
 
@@ -67,7 +68,8 @@ xcode-select --install  # skip if already installed
 brew install cmake      # or provide cmake another way
 cp .env.example .env
 cargo test -p comrade-core
-cargo run -p comrade-desktop
+npm install
+npm run tauri dev
 ```
 
 On Linux, install WebKitGTK and the native audio/build dependencies through the
@@ -77,7 +79,8 @@ setup script, then build and run:
 cp .env.example .env   # DEEPSEEK_API_KEY + OPENROUTER_API_KEY (memory embeddings)
 ./scripts/setup-linux.sh   # apt/dnf/pacman; rootless WebKit fallback on Arch
 cargo test -p comrade-core
-cargo run -p comrade-desktop
+npm install
+npm run tauri dev
 ```
 
 Rootless WebKit: distro WebKitGTK hard-codes `/usr/lib/webkit2gtk-4.1` for its
@@ -85,7 +88,23 @@ helper processes (verified in the WebKit source — no env override exists in
 distro builds). With sudo the setup script installs it normally; without sudo
 it vendors the package into the comrade-agent home and the app re-execs itself
 under `shim/webkit-path-shim.c` (LD_PRELOAD redirect) automatically. Nothing to
-configure — `cargo run` just works either way.
+configure — `npm run tauri dev` starts the frontend and desktop shell together.
+
+Frontend development: `npm run dev` opens a browser preview at
+`http://localhost:1420`. Chat, voice, memory, and browser tools require the
+Tauri desktop shell (`npm run tauri dev`). Run `npm run build` before a direct
+`cargo run -p comrade-desktop`; Tauri CLI builds the frontend automatically.
+Create a desktop bundle with `npm run tauri build`.
+
+The interface includes a collapsible chat sidebar, a multiline composer
+(Enter to send, Shift+Enter for a new line), and a settings dialog with sidebar
+categories. Appearance offers Catppuccin Mocha and Frappé (dark) and Latte
+(light), remembered on this device. Use Ctrl/Cmd+N for a new chat.
+
+Checks: `npm test` covers the Tauri browser controller, `npm run test:ui`
+covers the React interface with a mocked Tauri bridge (run
+`npx playwright install chromium` once), and `npm run build` validates the
+production frontend.
 
 Useful commands: `cargo check --workspace`, `cargo clippy --workspace`,
 `cargo test -p comrade-core -- --ignored` (live DeepSeek/OpenRouter checks).
@@ -105,18 +124,24 @@ Useful commands: `cargo check --workspace`, `cargo clippy --workspace`,
   `docs/VOICE.md` for architecture, models, tests, and troubleshooting.
 - DeepSeek validates function names strictly (`^[a-zA-Z0-9_-]+$`), so dotted
   tool names go on the wire as `namespace_tool` and are decoded back.
-- Browser: Comrade drives its own bundled Chromium
+- Browser: Ads and trackers are blocked by default using Brave’s Rust engine
+  with bundled EasyList and EasyPrivacy. Toggle protection in Settings → Browser.
+  See [browser architecture](docs/BROWSER.md) for filter updates and scope.
+  Comrade drives its own bundled Chromium
   (`comrade-agent/browser/`, single isolated profile — your system browsers
   are never touched). The browser is a core feature, not an add-on: the app
   installs it itself on first launch / first browser use (one-time download,
   live progress in the pane), so there is nothing to set up. It always runs
   headless, so nothing ever opens outside the app: the only visible surface
   is the resizable in-app browser pane (🌐 in the header, auto-shown on
-  browser use): a live view of the same tab the agent drives. It is fully
+  browser use): a live stream of the same tab the agent drives. Frames arrive over a
+  persistent connection and stop when hidden; the page reflows to the pane
+  instead of squeezing a fixed screenshot into it. It is fully
   interactive — click the page to press buttons, links, and focus fields,
   type to fill them, scroll with the wheel. Drag
   the divider to resize; the address bar, back/forward/reload, and refresh
   controls drive that same tab. One tab is reused across navigation, reading,
   and clicking. If the self-install itself fails (e.g. offline), the task
   reports it honestly instead of opening another browser.
+- Browser architecture and performance checks: `docs/BROWSER.md`.
 - No system tray / wake-word yet — push-to-talk via the mic button.
