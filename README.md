@@ -124,8 +124,8 @@ Useful commands: `cargo check --workspace`, `cargo clippy --workspace`,
   `docs/VOICE.md` for architecture, models, tests, and troubleshooting.
 - DeepSeek validates function names strictly (`^[a-zA-Z0-9_-]+$`), so dotted
   tool names go on the wire as `namespace_tool` and are decoded back.
-- Browser: Ads and trackers are blocked by default using Brave’s Rust engine
-  with bundled EasyList and EasyPrivacy. Toggle protection in Settings → Browser.
+- Browser: Ads and trackers are blocked by default using the official bundled
+  uBlock Origin Lite extension in Complete mode. Toggle protection in Settings → Browser.
   See [browser architecture](docs/BROWSER.md) for filter updates and scope.
   Comrade drives its own bundled Chromium
   (`comrade-agent/browser/`, single isolated profile — your system browsers

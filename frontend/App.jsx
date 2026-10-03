@@ -16,6 +16,16 @@ import {
   MessageSquare,
   Pin,
   X,
+  ArrowLeft,
+  ArrowRight,
+  RotateCw,
+  Home,
+  Plus,
+  Search,
+  RefreshCw,
+  Compass,
+  Ellipsis,
+  Copy,
 } from "lucide-react";
 import Settings from "./Settings";
 import { initializeComrade } from "./app";
@@ -232,41 +242,53 @@ export default function App() {
           ></div>
 
           <aside id="browser-pane" hidden aria-label="In-app browser">
+            <div className="browser-tabs-row">
+              <div className="browser-identity" title="Comrade browser"><Compass size={19} /><span>Explore</span></div>
+              <div id="browser-tabs" className="browser-tabs" role="tablist" aria-label="Open tabs" />
+              <button id="browser-new-tab" className="browser-new-tab" type="button" aria-label="New tab" title="New tab (Ctrl+T)">
+                <Plus size={16} />
+              </button>
+              <div className="browser-window-actions">
+                <button id="browser-fullscreen" type="button" aria-label="Enter fullscreen" title="Fullscreen (F11)" aria-pressed="false">
+                  <Expand size={15} />
+                </button>
+                <button id="browser-expand" type="button" aria-label="Make browser the main view" title="Make browser the main view" aria-pressed="false">
+                  <Maximize2 size={15} />
+                </button>
+                <button id="browser-hide" type="button" aria-label="Hide browser" title="Hide browser">
+                  <X size={16} />
+                </button>
+              </div>
+            </div>
             <div className="browser-bar">
-              <button id="browser-back" type="button" title="Back">
-                ‹
-              </button>
-              <button id="browser-forward" type="button" title="Forward">
-                ›
-              </button>
-              <button id="browser-reload" type="button" title="Reload">
-                ↻
-              </button>
+              <div className="browser-nav-actions">
+                <button id="browser-back" type="button" aria-label="Go back" title="Back"><ArrowLeft size={16} /></button>
+                <button id="browser-forward" type="button" aria-label="Go forward" title="Forward"><ArrowRight size={16} /></button>
+                <button id="browser-reload" type="button" aria-label="Reload page" title="Reload"><RotateCw size={15} /></button>
+                <button id="browser-home" type="button" aria-label="Open DuckDuckGo home" title="Home"><Home size={15} /></button>
+              </div>
               <form id="browser-form">
+                <Search className="address-search" size={15} aria-hidden="true" />
                 <input
                   id="browser-url"
                   type="text"
-                  placeholder="https://…"
+                  placeholder="Search DuckDuckGo or enter an address"
+                  aria-label="Search DuckDuckGo or enter an address"
                   autoComplete="off"
                   spellCheck="false"
                 />
+                <kbd className="address-shortcut" aria-hidden="true">Ctrl L</kbd>
               </form>
-              <button id="browser-shot" type="button" title="Refresh view">
-                ⤾
-              </button>
-              <button id="browser-expand" type="button" aria-label="Make browser the main view" title="Make browser the main view" aria-pressed="false">
-                <Maximize2 size={16} />
-              </button>
-              <button id="browser-fullscreen" type="button" aria-label="Enter fullscreen" title="Fullscreen (F11)" aria-pressed="false">
-                <Expand size={16} />
-              </button>
-          <button id="chat-reveal" type="button" aria-label="Show chat panel" aria-controls="chat-workspace" aria-expanded="false"><MessageSquare size={18} /><span>Chat</span></button>
-              <button id="browser-hide" type="button" aria-label="Hide browser" title="Hide browser">
-                ✕
-              </button>
-            </div>
-            <div id="browser-title" className="muted">
-              Comrade's browser — shown only here, inside the app.
+              <details id="browser-menu" className="browser-menu">
+                <summary aria-label="Browser tools" title="Browser tools"><Ellipsis size={19} /></summary>
+                <div className="browser-menu-panel">
+                  <div className="browser-menu-heading">PAGE ACTIONS</div>
+                  <button id="browser-copy" type="button"><Copy size={15} /><span>Copy page link</span></button>
+                  <button id="browser-shot" type="button" aria-label="Refresh browser preview"><RefreshCw size={15} /><span>Refresh preview</span></button>
+                  <div className="browser-menu-shortcuts"><span>New tab <kbd>Ctrl T</kbd></span><span>Close tab <kbd>Ctrl W</kbd></span></div>
+                </div>
+              </details>
+              <button id="chat-reveal" type="button" aria-label="Show chat panel" aria-controls="chat-workspace" aria-expanded="false"><Sparkles size={15} /><span>Ask Comrade</span></button>
             </div>
             <div id="browser-view" className="idle">
               <img id="browser-img" alt="In-app browser view" />
@@ -279,7 +301,12 @@ export default function App() {
                 aria-label="Type into the in-app browser"
               />
             </div>
-            <div id="browser-status" className="muted"></div>
+            <div className="browser-footer">
+              <span className="browser-footer-mark"><Globe size={12} /></span>
+              <div id="browser-title">DuckDuckGo</div>
+              <div id="browser-status" role="status" aria-live="polite"></div>
+              <span className="browser-search-provider">Search with <strong>DuckDuckGo</strong></span>
+            </div>
           </aside>
         </main>
 

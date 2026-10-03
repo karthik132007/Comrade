@@ -253,7 +253,7 @@ export default function Settings() {
                     <input id="pref-adblock" type="checkbox" defaultChecked /> Block ads and trackers
                   </label>
                 </div>
-                <p className="muted">Powered by Brave’s blocking engine with EasyList and EasyPrivacy. On by default. Changes apply to new requests; reload the page to restore blocked content.</p>
+                <p className="muted">uBlock Origin Lite is bundled and runs in Complete mode by default. Reload the page after changing protection to apply its scriptlets and restore blocked content.</p>
                 <div className="row">
                   <label className="muted" htmlFor="pref-bwidth">
                     Pane width <span id="pref-bwidth-val"></span>

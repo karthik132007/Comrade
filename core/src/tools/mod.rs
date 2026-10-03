@@ -1,7 +1,7 @@
 pub mod browser;
 pub mod browser_driver;
 mod cdp_transport;
-mod adblock;
+mod browser_extension;
 pub mod coding;
 pub mod computer;
 pub mod filesystem;

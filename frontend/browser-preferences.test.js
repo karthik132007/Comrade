@@ -130,7 +130,8 @@
       },
     };
     var streamSource = typeof require === 'function' ? require('node:fs').readFileSync('frontend/browser-stream.js', 'utf8') : readFile('frontend/browser-stream.js');
-    (0, eval)(streamSource.replace('export function createBrowserStream', 'function createBrowserStream') + '\n' + source.replace(/import .*?;\n/, '').replace('export function initializeComrade()', 'function initializeComrade()') + '\ninitializeComrade();');
+    var inputSource = typeof require === 'function' ? require('node:fs').readFileSync('frontend/browser-input.js', 'utf8') : readFile('frontend/browser-input.js');
+    (0, eval)(inputSource.replace('export function', 'function') + '\n' + streamSource.replace('export function createBrowserStream', 'function createBrowserStream') + '\n' + source.replace(/import .*?;\n/g, '').replace('export function initializeComrade()', 'function initializeComrade()') + '\ninitializeComrade();');
     state.fire = function (name, payload) {
       state.agentHandlers.filter(function (h) { return h.name === name; }).forEach(function (h) { h.fn({ payload: payload }); });
     };

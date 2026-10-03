@@ -27,6 +27,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+pub const DEFAULT_HOME_URL: &str = "https://duckduckgo.com/";
+
 // ---------------------------------------------------------------------------
 // Managed bundled-Chromium process (singleton)
 // ---------------------------------------------------------------------------
@@ -48,6 +50,7 @@ struct ManagedBrowser {
 struct BrowserState {
     browser: Option<ManagedBrowser>,
     failed_launch: Option<(String, Instant)>,
+    tab_order: Vec<String>,
 }
 
 static MANAGED: OnceLock<tokio::sync::Mutex<BrowserState>> = OnceLock::new();
@@ -156,7 +159,12 @@ fn launch_args(port: u16, profile: &str) -> Vec<String> {
         "--remote-allow-origins=*".to_string(),
         format!("--user-data-dir={profile}"),
         "--headless=new".to_string(),
-                "--no-first-run".to_string(),
+        // The streamed page has no native visible window; keep its renderer
+        // responsive instead of lowering its priority because it is occluded.
+        "--disable-backgrounding-occluded-windows".to_string(),
+        "--disable-renderer-backgrounding".to_string(),
+        "--enable-unsafe-extension-debugging".to_string(),
+        "--no-first-run".to_string(),
         "--no-default-browser-check".to_string(),
         "--disable-dev-shm-usage".to_string(),
         "--no-sandbox".to_string(),
@@ -171,6 +179,13 @@ fn launch_args(port: u16, profile: &str) -> Vec<String> {
 /// Reuses the live instance; otherwise launches it headless against the
 /// single isolated profile. Never touches system browsers or user profiles.
 pub async fn ensure_chromium() -> Result<u16, String> {
+    let port = ensure_process().await?;
+    super::browser_extension::ensure_loaded(port).await
+        .map_err(|e| format!("{e}. Extension support requires Comrade's current bundled Chromium."))?;
+    Ok(port)
+}
+
+async fn ensure_process() -> Result<u16, String> {
     let exe = bundled_exe().await?;
     let exe_key = exe.to_string_lossy().to_string();
     let profile = profile_dir();
@@ -442,6 +457,7 @@ pub enum CloseOutcome {
 pub async fn close_chromium() -> CloseOutcome {
     let mut guard = managed_lock().lock().await;
     guard.failed_launch = None;
+    if let Some(browser) = guard.browser.as_ref() { super::browser_extension::forget(browser.port).await; }
     match guard.browser.take() {
         Some(m) if m.child.is_some() => {
             let mut m = m;
@@ -470,17 +486,108 @@ pub async fn managed_port() -> Option<u16> {
     }
 }
 
+/// Input is already scoped to an initialized browser. Avoid filesystem,
+/// provisioning and extension checks on every keystroke and pointer event.
+/// Failed CDP connections invalidate the cached page and force full recovery.
+pub async fn interactive_port() -> Result<u16, String> {
+    {
+        let mut guard = managed_lock().lock().await;
+        if let Some(browser) = guard.browser.as_mut().filter(|browser| browser.page.is_some()) {
+            let alive = match browser.child.as_mut() {
+                Some(child) => child.try_wait().is_ok_and(|status| status.is_none()),
+                None => true,
+            };
+            if alive { return Ok(browser.port); }
+        }
+    }
+    ensure_chromium().await
+}
+
 /// Best-effort snapshot for the in-app pane: running flag + current URL/title.
 /// Never fails — the pane renders placeholders when the browser is down.
 pub async fn state_snapshot() -> serde_json::Value {
     let Some(port) = managed_port().await else {
         return serde_json::json!({ "running": false, "url": "", "title": "" });
     };
-    if !http_ok(&format!("{}/json/version", debugger_url(port))).await {
+    let Ok(tabs) = tabs(port).await else {
         return serde_json::json!({ "running": false, "url": "", "title": "" });
+    };
+    let active = tabs.iter().find(|tab| tab["active"] == true);
+    serde_json::json!({
+        "running": true,
+        "url": active.map(|tab| &tab["url"]),
+        "title": active.map(|tab| &tab["title"]),
+        "tabs": tabs,
+    })
+}
+
+/// Initialize a page without asking its JavaScript thread for metadata.
+pub async fn pane_snapshot(port: u16) -> Result<Value, String> {
+    active_page(port).await?;
+    Ok(state_snapshot().await)
+}
+
+/// User-visible browser tabs, backed by Chromium page targets.
+pub async fn tabs(port: u16) -> Result<Vec<Value>, String> {
+    let targets = ordered_targets(port).await?;
+    let active_id = {
+        let guard = managed_lock().lock().await;
+        guard.browser.as_ref().and_then(|browser| browser.page_id.clone())
+    };
+    let mut tabs = Vec::with_capacity(targets.len());
+    for target in targets {
+        // /json/list already supplies metadata without waiting for any page's
+        // JS main thread. Never evaluate all background tabs during UI polling.
+        tabs.push(serde_json::json!({
+            "id": target.id,
+            "url": target.url,
+            "title": target.title,
+            "favicon_url": target.favicon_url,
+            "active": active_id.as_deref() == Some(target.id.as_str()),
+        }));
     }
-    let (title, url) = page_title(port).await.unwrap_or_default();
-    serde_json::json!({ "running": true, "url": url, "title": title })
+    Ok(tabs)
+}
+
+pub async fn create_tab(port: u16, url: &str) -> Result<Value, String> {
+    ordered_targets(port).await?;
+    let target = new_tab(port, &normalize_url(url)).await?;
+    select_tab(port, &target.id).await
+}
+
+pub async fn select_tab(port: u16, id: &str) -> Result<Value, String> {
+    let target = ordered_targets(port).await?.into_iter().find(|target| target.id == id)
+        .ok_or_else(|| "TAB_NOT_FOUND: that browser tab is no longer open.".to_string())?;
+    let _ = devtools_client().get(format!("{}/json/activate/{}", debugger_url(port), target.id)).send().await;
+    let mut guard = managed_lock().lock().await;
+    let browser = guard.browser.as_mut().filter(|browser| browser.port == port)
+        .ok_or_else(|| "BROWSER_CLOSED: the browser is not running.".to_string())?;
+    browser.page_id = Some(target.id.clone());
+    browser.page = Some(target.clone());
+    drop(guard);
+    Ok(serde_json::json!({ "id": target.id, "url": target.url, "title": target.title }))
+}
+
+pub async fn close_tab(port: u16, id: &str) -> Result<Value, String> {
+    let targets = ordered_targets(port).await?;
+    let active_id = managed_lock().lock().await.browser.as_ref().and_then(|browser| browser.page_id.clone());
+    let closed_index = targets.iter().position(|target| target.id == id)
+        .ok_or_else(|| "TAB_NOT_FOUND: that browser tab is no longer open.".to_string())?;
+    let response = devtools_client().get(format!("{}/json/close/{}", debugger_url(port), id)).send().await
+        .map_err(|e| format!("CLOSE_FAILED: cannot close tab: {e}"))?;
+    if !response.status().is_success() {
+        return Err(format!("CLOSE_FAILED: DevTools refused to close tab ({}).", response.status()));
+    }
+    let remaining: Vec<PageTarget> = targets.into_iter().filter(|target| target.id != id).collect();
+    // Closing a background tab must not switch the page the user is viewing.
+    if let Some(active) = remaining.iter().find(|target| Some(&target.id) == active_id.as_ref()) {
+        return Ok(serde_json::json!({ "id": active.id, "url": active.url, "title": active.title }));
+    }
+    let next = match remaining.get(closed_index.min(remaining.len().saturating_sub(1))) {
+        Some(target) => target.clone(),
+        None => new_tab(port, DEFAULT_HOME_URL).await?,
+    };
+    select_tab(port, &next.id).await
 }
 
 /// Raw PNG bytes of the current tab (for the in-app pane live view).
@@ -570,6 +677,27 @@ struct PageTarget {
     id: String,
     ws_url: String,
     url: String,
+    title: String,
+    favicon_url: String,
+}
+
+fn keep_tab_order(order: &mut Vec<String>, targets: &mut [PageTarget]) {
+    order.retain(|id| targets.iter().any(|target| &target.id == id));
+    for target in targets.iter() {
+        if !order.contains(&target.id) { order.push(target.id.clone()); }
+    }
+    targets.sort_by_key(|target| order.iter().position(|id| id == &target.id).unwrap_or(usize::MAX));
+}
+
+async fn ordered_targets(port: u16) -> Result<Vec<PageTarget>, String> {
+    let mut targets = list_targets(port).await?;
+    let mut guard = managed_lock().lock().await;
+    if guard.browser.as_ref().is_some_and(|browser| browser.port == port) {
+        // DevTools ordering changes on activation. Preserve the user's strip
+        // order and append new pages; activation never moves a tab.
+        keep_tab_order(&mut guard.tab_order, &mut targets);
+    }
+    Ok(targets)
 }
 
 async fn list_targets(port: u16) -> Result<Vec<PageTarget>, String> {
@@ -586,7 +714,7 @@ async fn list_targets(port: u16) -> Result<Vec<PageTarget>, String> {
     let mut out = Vec::new();
     for item in items {
         let kind = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
-        if kind != "page" {
+        if kind != "page" || item["url"].as_str().is_some_and(|u| u.starts_with("chrome-extension://")) {
             continue;
         }
         let (Some(id), Some(ws), Some(url)) = (
@@ -596,7 +724,7 @@ async fn list_targets(port: u16) -> Result<Vec<PageTarget>, String> {
         ) else {
             continue;
         };
-        out.push(PageTarget { id: id.to_string(), ws_url: ws.to_string(), url: url.to_string() });
+        out.push(PageTarget { id: id.to_string(), ws_url: ws.to_string(), url: url.to_string(), title: item["title"].as_str().unwrap_or_default().to_string(), favicon_url: item["faviconUrl"].as_str().unwrap_or_default().to_string() });
     }
     Ok(out)
 }
@@ -619,7 +747,7 @@ async fn new_tab(port: u16, url: &str) -> Result<PageTarget, String> {
     ) else {
         return Err("OPEN_FAILED: DevTools returned a tab without a debugger URL.".to_string());
     };
-    Ok(PageTarget { id: id.to_string(), ws_url: ws.to_string(), url: target_url.to_string() })
+    Ok(PageTarget { id: id.to_string(), ws_url: ws.to_string(), url: target_url.to_string(), title: item["title"].as_str().unwrap_or_default().to_string(), favicon_url: item["faviconUrl"].as_str().unwrap_or_default().to_string() })
 }
 
 fn url_query(url: &str) -> String {
@@ -645,16 +773,14 @@ async fn active_page(port: u16) -> Result<PageTarget, String> {
     if let Some(page) = session.as_ref().and_then(|m| m.page.as_ref()) {
         let page = page.clone();
         drop(guard);
-        super::cdp_transport::session(&page.ws_url).await?.protect().await?;
         return Ok(page);
     }
     let targets = list_targets(port).await?;
     let remembered = session.as_ref().and_then(|m| m.page_id.as_deref());
     let target = match choose_page(&targets, remembered) {
         Some(target) => target.clone(),
-        None => new_tab(port, "about:blank").await?,
+        None => new_tab(port, DEFAULT_HOME_URL).await?,
     };
-    super::cdp_transport::session(&target.ws_url).await?.protect().await?;
     if let Some(session) = session {
         session.page_id = Some(target.id.clone());
         session.page = Some(target.clone());
@@ -664,15 +790,8 @@ async fn active_page(port: u16) -> Result<PageTarget, String> {
 
 /// Apply protection preferences to the running tab without restarting Chromium.
 pub async fn set_adblock_enabled(enabled: bool) -> Result<(), String> {
-    super::adblock::set_enabled(enabled);
-    let page = managed_lock().lock().await.browser.as_ref().and_then(|m| m.page.clone());
-    if let Some(page) = page {
-        // Wake the isolated cosmetic world through the shared DOM. The binding
-        // then removes or rebuilds styles according to the current preference.
-        cdp_eval(&page.ws_url, "window.dispatchEvent(new Event('__comradeAdblockRefresh')); document.querySelectorAll('iframe').forEach(f => { try { f.contentWindow.dispatchEvent(new Event('__comradeAdblockRefresh')); } catch (_) {} });").await?;
-        if !enabled {
-            cdp_eval(&page.ws_url, "document.getElementById('__comradeAdblockStyle')?.remove()").await?;
-        }
+    if let Some(port) = managed_port().await {
+        super::browser_extension::set_enabled(port, enabled).await?;
     }
     Ok(())
 }
@@ -733,8 +852,10 @@ async fn wait_ready(ws_url: &str, timeout: Duration) -> Value {
     let start = Instant::now();
     while start.elapsed() < timeout {
         match cdp_eval(ws_url, "document.readyState").await {
-            Ok(v) if v.as_str() == Some("complete") => return v,
-            _ => tokio::time::sleep(Duration::from_millis(300)).await,
+            // Text and controls are usable at DOM readiness. Waiting for
+            // every image/analytics request delays agent navigation needlessly.
+            Ok(v) if matches!(v.as_str(), Some("interactive" | "complete")) => return v,
+            _ => tokio::time::sleep(Duration::from_millis(50)).await,
         }
     }
     Value::Null
@@ -755,8 +876,8 @@ pub fn normalize_url(input: &str) -> String {
     if !t.contains(' ') && (t.contains('.') || t.contains(':') || t.starts_with("localhost")) {
         return format!("https://{t}");
     }
-    // Bare words become a search (keeps "open youtube" style prompts working).
-    format!("https://www.google.com/search?q={}", url_query(t))
+    // Bare words become a privacy-friendly DuckDuckGo search.
+    format!("https://duckduckgo.com/?q={}", url_query(t))
 }
 
 // ---------------------------------------------------------------------------
@@ -789,8 +910,9 @@ pub async fn page_navigate_interactive(port: u16, url: &str) -> Result<(String, 
     if let Some(err) = res.get("errorText").and_then(|e| e.as_str()) {
         return Err(format!("NAVIGATE_FAILED: {err}"));
     }
-    let final_url = current_url(port).await.unwrap_or(target.clone());
-    Ok((target, final_url))
+    // Do not run JS in the freshly navigating renderer. Its startup scripts
+    // can stall this toolbar command; redirects arrive through pane metadata.
+    Ok((target.clone(), target))
 }
 
 pub async fn current_url(port: u16) -> Result<String, String> {
@@ -1152,12 +1274,12 @@ mod tests {
         assert_eq!(normalize_url("https://example.com/x"), "https://example.com/x");
         assert_eq!(normalize_url("example.com"), "https://example.com");
         assert_eq!(normalize_url("about:blank"), "about:blank");
-        assert!(normalize_url("imagine dragons").contains("google.com/search"));
+        assert_eq!(normalize_url("imagine dragons"), "https://duckduckgo.com/?q=imagine%20dragons");
     }
 
     #[test]
     fn page_selection_stays_on_same_target_when_another_tab_opens() {
-        let page = |id: &str, url: &str| PageTarget { id: id.into(), url: url.into(), ws_url: String::new() };
+        let page = |id: &str, url: &str| PageTarget { id: id.into(), url: url.into(), title: String::new(), favicon_url: String::new(), ws_url: String::new() };
         let targets = vec![
             page("blank", "about:blank"),
             page("unrelated", "https://example.com/unrelated"),

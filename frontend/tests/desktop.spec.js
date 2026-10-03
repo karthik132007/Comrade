@@ -4,6 +4,7 @@ async function mockDesktop(page) {
   await page.addInitScript(() => {
     window.ipcCalls = [];
     window.agentListeners = {};
+    let browserTabs = [{ id: "tab-1", title: "DuckDuckGo", url: "https://duckduckgo.com/", active: true }];
     let prefs = {
       browser: { auto_show: true, width_pct: 45 },
       coding: { agents: ["codex"], default: "codex" },
@@ -67,9 +68,35 @@ async function mockDesktop(page) {
             case "browser_ensure":
               return {
                 running: true,
-                url: "https://example.com",
-                title: "Example",
+                url: browserTabs.find((tab) => tab.active)?.url || "https://duckduckgo.com/",
+                title: browserTabs.find((tab) => tab.active)?.title || "DuckDuckGo",
+                tabs: structuredClone(browserTabs),
               };
+            case "browser_tabs":
+              return structuredClone(browserTabs);
+            case "browser_tab_new": {
+              browserTabs.forEach((tab) => { tab.active = false; });
+              const tab = { id: `tab-${browserTabs.length + 1}`, title: "DuckDuckGo", url: args.url, active: true };
+              browserTabs.push(tab);
+              return structuredClone(tab);
+            }
+            case "browser_tab_select": {
+              browserTabs.forEach((tab) => { tab.active = tab.id === args.id; });
+              return structuredClone(browserTabs.find((tab) => tab.active));
+            }
+            case "browser_tab_close": {
+              const wasActive = browserTabs.find((tab) => tab.id === args.id)?.active;
+              browserTabs = browserTabs.filter((tab) => tab.id !== args.id);
+              if (!browserTabs.length) browserTabs = [{ id: "tab-home", title: "DuckDuckGo", url: "https://duckduckgo.com/", active: true }];
+              if (wasActive) browserTabs[0].active = true;
+              return structuredClone(browserTabs.find((tab) => tab.active));
+            }
+            case "browser_open": {
+              const active = browserTabs.find((tab) => tab.active);
+              active.url = args.url.includes(" ") ? `https://duckduckgo.com/?q=${encodeURIComponent(args.url)}` : args.url;
+              active.title = active.url.includes("duckduckgo.com") ? "DuckDuckGo" : "Page";
+              return structuredClone(active);
+            }
             case "browser_frame":
               return {
                 data_url:
@@ -140,6 +167,23 @@ test("settings themes persist, categories retain edits, save reaches Tauri", asy
   await page.reload();
   await expect(page.locator("html")).toHaveAttribute("data-theme", "latte");
   expect(errors).toEqual([]);
+});
+
+test("browser has functional tabs and DuckDuckGo home/search controls", async ({ page }) => {
+  await mockDesktop(page);
+  await page.goto("/");
+  await page.getByRole("button", { name: "Toggle in-app browser" }).click();
+  await expect(page.getByRole("tab", { name: /DuckDuckGo/ })).toHaveCount(1);
+  await page.getByRole("button", { name: "New tab" }).click();
+  await expect(page.getByRole("tab", { name: /DuckDuckGo/ })).toHaveCount(2);
+  await expect(page.locator("#browser-url")).toHaveValue("https://duckduckgo.com/");
+  await page.locator("#browser-url").fill("privacy focused search");
+  await page.locator("#browser-form").press("Enter");
+  await expect.poll(() => page.evaluate(() => window.ipcCalls.findLast((call) => call.command === "browser_open")?.args.url)).toBe("privacy focused search");
+  await page.getByRole("button", { name: "Open DuckDuckGo home" }).click();
+  await expect.poll(() => page.evaluate(() => window.ipcCalls.findLast((call) => call.command === "browser_open")?.args.url)).toBe("https://duckduckgo.com/");
+  await page.getByRole("button", { name: /Close DuckDuckGo/ }).last().click();
+  await expect(page.getByRole("tab", { name: /DuckDuckGo/ })).toHaveCount(1);
 });
 
 test("composer sends multiline messages and receives streamed events", async ({
@@ -274,6 +318,127 @@ test('live pane streams without snapshot polling, forwards pointer input, resize
   await expect.poll(() => page.evaluate(() => window.streamSequence)).toBe(2);
 });
 
+test('metadata polling preserves tab focus and closing a background tab keeps the live stream', async ({ page }) => {
+  await mockStream(page);
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Toggle in-app browser' }).click();
+  const first = page.getByRole('tab').first();
+  await first.focus();
+  await expect.poll(() => page.evaluate(() => window.ipcCalls.filter(call => call.command === 'browser_state').length)).toBeGreaterThan(2);
+  await expect(first).toBeFocused();
+  expect(await page.evaluate(() => window.ipcCalls.filter(call => call.command === 'browser_tabs').length)).toBe(0);
+  await page.getByRole('button', { name: 'New tab' }).click();
+  await expect(page.getByRole('tab')).toHaveCount(2);
+  const sequence = await page.evaluate(() => window.streamSequence);
+  await page.getByRole('button', { name: /Close DuckDuckGo/ }).first().click();
+  await expect(page.getByRole('tab')).toHaveCount(1);
+  expect(await page.evaluate(() => window.streamSequence)).toBe(sequence);
+  // Browser chrome shortcuts must not also reach the remote page.
+  await page.locator('#browser-keys').focus();
+  await page.keyboard.press('Control+l');
+  await expect(page.locator('#browser-url')).toBeFocused();
+  expect(await page.evaluate(() => window.ipcCalls.some(call => call.command === 'browser_press_key' && call.args.key === 'l'))).toBe(false);
+});
+
+test('tabs keep their positions and elements across reordered metadata and late replies', async ({ page }) => {
+  await mockStream(page);
+  await page.addInitScript(() => {
+    const original = window.__TAURI__.core.invoke;
+    let polls = 0;
+    window.__TAURI__.core.invoke = async (command, args) => {
+      const result = await original(command, args);
+      if (command === 'browser_state') {
+        if (window.holdBrowserSnapshot) {
+          window.holdBrowserSnapshot = false;
+          return new Promise(resolve => { window.releaseBrowserSnapshot = () => resolve(result); });
+        }
+        result.tabs.reverse();
+        result.tabs.forEach(tab => { tab.title = `${tab.id} title ${++polls}`; });
+      }
+      return result;
+    };
+  });
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Toggle in-app browser' }).click();
+  await page.getByRole('button', { name: 'New tab', exact: true }).click();
+  await expect(page.getByRole('tab')).toHaveCount(2);
+  await page.evaluate(() => { window.savedFirstTab = document.querySelector('[data-tab-id="tab-1"]'); });
+  await page.locator('[data-tab-id="tab-1"]').focus();
+  await expect.poll(() => page.evaluate(() => window.ipcCalls.filter(call => call.command === 'browser_state').length)).toBeGreaterThan(4);
+  expect(await page.getByRole('tab').evaluateAll(tabs => tabs.map(tab => tab.dataset.tabId))).toEqual(['tab-1', 'tab-2']);
+  expect(await page.evaluate(() => window.savedFirstTab === document.querySelector('[data-tab-id="tab-1"]'))).toBe(true);
+  await expect(page.locator('[data-tab-id="tab-1"]')).toBeFocused();
+  await page.evaluate(() => { window.holdBrowserSnapshot = true; });
+  await expect.poll(() => page.evaluate(() => typeof window.releaseBrowserSnapshot)).toBe('function');
+  await page.getByRole('button', { name: 'New tab', exact: true }).click();
+  await expect(page.getByRole('tab')).toHaveCount(3);
+  await page.evaluate(() => window.releaseBrowserSnapshot());
+  await expect(page.locator('[data-tab-id="tab-3"]')).toHaveAttribute('aria-selected', 'true');
+  await expect.poll(() => page.evaluate(() => window.ipcCalls.filter(call => call.command === 'browser_state').length)).toBeGreaterThan(6);
+  expect(await page.getByRole('tab').evaluateAll(tabs => tabs.map(tab => tab.dataset.tabId))).toEqual(['tab-1', 'tab-2', 'tab-3']);
+});
+
+test('rapid tab clicks finish on the last tab chosen', async ({ page }) => {
+  await mockStream(page);
+  await page.addInitScript(() => {
+    const original = window.__TAURI__.core.invoke;
+    window.__TAURI__.core.invoke = async (command, args) => {
+      const result = await original(command, args);
+      if (command === 'browser_tab_select' && window.holdTabSwitch) {
+        window.holdTabSwitch = false;
+        return new Promise(resolve => { window.releaseTabSwitch = () => resolve(result); });
+      }
+      return result;
+    };
+  });
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Toggle in-app browser' }).click();
+  for (const count of [2, 3]) {
+    await page.getByRole('button', { name: 'New tab', exact: true }).click();
+    await expect(page.getByRole('tab')).toHaveCount(count);
+  }
+  await page.evaluate(() => { window.holdTabSwitch = true; });
+  await page.locator('[data-tab-id="tab-1"]').click();
+  await expect.poll(() => page.evaluate(() => typeof window.releaseTabSwitch)).toBe('function');
+  await page.locator('[data-tab-id="tab-2"]').click();
+  await page.locator('[data-tab-id="tab-3"]').click();
+  await page.evaluate(() => window.releaseTabSwitch());
+  await expect.poll(() => page.evaluate(() => window.ipcCalls.filter(call => call.command === 'browser_tab_select').map(call => call.args.id))).toEqual(['tab-1', 'tab-3']);
+  await expect(page.locator('[data-tab-id="tab-3"]')).toHaveAttribute('aria-selected', 'true');
+  expect(await page.getByRole('tab').evaluateAll(tabs => tabs.map(tab => tab.dataset.tabId))).toEqual(['tab-1', 'tab-2', 'tab-3']);
+});
+
+test('tabs display site favicons, reuse loaded images and show a globe when an icon fails', async ({ page }) => {
+  await mockStream(page);
+  await page.addInitScript(() => {
+    const original = window.__TAURI__.core.invoke;
+    window.__TAURI__.core.invoke = async (command, args) => {
+      const result = await original(command, args);
+      const tabs = command === 'browser_tabs' ? result : result.tabs;
+      if (Array.isArray(tabs)) tabs.forEach(tab => {
+        tab.favicon_url = window.failSiteIcon ? 'https://icons.example/broken.svg' : 'https://icons.example/site.svg';
+      });
+      return result;
+    };
+  });
+  await page.route('https://icons.example/**', route => route.request().url().endsWith('/site.svg')
+    ? route.fulfill({ contentType: 'image/svg+xml', body: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect width="24" height="24" fill="red"/></svg>' })
+    : route.abort());
+  await page.route('https://duckduckgo.com/favicon.ico', route => route.abort());
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Toggle in-app browser' }).click();
+  const icon = page.locator('.browser-tab-favicon img');
+  await expect(icon).toHaveAttribute('src', 'https://icons.example/site.svg');
+  await expect(page.locator('.browser-tab-favicon')).toHaveClass(/has-icon/);
+  await page.evaluate(() => { window.savedFavicon = document.querySelector('.browser-tab-favicon img'); });
+  await expect.poll(() => page.evaluate(() => window.ipcCalls.filter(call => call.command === 'browser_state').length)).toBeGreaterThan(2);
+  expect(await page.evaluate(() => window.savedFavicon === document.querySelector('.browser-tab-favicon img'))).toBe(true);
+  await page.evaluate(() => { window.failSiteIcon = true; });
+  await expect(page.locator('.browser-tab-favicon img')).toHaveCount(0);
+  await expect(page.locator('.browser-tab-favicon > svg')).toBeVisible();
+  await expect(page.locator('.browser-tab-favicon')).toHaveText('');
+});
+
 
 test('browser-first layout keeps streaming, floats chat on hover and persists pinned chat', async ({ page }) => {
   await mockStream(page);
@@ -350,7 +515,7 @@ test('desktop fullscreen uses the native window and Escape restores the chat lay
 });
 
 
-test('Brave ad blocking defaults on and stays disabled when other browser settings are saved', async ({ page }) => {
+test('uBlock Origin Lite blocking defaults on and stays disabled when other browser settings are saved', async ({ page }) => {
   await mockDesktop(page); // Legacy prefs omit adblock_enabled; default must be on.
   await page.goto('/');
   await page.getByRole('button', { name: 'Open settings' }).click();

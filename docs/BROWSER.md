@@ -68,37 +68,35 @@ retain their own Escape behavior.
 
 ## Default ad and tracker blocking
 
-Comrade uses Brave's [`adblock-rust`](https://github.com/brave/adblock-rust)
-engine (`adblock` 0.13.3) with bundled **EasyList** and **EasyPrivacy**. Protection
-is enabled even for existing preferences that omit the new setting. Change
-**Settings → Browser → Block ads and trackers**, or set
+Comrade bundles the unmodified official **uBlock Origin Lite** extension
+(version `2026.930.1227`) and enables **Complete** filtering by default, including
+network rules, cosmetic filters, and the extension's own site scriptlets.
+Current Chrome for Testing supports Manifest V3; full uBlock Origin uses
+Manifest V2, so it cannot run in this browser. See the
+[official Lite FAQ](https://github.com/uBlockOrigin/uBOL-home/wiki/Frequently-asked-questions-(FAQ))
+for differences from full uBlock Origin and filtering modes.
+
+The package is embedded in the executable, checksum-verified and extracted
+offline into `comrade-agent/browser-extensions/`. It runs only in Comrade's
+isolated Chromium profile. The driver loads it through Chromium's extension
+API and waits for Complete-mode rules and document-start scriptlets before
+opening a page. An already-running owned Chromium process can load the extension while
+retaining its profile and active page; reload that page to apply scriptlets.
+
+Change **Settings → Browser → Block ads and trackers**, or set
 `adblock_enabled = false` in the `[browser]` section of `comrade.conf`.
-Saved settings apply without restarting Chromium; reload a page to restore
-resources blocked before disabling protection.
+Saved settings apply without restarting Chromium. **Reload the page after
+changing protection**: scripts and styles already injected into a document
+remain until navigation. Existing preferences that omit the setting default
+to enabled. The previous custom Rust request interception and cosmetic
+injection have been removed.
 
-The controlled tab enables CDP Fetch interception before navigating. Every
-paused request is evaluated and either cancelled with `BlockedByClient` or
-continued directly in the persistent transport; paused requests never use the
-lossy screencast event queue. Request type, frame source, third-party rules,
-and filter exceptions are passed to Brave's engine. Service-worker responses
-are bypassed to keep those cached resources on the interception path.
-
-An isolated content-script world applies site-specific and generic CSS hiding
-rules, including dynamic class/id changes, while respecting cosmetic
-exceptions. DOM checks are throttled, with bounded selector payloads. This
-integration does not include Brave Shields features such as fingerprinting
-protection, redirect resources, procedural cosmetics, or scriptlet injection;
-CDP interception is scoped to the controlled page target, not browser-wide
-worker or out-of-process iframe targets.
-
-Validated cached filters live in `comrade-agent/adblock/`. Background refresh
-checks hourly and downloads from the official EasyList HTTPS endpoints when
-snapshots are older than four days. Downloads are size-limited and both lists
-must validate before replacing the engine. Compilation runs off the browser
-transport task. Offline or invalid downloads preserve the current engine and
-bundled fallback. `COMRADE_ADBLOCK_UPDATE=0` disables background downloads for
-local tests or managed offline deployments. Filter attribution and license
-are in `core/assets/adblock/`.
+Filters and scriptlets ship with the pinned extension package; updates arrive
+with Comrade's bundled-extension updates, rather than background list downloads.
+Package source, checksum, and GPL attribution are in
+[`core/assets/extensions/README.md`](../core/assets/extensions/README.md).
+YouTube changes its ad delivery frequently; this integration does not promise
+that every live ad variant is blocked.
 
 ## Verification
 
@@ -112,7 +110,6 @@ Live checks use only a local HTML fixture and a fresh isolated scratch
 profile. Supply an existing Chromium executable, then run:
 
 ```bash
-COMRADE_ADBLOCK_UPDATE=0 \
 COMRADE_HOME=/tmp/comrade-browser-tests \
 COMRADE_CHROMIUM_BIN=/absolute/path/to/chrome \
 cargo test -p comrade-core --test browser_cdp live_ -- \
@@ -121,8 +118,11 @@ cargo test -p comrade-core --test browser_cdp live_ -- \
 
 The ad-block test proves that blocked script requests never reach its local
 HTTP server, allowed scripts execute, dynamic ads are hidden, and disabling
-then re-enabling protection takes effect. Engine tests cover filter exceptions
-and request types; UI checks cover the default and saved setting.
+then re-enabling protection takes effect after reload. A YouTube-origin fixture
+checks the extension's actual fetch and XHR scriptlets: player ad fields are
+removed while content stream URLs and video metadata survive. It runs with
+protection on, off, and on again; no live YouTube playback is claimed. UI checks
+cover the default and saved setting.
 
 The stream test verifies first-frame delivery, nested scrolling, trusted
 clicks and typing, larger pastes, viewport changes, and stream restart. It

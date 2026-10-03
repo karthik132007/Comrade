@@ -825,14 +825,38 @@ async fn browser_open(url: String) -> Result<serde_json::Value, String> {
     if url.is_empty() {
         return Err("EMPTY_URL: no URL provided.".into());
     }
-    let port = browser_driver::ensure_chromium().await.map_err(|m| trim_msg(m, 400))?;
+    let port = browser_driver::interactive_port().await.map_err(|m| trim_msg(m, 400))?;
     let (requested, final_url) =
         browser_driver::page_navigate_interactive(port, &url).await.map_err(|m| trim_msg(m, 400))?;
-    let title = browser_driver::page_title(port)
-        .await
-        .map(|(t, _)| t)
-        .unwrap_or_default();
-    Ok(serde_json::json!({ "requested": requested, "url": final_url, "title": title }))
+    Ok(serde_json::json!({ "requested": requested, "url": final_url }))
+}
+
+#[tauri::command]
+async fn browser_tabs() -> Result<Vec<serde_json::Value>, String> {
+    use comrade_core::tools::browser_driver;
+    let port = browser_driver::ensure_chromium().await.map_err(|m| trim_msg(m, 400))?;
+    browser_driver::tabs(port).await.map_err(|m| trim_msg(m, 400))
+}
+
+#[tauri::command]
+async fn browser_tab_new(url: Option<String>) -> Result<serde_json::Value, String> {
+    use comrade_core::tools::browser_driver;
+    let port = browser_driver::ensure_chromium().await.map_err(|m| trim_msg(m, 400))?;
+    browser_driver::create_tab(port, url.as_deref().unwrap_or(browser_driver::DEFAULT_HOME_URL)).await.map_err(|m| trim_msg(m, 400))
+}
+
+#[tauri::command]
+async fn browser_tab_select(id: String) -> Result<serde_json::Value, String> {
+    use comrade_core::tools::browser_driver;
+    let port = browser_driver::ensure_chromium().await.map_err(|m| trim_msg(m, 400))?;
+    browser_driver::select_tab(port, &id).await.map_err(|m| trim_msg(m, 400))
+}
+
+#[tauri::command]
+async fn browser_tab_close(id: String) -> Result<serde_json::Value, String> {
+    use comrade_core::tools::browser_driver;
+    let port = browser_driver::ensure_chromium().await.map_err(|m| trim_msg(m, 400))?;
+    browser_driver::close_tab(port, &id).await.map_err(|m| trim_msg(m, 400))
 }
 
 #[derive(Serialize)]
@@ -840,6 +864,7 @@ struct BrowserPaneState {
     running: bool,
     url: String,
     title: String,
+    tabs: Vec<serde_json::Value>,
 }
 
 /// Snapshot for the in-app browser pane (never fails — placeholders when down).
@@ -854,6 +879,7 @@ fn state_from_snapshot(snap: serde_json::Value) -> BrowserPaneState {
         running: snap.get("running").and_then(|v| v.as_bool()).unwrap_or(false),
         url: snap.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string(),
         title: snap.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        tabs: snap.get("tabs").and_then(|v| v.as_array()).cloned().unwrap_or_default(),
     }
 }
 
@@ -864,12 +890,8 @@ fn state_from_snapshot(snap: serde_json::Value) -> BrowserPaneState {
 async fn browser_ensure() -> Result<BrowserPaneState, String> {
     use comrade_core::tools::browser_driver;
     let port = browser_driver::ensure_chromium().await.map_err(|m| trim_msg(m, 400))?;
-    let url = browser_driver::current_url(port).await.unwrap_or_default();
-    let title = browser_driver::page_title(port)
-        .await
-        .map(|(t, _)| t)
-        .unwrap_or_default();
-    Ok(BrowserPaneState { running: true, url, title })
+    let snapshot = browser_driver::pane_snapshot(port).await.map_err(|m| trim_msg(m, 400))?;
+    Ok(state_from_snapshot(snapshot))
 }
 
 /// Self-install progress for the built-in browser
@@ -930,7 +952,7 @@ async fn browser_click_at(x: f64, y: f64) -> Result<serde_json::Value, String> {
 #[tauri::command]
 async fn browser_pointer(event: serde_json::Value) -> Result<(), String> {
     use comrade_core::tools::browser_driver;
-    let port = browser_driver::ensure_chromium().await.map_err(|m| trim_msg(m, 400))?;
+    let port = browser_driver::interactive_port().await.map_err(|m| trim_msg(m, 400))?;
     browser_driver::pointer_event(port, event).await
 }
 
@@ -938,7 +960,7 @@ async fn browser_pointer(event: serde_json::Value) -> Result<(), String> {
 #[tauri::command]
 async fn browser_type_text(text: String) -> Result<serde_json::Value, String> {
     use comrade_core::tools::browser_driver;
-    let port = browser_driver::ensure_chromium().await.map_err(|m| trim_msg(m, 400))?;
+    let port = browser_driver::interactive_port().await.map_err(|m| trim_msg(m, 400))?;
     browser_driver::insert_text(port, &text).await.map_err(|m| trim_msg(m, 400))?;
     Ok(serde_json::json!({ "typed": text.len() }))
 }
@@ -947,7 +969,7 @@ async fn browser_type_text(text: String) -> Result<serde_json::Value, String> {
 #[tauri::command]
 async fn browser_press_key(key: String, modifiers: Option<i64>) -> Result<serde_json::Value, String> {
     use comrade_core::tools::browser_driver;
-    let port = browser_driver::ensure_chromium().await.map_err(|m| trim_msg(m, 400))?;
+    let port = browser_driver::interactive_port().await.map_err(|m| trim_msg(m, 400))?;
     browser_driver::page_press_with_modifiers(port, key.trim(), modifiers.unwrap_or(0)).await.map_err(|m| trim_msg(m, 400))?;
     Ok(serde_json::json!({ "key": key }))
 }
@@ -976,30 +998,27 @@ async fn browser_close() -> Result<bool, String> {
 #[tauri::command]
 async fn browser_back() -> Result<serde_json::Value, String> {
     use comrade_core::tools::browser_driver;
-    let port = browser_driver::ensure_chromium().await.map_err(|m| trim_msg(m, 400))?;
+    let port = browser_driver::interactive_port().await.map_err(|m| trim_msg(m, 400))?;
     browser_driver::history_interactive(port, false).await.map_err(|m| trim_msg(m, 400))?;
-    let cur = browser_driver::current_url(port).await.unwrap_or_default();
-    Ok(serde_json::json!({ "url": cur }))
+    Ok(browser_driver::state_snapshot().await)
 }
 
 /// Step forward in the in-app browser history (pane toolbar).
 #[tauri::command]
 async fn browser_forward() -> Result<serde_json::Value, String> {
     use comrade_core::tools::browser_driver;
-    let port = browser_driver::ensure_chromium().await.map_err(|m| trim_msg(m, 400))?;
+    let port = browser_driver::interactive_port().await.map_err(|m| trim_msg(m, 400))?;
     browser_driver::history_interactive(port, true).await.map_err(|m| trim_msg(m, 400))?;
-    let cur = browser_driver::current_url(port).await.unwrap_or_default();
-    Ok(serde_json::json!({ "url": cur }))
+    Ok(browser_driver::state_snapshot().await)
 }
 
 /// Reload the in-app browser tab (pane toolbar).
 #[tauri::command]
 async fn browser_reload() -> Result<serde_json::Value, String> {
     use comrade_core::tools::browser_driver;
-    let port = browser_driver::ensure_chromium().await.map_err(|m| trim_msg(m, 400))?;
+    let port = browser_driver::interactive_port().await.map_err(|m| trim_msg(m, 400))?;
     browser_driver::reload_interactive(port).await.map_err(|m| trim_msg(m, 400))?;
-    let url = browser_driver::current_url(port).await.unwrap_or_default();
-    Ok(serde_json::json!({ "url": url }))
+    Ok(browser_driver::state_snapshot().await)
 }
 
 fn trim_msg(msg: String, n: usize) -> String {
@@ -1359,6 +1378,10 @@ fn main() {
             history_rename,
             system_coding_agents,
             browser_open,
+            browser_tabs,
+            browser_tab_new,
+            browser_tab_select,
+            browser_tab_close,
             browser_state,
             browser_ensure,
             browser_provision_status,

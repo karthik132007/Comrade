@@ -445,6 +445,132 @@ async fn live_stream_reflows_and_delivers_input_without_snapshot_polling() {
     assert_eq!(browser_driver::close_chromium().await, browser_driver::CloseOutcome::Closed);
 }
 
+/// Tab metadata must remain responsive when a background renderer is busy.
+#[tokio::test]
+#[ignore]
+async fn live_tabs_stay_responsive_with_busy_background_page() {
+    let context = TestContext::new("tab-performance").await;
+    let port = browser_driver::ensure_chromium().await.unwrap();
+    browser_driver::page_navigate(port, &context.page("first")).await.unwrap();
+    let first = browser_driver::tabs(port).await.unwrap().into_iter().find(|tab| tab["active"] == true).unwrap();
+    let second = browser_driver::create_tab(port, &context.page("second")).await.unwrap();
+    let targets: Vec<Value> = client().get(format!("http://127.0.0.1:{port}/json/list")).send().await.unwrap().json().await.unwrap();
+    let ws = targets.iter().find(|target| target["id"] == first["id"]).unwrap()["webSocketDebuggerUrl"].as_str().unwrap().to_owned();
+    // Run a long synchronous script on the background page, as a heavy site can.
+    let busy = tokio::spawn(async move {
+        browser_driver::cdp_call(&ws, "Runtime.evaluate", serde_json::json!({
+            "expression": "{ const until = performance.now() + 1500; while (performance.now() < until) {} }"
+        })).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let start = std::time::Instant::now();
+    let snapshot = tokio::time::timeout(Duration::from_millis(800), browser_driver::state_snapshot()).await
+        .expect("metadata must not wait for background JavaScript");
+    println!("tab snapshot with busy background renderer: {:?}", start.elapsed());
+    assert_eq!(snapshot["tabs"].as_array().unwrap().len(), 2);
+    assert_eq!(snapshot["url"], second["url"]);
+    assert_eq!(browser_driver::interactive_port().await.unwrap(), port);
+    busy.await.unwrap();
+    let after_close = browser_driver::close_tab(port, first["id"].as_str().unwrap()).await.unwrap();
+    assert_eq!(after_close["id"], second["id"], "closing a background tab must preserve the active page");
+    assert_eq!(browser_driver::close_chromium().await, browser_driver::CloseOutcome::Closed);
+}
+
+/// Activation and background-tab closure must preserve strip order and page identity.
+#[tokio::test]
+#[ignore]
+async fn live_tab_order_and_active_page_remain_stable() {
+    let context = TestContext::new("stable-tabs").await;
+    let port = browser_driver::ensure_chromium().await.unwrap();
+    browser_driver::page_navigate(port, &context.page("video-tab")).await.unwrap();
+    let first = browser_driver::tabs(port).await.unwrap().into_iter().find(|tab| tab["active"] == true).unwrap();
+    let second = browser_driver::create_tab(port, &context.page("second-tab")).await.unwrap();
+    let third = browser_driver::create_tab(port, &context.page("third-tab")).await.unwrap();
+    let order = vec![first["id"].clone(), second["id"].clone(), third["id"].clone()];
+    for tab in [&first, &third, &second, &first] {
+        browser_driver::select_tab(port, tab["id"].as_str().unwrap()).await.unwrap();
+        let tabs = browser_driver::tabs(port).await.unwrap();
+        assert_eq!(tabs.iter().map(|tab| tab["id"].clone()).collect::<Vec<_>>(), order);
+        assert_eq!(tabs.iter().find(|tab| tab["active"] == true).unwrap()["id"], tab["id"]);
+        assert_eq!(browser_driver::current_url(port).await.unwrap(), tab["url"].as_str().unwrap());
+    }
+    browser_driver::close_tab(port, third["id"].as_str().unwrap()).await.unwrap();
+    assert_eq!(browser_driver::current_url(port).await.unwrap(), first["url"].as_str().unwrap());
+    let neighbor = browser_driver::close_tab(port, first["id"].as_str().unwrap()).await.unwrap();
+    assert_eq!(neighbor["id"], second["id"]);
+    assert_eq!(browser_driver::close_chromium().await, browser_driver::CloseOutcome::Closed);
+}
+
+/// Slow local fixtures verify early navigation, cached assets and real icon metadata.
+#[tokio::test]
+#[ignore]
+async fn live_loading_returns_early_keeps_cache_and_reports_favicon() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+    let context = TestContext::new("page-loading").await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let image_requests = Arc::new(AtomicUsize::new(0));
+    let counter = image_requests.clone();
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let counter = counter.clone();
+            tokio::spawn(async move {
+                let mut buffer = [0u8; 8192];
+                let n = socket.read(&mut buffer).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buffer[..n]);
+                let path = request.split_whitespace().nth(1).unwrap_or("/").split('?').next().unwrap();
+                let (kind, body, cache) = match path {
+                    "/heavy" => ("text/html", "<!doctype html><title>heavy</title><h1>Loading test</h1><script>const until=performance.now()+1500;while(performance.now()<until){}</script>", "no-store"),
+                    "/slow.svg" => {
+                        counter.fetch_add(1, Ordering::Relaxed);
+                        tokio::time::sleep(Duration::from_millis(1500)).await;
+                        ("image/svg+xml", "<svg xmlns='http://www.w3.org/2000/svg' width='40' height='40'><rect width='40' height='40' fill='blue'/></svg>", "public, max-age=3600")
+                    }
+                    "/brand.svg" => ("image/svg+xml", "<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16'><rect width='16' height='16' fill='red'/></svg>", "public, max-age=3600"),
+                    _ => ("text/html", "<!doctype html><title>early content</title><link rel='icon' type='image/svg+xml' href='/brand.svg'><h1>Visible content</h1><img src='/slow.svg'>", "no-store"),
+                };
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nCache-Control: {cache}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                let _ = socket.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    let port = browser_driver::ensure_chromium().await.unwrap();
+    let start = std::time::Instant::now();
+    browser_driver::page_navigate_interactive(port, &format!("{origin}/heavy")).await.unwrap();
+    let elapsed = start.elapsed();
+    println!("interactive navigation with 1.5s startup script: {elapsed:?}");
+    assert!(elapsed < Duration::from_millis(1000), "toolbar must not wait for page JavaScript");
+    let pane = tokio::time::timeout(Duration::from_millis(500), browser_driver::pane_snapshot(port)).await.unwrap().unwrap();
+    assert_eq!(pane["running"], true);
+    // Let this intentionally busy page finish before testing DOM readiness.
+    tokio::time::sleep(Duration::from_millis(1600)).await;
+    let start = std::time::Instant::now();
+    browser_driver::page_navigate(port, &origin).await.unwrap();
+    println!("DOM-ready navigation while image is still loading: {:?}", start.elapsed());
+    assert!(start.elapsed() < Duration::from_millis(1000), "usable HTML must not wait for slow image downloads");
+    let mut favicon = String::new();
+    for _ in 0..40 {
+        let snapshot = browser_driver::pane_snapshot(port).await.unwrap();
+        let active = snapshot["tabs"].as_array().unwrap().iter().find(|tab| tab["active"] == true).unwrap();
+        favicon = active["favicon_url"].as_str().unwrap_or_default().to_string();
+        let ready = browser_driver::cdp_eval_via_active(port, "document.readyState").await.unwrap();
+        if ready == "complete" && favicon.ends_with("/brand.svg") { break; }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(favicon, format!("{origin}/brand.svg"));
+    assert_eq!(image_requests.load(Ordering::Relaxed), 1);
+    let start = std::time::Instant::now();
+    browser_driver::page_navigate(port, &format!("{origin}/?repeat=1")).await.unwrap();
+    println!("repeat navigation with cached image: {:?}", start.elapsed());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(image_requests.load(Ordering::Relaxed), 1, "repeat visits should reuse Chromium's HTTP cache");
+    assert_eq!(browser_driver::close_chromium().await, browser_driver::CloseOutcome::Closed);
+    server.abort();
+    drop(context);
+}
+
 /// Every network assertion uses a local fixture: blocked requests must never
 /// reach the server, normal scripts must execute, and CSS hides dynamic ads.
 #[tokio::test]
@@ -489,14 +615,7 @@ async fn live_adblock_blocks_before_download_and_can_be_disabled() {
         loop {
             let expression = format!("getComputedStyle(document.getElementById('{id}')).display");
             if browser_driver::cdp_eval_via_active(port, &expression).await.unwrap() == "none" { break; }
-            if tokio::time::Instant::now() >= deadline {
-                let target = page_targets(port).await.remove(0);
-                let ws = target["webSocketDebuggerUrl"].as_str().unwrap();
-                let tree = browser_driver::cdp_call(ws, "Page.getFrameTree", serde_json::json!({})).await.unwrap();
-                let world = browser_driver::cdp_call(ws, "Page.createIsolatedWorld", serde_json::json!({"frameId": tree["frameTree"]["frame"]["id"], "worldName": "comrade-adblock"})).await.unwrap();
-                let diagnosis = browser_driver::cdp_call(ws, "Runtime.evaluate", serde_json::json!({"contextId": world["executionContextId"], "expression": "JSON.stringify({installed: globalThis.__comradeCosmeticInstalled, binding: typeof globalThis.__comradeAdblock, style: document.getElementById('__comradeAdblockStyle')?.outerHTML, classes: [...document.querySelector('#ad').classList]})", "returnByValue": true})).await.unwrap();
-                panic!("cosmetic filter did not hide {id}: {diagnosis}");
-            }
+            assert!(tokio::time::Instant::now() < deadline, "uBlock cosmetic filter did not hide {id}");
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
@@ -505,8 +624,9 @@ async fn live_adblock_blocks_before_download_and_can_be_disabled() {
     wait_hidden(port, "dynamic").await;
     assert_eq!(eval("getComputedStyle(document.getElementById('article')).display").await.unwrap(), "block");
     browser_driver::set_adblock_enabled(false).await.unwrap();
-    assert_ne!(eval("getComputedStyle(document.getElementById('ad')).display").await.unwrap(), "none");
+    // Registered extension content scripts are removed for subsequent documents.
     browser_driver::page_navigate(port, &url).await.unwrap();
+    assert_ne!(eval("getComputedStyle(document.getElementById('ad')).display").await.unwrap(), "none");
     assert_eq!(eval("String(window.adLoaded === true)").await.unwrap(), "true");
     assert!(requests.lock().unwrap().iter().any(|p| p == "/banner_ads/blocked.js"));
     requests.lock().unwrap().clear();
@@ -518,4 +638,61 @@ async fn live_adblock_blocks_before_download_and_can_be_disabled() {
     browser_driver::close_chromium().await;
     server.abort();
     drop(context);
+}
+
+/// Exercise the upstream extension's real MAIN-world YouTube scriptlets,
+/// including their absence after disabling protection. All responses are local.
+#[tokio::test]
+#[ignore]
+async fn live_ublock_youtube_scriptlets_filter_player_responses() {
+    let _context = TestContext::new("ublock-youtube").await;
+    let port = browser_driver::ensure_chromium().await.unwrap();
+    browser_driver::page_navigate(port, "about:blank").await.unwrap();
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../scripts/test-ublock-youtube.cjs");
+    for enabled in [true, false, true] {
+        browser_driver::set_adblock_enabled(enabled).await.unwrap();
+        let output = tokio::process::Command::new("node").arg(&script).arg(port.to_string())
+            .arg(if enabled { "on" } else { "off" }).output().await.expect("npm ci and Node are required for this fixture");
+        assert!(output.status.success(), "YouTube scriptlet fixture failed:\n{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        println!("{}", String::from_utf8_lossy(&output.stdout));
+    }
+    browser_driver::close_chromium().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn live_ublock_loads_into_owned_legacy_browser_and_preserves_page() {
+    let context = TestContext::new("extension-upgrade").await;
+    let profile = context.home.join("browser-profile");
+    std::fs::create_dir_all(&profile).unwrap();
+    let url = context.page("restored-after-extension-upgrade");
+    // Simulate a still-running Comrade browser from before extension support.
+    let mut legacy = tokio::process::Command::new(test_chromium_exe(&context.home))
+        .args(["--headless=new", "--no-sandbox", "--no-first-run", "--remote-debugging-port=0"])
+        .arg(format!("--user-data-dir={}", profile.display()))
+        .arg(&url)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn().unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let old_port = loop {
+        if let Ok(info) = std::fs::read_to_string(profile.join("DevToolsActivePort")) {
+            if let Some(port) = info.lines().next().and_then(|s| s.parse::<u16>().ok()) {
+                if page_targets(port).await.iter().any(|page| page["url"] == url) { break port; }
+            }
+        }
+        assert!(tokio::time::Instant::now() < deadline, "legacy browser did not start");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let port = browser_driver::ensure_chromium().await.expect("load extension into owned legacy browser");
+    assert_eq!(port, old_port, "reuse our existing Chromium process");
+    assert!(page_targets(port).await.iter().any(|page| page["url"] == url), "restore previous URL");
+    let result = tokio::process::Command::new("node")
+        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/test-ublock-youtube.cjs"))
+        .arg(port.to_string()).arg("on").output().await.unwrap();
+    assert!(result.status.success(), "extension in existing browser: {}{}", String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+    browser_driver::close_chromium().await;
+    legacy.kill().await.unwrap();
+    legacy.wait().await.unwrap();
 }

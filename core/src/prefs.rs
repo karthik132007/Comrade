@@ -5,7 +5,7 @@
  * ```ini
  * [browser]
  * auto_show = true   # open the in-app browser pane when a browser tool runs
- * adblock_enabled = true # Brave Rust engine, EasyList + EasyPrivacy
+ * adblock_enabled = true # uBlock Origin Lite, Complete mode
  * width_pct = 45     # pane width (20-70% of the main area)
  *
  * [voice]
@@ -86,7 +86,7 @@ pub struct BrowserPrefs {
     /// Pane width as % of the main area (clamped 20-70).
     #[serde(default = "default_browser_width")]
     pub width_pct: u32,
-    /// Brave Rust ad and tracker blocking, enabled for old and new installs.
+    /// uBlock Origin Lite ad and tracker blocking, enabled for old and new installs.
     #[serde(default = "default_browser_auto_show")]
     pub adblock_enabled: bool,
 }

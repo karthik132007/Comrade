@@ -1,4 +1,5 @@
 import { createBrowserStream } from './browser-stream';
+import { createBrowserInputQueue } from './browser-input';
 
 /* Tauri IPC controller. React owns the shell; this controller owns the dynamic
    transcript, task steps, history, and backend-driven preference fields.
@@ -659,6 +660,14 @@ export function initializeComrade() {
   var chatCloseBtn = document.getElementById('chat-close');
   var browserExpandBtn = document.getElementById('browser-expand');
   var browserFullscreenBtn = document.getElementById('browser-fullscreen');
+  var browserTabs = document.getElementById('browser-tabs');
+  var browserNewTabBtn = document.getElementById('browser-new-tab');
+  var browserHomeBtn = document.getElementById('browser-home');
+  var browserMenu = document.getElementById('browser-menu');
+  var browserCopyBtn = document.getElementById('browser-copy');
+  var DUCKDUCKGO_HOME = 'https://duckduckgo.com/';
+  var addressShortcut = document.querySelector('.address-shortcut');
+  if (addressShortcut && /Mac|iPhone|iPad/.test(navigator.platform)) addressShortcut.textContent = '⌘ L';
 
   function renderBrowserLayout() {
     document.body.classList.toggle('browser-primary', browserPrimary);
@@ -770,12 +779,7 @@ export function initializeComrade() {
 
   var browserMetadataTimer = null;
   var browserReconnectTimer = null;
-  var browserInputQueue = Promise.resolve();
-  function queueBrowserInput(command, args) {
-    var operation = browserInputQueue.then(function () { return invoke(command, args); });
-    browserInputQueue = operation.catch(function () {});
-    return operation;
-  }
+  var queueBrowserInput = createBrowserInputQueue(invoke);
   function paneDimensions() {
     return { width: Math.max(240, Math.round(browserView.clientWidth || 640)), height: Math.max(120, Math.round(browserView.clientHeight || 640)) };
   }
@@ -783,8 +787,8 @@ export function initializeComrade() {
     invoke: invoke, tauri: tauri, image: browserImg,
     onFrame: function (frame) {
       browserPageW = frame.width; browserPageH = frame.height;
-      browserView.classList.remove('idle');
-      browserStatus.textContent = '';
+      if (browserView.classList.contains('idle')) browserView.classList.remove('idle');
+      if (browserStatus.textContent) browserStatus.textContent = '';
     },
     onError: function (error) {
       browserStatus.textContent = 'Reconnecting browser…';
@@ -800,6 +804,197 @@ export function initializeComrade() {
   var browserInteractTimer = null;
   var browserWheelDebt = { x: 0, y: 0 };
   var browserWheelTimer = null;
+  var browserTabsSignature = '';
+  var browserTabsRequest = null;
+  var activeBrowserTabId = null;
+  var activeBrowserTabUrl = '';
+  var browserTabBusy = false;
+  var browserTabOrder = [];
+  var browserTabElements = new Map();
+  var browserTabRevision = 0;
+  var browserTabsRequestVersion = 0;
+  var browserRequestedTabId = null;
+
+  function tabLabel(tab) {
+    if (tab.title) return tab.title;
+    if (!tab.url || tab.url === 'about:blank') return 'New tab';
+    try { return new URL(tab.url).hostname.replace(/^www\./, '') || 'New tab'; } catch (e) { return 'New tab'; }
+  }
+
+  function tabFaviconUrl(tab) {
+    try {
+      var site = new URL(tab.url);
+      if (site.protocol !== 'https:' && site.protocol !== 'http:') return '';
+      if (tab.favicon_url) {
+        var icon = new URL(tab.favicon_url, site);
+        if (icon.protocol === 'https:' || icon.protocol === 'http:' || icon.href.startsWith('data:image/')) return icon.href;
+      }
+      return new URL('/favicon.ico', site.origin).href;
+    } catch (error) { return ''; }
+  }
+
+  function updateTabFavicon(element, tab) {
+    var url = tabFaviconUrl(tab);
+    if (element.dataset.iconUrl === url) return;
+    element.dataset.iconUrl = url;
+    element.classList.remove('has-icon');
+    element.innerHTML = '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c5 5 5 13 0 18-5-5-5-13 0-18Z"/></svg>';
+    if (!url) return;
+    var image = document.createElement('img');
+    image.alt = '';
+    image.decoding = 'async';
+    image.referrerPolicy = 'no-referrer';
+    image.onload = function () { if (element.dataset.iconUrl === url) element.classList.add('has-icon'); };
+    var fallback = new URL('/favicon.ico', tab.url).href;
+    image.onerror = function () {
+      if (image.getAttribute('src') !== fallback) image.src = fallback;
+      else { image.remove(); element.classList.remove('has-icon'); }
+    };
+    image.src = url;
+    element.appendChild(image);
+  }
+
+  function renderBrowserTabs(tabs) {
+    if (!browserTabs) return;
+    tabs = tabs || [];
+    var ids = tabs.map(function (tab) { return tab.id; });
+    browserTabOrder = browserTabOrder.filter(function (id) { return ids.indexOf(id) >= 0; });
+    tabs.forEach(function (tab) { if (browserTabOrder.indexOf(tab.id) < 0) browserTabOrder.push(tab.id); });
+    tabs = browserTabOrder.map(function (id) { return tabs.find(function (tab) { return tab.id === id; }); });
+    var signature = JSON.stringify(tabs);
+    if (signature === browserTabsSignature) return;
+    browserTabsSignature = signature;
+    var active = tabs.find(function (tab) { return tab.active; });
+    var previousActiveId = activeBrowserTabId;
+    activeBrowserTabId = active?.id || null;
+    activeBrowserTabUrl = active?.url || '';
+    browserTabElements.forEach(function (item, id) {
+      if (ids.indexOf(id) < 0) { item.remove(); browserTabElements.delete(id); }
+    });
+    tabs.forEach(function (tab, index) {
+      var item = browserTabElements.get(tab.id);
+      if (!item) {
+        item = document.createElement('div');
+        item.setAttribute('role', 'tab');
+        item.dataset.tabId = tab.id;
+        var favicon = document.createElement('span');
+        favicon.className = 'browser-tab-favicon';
+        var label = document.createElement('span');
+        label.className = 'browser-tab-label';
+        var close = document.createElement('button');
+        close.className = 'browser-tab-close';
+        close.type = 'button';
+        close.innerHTML = '&times;';
+        close.addEventListener('click', function (event) {
+          event.stopPropagation();
+          closeBrowserTab(tab.id);
+        });
+        item.append(favicon, label, close);
+        item.addEventListener('click', function () {
+          if (!item.browserTab.active || browserTabBusy) selectBrowserTab(tab.id);
+        });
+        item.addEventListener('keydown', function (event) {
+          if (event.target !== item) return;
+          if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); selectBrowserTab(tab.id); }
+          if (['ArrowLeft', 'ArrowRight', 'Home', 'End'].indexOf(event.key) >= 0) {
+            event.preventDefault();
+            var items = Array.from(browserTabs.querySelectorAll('[role="tab"]'));
+            var current = items.indexOf(item);
+            var next = event.key === 'Home' ? 0 : event.key === 'End' ? items.length - 1
+              : (current + (event.key === 'ArrowRight' ? 1 : -1) + items.length) % items.length;
+            items[next].focus();
+          }
+        });
+        browserTabElements.set(tab.id, item);
+      }
+      item.browserTab = tab;
+      item.className = 'browser-tab' + (tab.active ? ' active' : '');
+      item.setAttribute('aria-selected', String(!!tab.active));
+      item.setAttribute('tabindex', tab.active ? '0' : '-1');
+      item.title = tabLabel(tab);
+      var favicon = item.children[0];
+      updateTabFavicon(favicon, tab);
+      item.children[1].textContent = tabLabel(tab);
+      item.children[2].setAttribute('aria-label', 'Close ' + tabLabel(tab));
+      if (browserTabs.children[index] !== item) browserTabs.insertBefore(item, browserTabs.children[index] || null);
+    });
+    if (activeBrowserTabId !== previousActiveId) {
+      var selected = browserTabElements.get(activeBrowserTabId);
+      if (selected) selected.scrollIntoView({ inline: 'nearest', block: 'nearest' });
+    }
+  }
+
+  function refreshBrowserTabs() {
+    var version = browserTabRevision;
+    if (browserTabsRequest) {
+      return browserTabsRequestVersion === version ? browserTabsRequest : browserTabsRequest.then(refreshBrowserTabs);
+    }
+    browserTabsRequestVersion = version;
+    browserTabsRequest = invoke('browser_tabs', {}).then(function (tabs) {
+      if (version === browserTabRevision) renderBrowserTabs(tabs);
+    }).catch(function () { /* keep last stable strip */ })
+      .finally(function () { browserTabsRequest = null; });
+    return browserTabsRequest;
+  }
+
+  function finishBrowserTabOperation() {
+    browserTabBusy = false;
+    var requested = browserRequestedTabId;
+    browserRequestedTabId = null;
+    if (requested && requested !== activeBrowserTabId && browserTabElements.has(requested)) selectBrowserTab(requested);
+    else refreshBrowser();
+  }
+
+  function restartBrowserStream() {
+    browserStream.stop();
+    if (!browserIsOpen || document.hidden) return Promise.resolve();
+    var size = paneDimensions();
+    return browserStream.start(size.width, size.height).then(function () { refreshBrowser(); });
+  }
+
+  function selectBrowserTab(id) {
+    if (browserTabBusy) { browserRequestedTabId = id; return; }
+    if (id === activeBrowserTabId) return;
+    browserTabBusy = true;
+    browserTabRevision++;
+    queueBrowserInput.clear();
+    if (browserStatus) browserStatus.textContent = 'Switching tab…';
+    invoke('browser_tab_select', { id: id }).then(function (tab) {
+      if (tab.url) browserUrl.value = tab.url;
+      if (tab.title) browserTitle.textContent = tab.title;
+      return restartBrowserStream();
+    }).then(refreshBrowserTabs).catch(function (err) {
+      if (browserStatus) browserStatus.textContent = 'Could not switch tabs: ' + errMsg(err);
+    }).finally(finishBrowserTabOperation);
+  }
+
+  function createBrowserTab() {
+    if (browserTabBusy) return;
+    browserTabBusy = true;
+    browserTabRevision++;
+    queueBrowserInput.clear();
+    if (browserStatus) browserStatus.textContent = 'Opening a new tab…';
+    invoke('browser_tab_new', { url: DUCKDUCKGO_HOME }).then(function (tab) {
+      browserUrl.value = tab.url || DUCKDUCKGO_HOME;
+      return restartBrowserStream();
+    }).then(function () { browserUrl.focus(); browserUrl.select(); return refreshBrowserTabs(); }).catch(function (err) {
+      if (browserStatus) browserStatus.textContent = 'Could not open a tab: ' + errMsg(err);
+    }).finally(finishBrowserTabOperation);
+  }
+
+  function closeBrowserTab(id) {
+    if (browserTabBusy) return;
+    browserTabBusy = true;
+    browserTabRevision++;
+    var closesActiveTab = id === activeBrowserTabId;
+    if (closesActiveTab) queueBrowserInput.clear();
+    invoke('browser_tab_close', { id: id }).then(function (tab) {
+      if (tab.url) browserUrl.value = tab.url;
+      return closesActiveTab ? restartBrowserStream() : undefined;
+    }).then(refreshBrowserTabs).catch(function (err) {
+      if (browserStatus) browserStatus.textContent = 'Could not close the tab: ' + errMsg(err);
+    }).finally(finishBrowserTabOperation);
+  }
 
   function clampWidth(pct) {
     pct = Math.round(Number(pct) || 45);
@@ -827,7 +1022,7 @@ export function initializeComrade() {
     try { window.localStorage.setItem('comrade-browser-open', browserIsOpen ? '1' : '0'); } catch (e) { /* noop */ }
     if (browserMetadataTimer) { clearInterval(browserMetadataTimer); browserMetadataTimer = null; }
     if (browserReconnectTimer) { clearTimeout(browserReconnectTimer); browserReconnectTimer = null; }
-    if (!browserIsOpen) { browserStream.stop(); stopInstallPoll(); }
+    if (!browserIsOpen) { queueBrowserInput.clear(); browserStream.stop(); stopInstallPoll(); }
     if (browserIsOpen && refresh !== false && !document.hidden) ensureBrowserReady();
     if (browserIsOpen && browserStream.supported) {
       browserMetadataTimer = setInterval(function () { if (!document.hidden && browserStream.active) refreshBrowser(); }, 1000);
@@ -879,12 +1074,23 @@ export function initializeComrade() {
   // Ensure the built-in browser is installed and running, showing install
   // progress in the pane. Resolves true when the live view is refreshing.
   function ensureBrowserReady() {
+    if (browserTabBusy) return Promise.resolve(false);
+    var version = browserTabRevision;
     if (browserStatus) browserStatus.textContent = 'Starting built-in browser…';
     return invoke('browser_ensure', {}).then(function (st) {
+      if (version !== browserTabRevision || browserTabBusy) return false;
       stopInstallPoll();
       st = st || {};
-      if (st.url && browserUrl) browserUrl.value = st.url;
-      if (st.title && browserTitle) browserTitle.textContent = st.title + (st.url ? ' — ' + st.url : '');
+      if (st.url && st.url !== 'about:blank' && browserUrl) browserUrl.value = st.url;
+      if (st.title && browserTitle) browserTitle.textContent = st.title;
+      if (!st.url || st.url === 'about:blank') {
+        return invoke('browser_open', { url: DUCKDUCKGO_HOME }).then(function (home) {
+          if (home && home.url) browserUrl.value = home.url;
+          return ensureBrowserReady();
+        });
+      }
+      if (Array.isArray(st.tabs)) renderBrowserTabs(st.tabs);
+      else refreshBrowserTabs();
       if (!browserIsOpen || document.hidden) return false;
       if (browserStream.supported) {
         var size = paneDimensions();
@@ -909,21 +1115,27 @@ export function initializeComrade() {
   }
 
   function refreshBrowser() {
-    if (browserRefreshing) return;
+    if (browserRefreshing || browserTabBusy) return;
     browserRefreshing = true;
+    var version = browserTabRevision;
     if (!browserStream.active && browserStatus) browserStatus.textContent = 'updating…';
     invoke('browser_state', {}).then(function (st) {
+      if (version !== browserTabRevision || browserTabBusy || !browserIsOpen) return null;
       st = st || {};
       if (st.url && browserUrl && document.activeElement !== browserUrl) browserUrl.value = st.url;
-      if (browserTitle) browserTitle.textContent = st.title ? st.title + ' — ' + (st.url || '') : (st.url || 'Comrade\u2019s browser — shown only here, inside the app.');
+      if (browserTitle) browserTitle.textContent = st.title || st.url || 'Comrade browser';
       if (!st.running) {
         if (browserStatus) browserStatus.textContent = 'Browser is idle. Open a page or run a task.';
         if (browserView) browserView.classList.add('idle');
         return null;
       }
+      if (browserTabBusy) return null;
+      if (Array.isArray(st.tabs)) renderBrowserTabs(st.tabs);
+      else refreshBrowserTabs();
       if (browserView) browserView.classList.remove('idle');
       return browserStream.active ? null : invoke('browser_frame', {});
     }).then(function (frame) {
+      if (version !== browserTabRevision || browserTabBusy) return;
       if (frame && frame.data_url && browserImg) browserImg.src = frame.data_url;
       if (frame && frame.width > 0) { browserPageW = frame.width; browserPageH = frame.height; }
       if (browserStatus) browserStatus.textContent = '';
@@ -945,7 +1157,36 @@ export function initializeComrade() {
 
   if (browserBtn) browserBtn.addEventListener('click', function () { setBrowserOpen(!browserIsOpen); });
   if (browserHideBtn) browserHideBtn.addEventListener('click', function () { setBrowserOpen(false); });
-  if (browserShotBtn) browserShotBtn.addEventListener('click', refreshBrowser);
+  if (browserShotBtn) browserShotBtn.addEventListener('click', function () {
+    if (browserMenu) browserMenu.open = false;
+    refreshBrowser();
+  });
+  if (browserCopyBtn) browserCopyBtn.addEventListener('click', function () {
+    browserMenu.open = false;
+    var url = activeBrowserTabUrl || browserUrl.value.trim();
+    if (!url) return;
+    Promise.resolve().then(function () { return navigator.clipboard.writeText(url); }).then(function () {
+      browserStatus.textContent = 'Link copied';
+    }).catch(function () {
+      browserUrl.focus(); browserUrl.select();
+      browserStatus.textContent = 'Press Ctrl+C / ⌘C to copy the selected link';
+    });
+  });
+  document.addEventListener('click', function (event) {
+    if (browserMenu && browserMenu.open && !browserMenu.contains(event.target)) browserMenu.open = false;
+  });
+  document.addEventListener('keydown', function (event) {
+    if (event.key === 'Escape' && browserMenu && browserMenu.open) {
+      event.preventDefault(); event.stopImmediatePropagation();
+      browserMenu.open = false;
+      browserMenu.querySelector('summary').focus();
+    }
+  }, true);
+  if (browserNewTabBtn) browserNewTabBtn.addEventListener('click', createBrowserTab);
+  if (browserHomeBtn) browserHomeBtn.addEventListener('click', function () {
+    browserUrl.value = DUCKDUCKGO_HOME;
+    browserForm.requestSubmit();
+  });
   if (browserBackBtn) browserBackBtn.addEventListener('click', function () {
     invoke('browser_back', {}).then(function (r) {
       if (r && r.url && browserUrl) browserUrl.value = r.url;
@@ -976,6 +1217,27 @@ export function initializeComrade() {
       if (browserStatus) browserStatus.textContent = 'Open failed: ' + errMsg(err);
     });
   });
+
+  document.addEventListener('keydown', function (event) {
+    if (!browserIsOpen || document.getElementById('settings').hidden === false) return;
+    var modifier = event.ctrlKey || event.metaKey;
+    if (modifier && event.key.toLowerCase() === 'l') {
+      event.preventDefault(); event.stopPropagation(); browserUrl.focus(); browserUrl.select();
+    } else if (modifier && event.key.toLowerCase() === 't') {
+      event.preventDefault(); event.stopPropagation(); createBrowserTab();
+    } else if (modifier && event.key.toLowerCase() === 'w') {
+      var active = browserTabs && browserTabs.querySelector('.browser-tab.active');
+      var close = active && active.querySelector('.browser-tab-close');
+      if (close) { event.preventDefault(); event.stopPropagation(); close.click(); }
+    } else if (browserPane.contains(document.activeElement) &&
+        ((modifier && event.key.toLowerCase() === 'r') || event.key === 'F5')) {
+      event.preventDefault(); event.stopPropagation(); browserReloadBtn.click();
+    } else if (browserPane.contains(document.activeElement) && event.altKey &&
+        (event.key === 'ArrowLeft' || event.key === 'ArrowRight')) {
+      event.preventDefault(); event.stopPropagation();
+      (event.key === 'ArrowLeft' ? browserBackBtn : browserFwdBtn).click();
+    }
+  }, true);
 
   // --- Direct interaction: the view is live. Clicks, typing, and wheel
   // events on the image drive the same bundled Chromium the agent uses. ---
@@ -1018,38 +1280,39 @@ export function initializeComrade() {
   }
   function flushPointerMove() {
     if (pointerMoveTimer) { clearTimeout(pointerMoveTimer); pointerMoveTimer = null; }
+    if (browserTabBusy || !browserIsOpen) { pointerMove = null; return; }
     if (pointerMove) { var event = pointerMove; pointerMove = null; queueBrowserInput('browser_pointer', { event: event }).catch(function () {}); }
   }
   if (browserImg) {
     browserImg.addEventListener('pointerdown', function (ev) {
-      if (!browserStream.active) return;
+      if (!browserStream.active || browserTabBusy) return;
       var event = pointerPayload(ev, 'mousePressed'); if (!event) return;
       ev.preventDefault(); flushPointerMove();
       if (browserImg.setPointerCapture) browserImg.setPointerCapture(ev.pointerId);
       queueBrowserInput('browser_pointer', { event: event }).catch(function (err) { browserStatus.textContent = errMsg(err); });
     });
     browserImg.addEventListener('pointerup', function (ev) {
-      if (!browserStream.active) return;
+      if (!browserStream.active || browserTabBusy) return;
       var event = pointerPayload(ev, 'mouseReleased'); if (!event) return;
       ev.preventDefault(); flushPointerMove();
       queueBrowserInput('browser_pointer', { event: event }).catch(function (err) { browserStatus.textContent = errMsg(err); });
       browserKeys.focus();
     });
     browserImg.addEventListener('pointercancel', function (ev) {
-      if (!browserStream.active) return;
+      if (!browserStream.active || browserTabBusy) return;
       var event = pointerPayload(ev, 'mouseReleased');
       if (event) { event.buttons = 0; queueBrowserInput('browser_pointer', { event: event }).catch(function () {}); }
     });
     browserImg.addEventListener('pointermove', function (ev) {
-      if (!browserStream.active) return;
+      if (!browserStream.active || browserTabBusy) return;
       pointerMove = pointerPayload(ev, 'mouseMoved');
-      if (!pointerMoveTimer) pointerMoveTimer = setTimeout(flushPointerMove, 32);
+      if (!pointerMoveTimer) pointerMoveTimer = setTimeout(flushPointerMove, 16);
     });
     browserImg.addEventListener('contextmenu', function (ev) { if (browserStream.active) ev.preventDefault(); });
   }
 
   if (browserView) browserView.addEventListener('wheel', function (ev) {
-    if (!browserIsOpen) return;
+    if (!browserIsOpen || browserTabBusy) return;
     ev.preventDefault();
     var factor = ev.deltaMode === 1 ? 16 : ev.deltaMode === 2 ? (browserPageH || 640) : 1;
     browserWheelDebt.x += (ev.deltaX || 0) * factor;
@@ -1062,7 +1325,7 @@ export function initializeComrade() {
       var dx = Math.round(browserWheelDebt.x);
       var dy = Math.round(browserWheelDebt.y);
       browserWheelDebt.x = 0; browserWheelDebt.y = 0;
-      if (!dx && !dy) return;
+      if ((!dx && !dy) || browserTabBusy || !browserIsOpen) return;
       var request = browserStream.active
         ? queueBrowserInput('browser_pointer', { event: { type: 'mouseWheel', x: browserWheelDebt.point.x, y: browserWheelDebt.point.y, deltaX: dx, deltaY: dy, modifiers: browserWheelDebt.modifiers } })
         : queueBrowserInput('browser_scroll', { x: dx, y: dy });
@@ -1081,6 +1344,7 @@ export function initializeComrade() {
 
   if (browserKeys) {
     browserKeys.addEventListener('keydown', function (ev) {
+      if (browserTabBusy) { ev.preventDefault(); return; }
       if (ev.isComposing) return;
       var key = SPECIAL_KEYS[ev.key] || ((ev.ctrlKey || ev.metaKey || ev.altKey) && ev.key.length === 1 ? ev.key : null);
       if (!key) return;
@@ -1093,6 +1357,7 @@ export function initializeComrade() {
       var text = browserKeys.value;
       if (!text) return;
       browserKeys.value = '';
+      if (browserTabBusy) return;
       queueBrowserInput('browser_type_text', { text: text }).then(function () {
         interactRefreshSoon();
       }).catch(function (err) { if (browserStatus) browserStatus.textContent = 'Type failed: ' + errMsg(err); });
