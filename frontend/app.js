@@ -76,6 +76,8 @@ export function initializeComrade() {
   var pendingPermId = null;
   var taskStartVersion = 0;
   var messageStarting = false;
+  var pendingCodingProject = null;
+  var chatVersion = 0;
 
   // --- chat history sidebar (history.db sessions) ---
   var sidebarEl = document.getElementById('sidebar');
@@ -174,6 +176,32 @@ export function initializeComrade() {
     }
   });
 
+  // Optimistic browser open: the backend also emits the classified intent,
+  // but that round-trips through the LLM. Open the pane right away for
+  // obvious browser requests so the bundled Chromium is already installing /
+  // streaming when the first browser.* step arrives.
+  function isBrowserRequest(text) {
+    var t = ' ' + String(text || '').toLowerCase() + ' ';
+    if (t.trim().length < 2) return false;
+    if (t.indexOf('open vs code') >= 0 || t.indexOf('open vscode') >= 0 ||
+        t.indexOf('open code') >= 0 || t.indexOf('open terminal') >= 0 ||
+        t.indexOf('launch terminal') >= 0 || t.indexOf('open app') >= 0) return false;
+    if (/https?:\/\//.test(t) || t.indexOf('www.') >= 0) return true;
+    if (/\b[a-z0-9-]+\.(com|org|net|io|dev|edu|gov|co|ai|app)\b/.test(t)) return true;
+    var sites = ['youtube', 'google', 'github', 'duckduckgo', 'wikipedia', 'reddit',
+      'stackoverflow', 'twitter', 'facebook', 'instagram', 'linkedin', 'website', 'webpage', 'browser'];
+    for (var i = 0; i < sites.length; i++) {
+      if (t.indexOf(sites[i]) >= 0) return true;
+    }
+    if (/\b(search|browse|surf|research|summariz|navigate|lookup|look up|go to)\b/.test(t)) return true;
+    if (/\b(open|launch|visit|check)\b/.test(t) &&
+        /\b(page|site|link|url|tab|notifications|pull request)\b/.test(t)) return true;
+    if (/^\s*(open|launch|go to|visit)\b/.test(t.trim()) && t.trim().split(/\s+/).length <= 6 &&
+        t.indexOf('file') < 0 && t.indexOf('terminal') < 0 && t.indexOf('code') < 0 &&
+        t.indexOf('docker') < 0) return true;
+    return false;
+  }
+
   form.addEventListener('submit', function (ev) {
     ev.preventDefault();
     var text = input.value.trim();
@@ -183,15 +211,22 @@ export function initializeComrade() {
     addMessage('user', text);
     resetTaskPanel(text);
     currentResponseEl = null;
-    invoke('send_message', { text: text, sessionId: currentSessionId, model: modelPick ? modelPick.value : null }).then(function (res) {
+    if (isBrowserRequest(text)) onBrowserActivity();
+    var requestedProject = pendingCodingProject;
+    var sentChatVersion = chatVersion;
+    invoke('send_message', { text: text, sessionId: currentSessionId, model: modelPick ? modelPick.value : null, projectDir: requestedProject }).then(function (res) {
       messageStarting = false;
-      if (!res) return;
-      if (res.session_id) { setSession(res.session_id); refreshChatList(); }
+      if (sentChatVersion !== chatVersion || !res) return;
+      if (res.session_id) {
+        if (pendingCodingProject === requestedProject) pendingCodingProject = null;
+        setSession(res.session_id); refreshChatList();
+      }
       if (res.status === 'done' || res.status === 'running') return;
       setState('idle');
       if (res.error) addMessage('comrade', 'Error: ' + res.error);
     }).catch(function (err) {
       messageStarting = false;
+      if (sentChatVersion !== chatVersion) return;
       setState('error');
       addMessage('comrade', 'Error: ' + (err && err.message ? err.message : err));
     });
@@ -209,6 +244,15 @@ export function initializeComrade() {
     setState('idle');
     greeting.textContent = 'Cancelled.';
     subtitle.textContent = 'How can I help you?';
+  });
+
+  window.addEventListener('comrade:orchestration-request', function (event) {
+    var request = event.detail;
+    if (!request || typeof request.text !== 'string' || !request.text.trim() || typeof request.projectDir !== 'string' || !request.projectDir) return;
+    pendingCodingProject = request.projectDir;
+    input.value = request.text.trim();
+    window.dispatchEvent(new Event('comrade:show-chat'));
+    if (!messageStarting) form.requestSubmit();
   });
 
   // --- local voice sessions (backend mic/VAD/STT/TTS; no audio in the UI) ---
@@ -330,13 +374,19 @@ export function initializeComrade() {
         greeting.textContent = 'Hey, Comrade.';
         subtitle.textContent = 'How can I help you?';
       }
+    } else if (ev.type === 'intent') {
+      // Backend classified the request before any tool runs: open the
+      // in-app browser pane immediately for browser work instead of waiting
+      // for the first browser.* step (LLM + approvals can take seconds).
+      if (ev.intent === 'BROWSER' || ev.intent === 'RESEARCH') onBrowserActivity();
     } else if (ev.type === 'transcript') {
       addMessage('user', ev.transcript);
       resetTaskPanel(ev.transcript);
       currentResponseEl = null;
+      if (isBrowserRequest(ev.transcript)) onBrowserActivity();
     } else if (ev.type === 'step') {
       upsertStep(ev.label, ev.status, ev.detail);
-      if (ev.label && ev.label.indexOf('browser.') === 0) onBrowserActivity();
+      if (ev.label && ev.label.indexOf('browser.') === 0 && ev.label.indexOf('browser.close') !== 0) onBrowserActivity();
     } else if (ev.type === 'token') {
       if (!currentResponseEl) currentResponseEl = addMessage('comrade', '');
       currentResponseEl.textContent += ev.token;
@@ -548,7 +598,8 @@ export function initializeComrade() {
   }
 
   function toggleSidebar(force) {
-    var show = typeof force === 'boolean' ? force : sidebarEl.hidden;
+    var show = typeof force === 'boolean' ? force : browserPrimary ? !document.body.classList.contains('browser-sidebar-open') : sidebarEl.hidden;
+    if (browserPrimary) document.body.classList.toggle('browser-sidebar-open', show);
     sidebarEl.hidden = !show;
     document.body.classList.toggle('sidebar-open', show);
   }
@@ -560,7 +611,14 @@ export function initializeComrade() {
     currentResponseEl = null;
   }
 
+  window.addEventListener('comrade:show-chat', function () {
+    if (browserPrimary) revealChat(true, true);
+  });
+
   function newChat() {
+    chatVersion++;
+    pendingCodingProject = null;
+    window.dispatchEvent(new Event('comrade:show-chat'));
     setSession(null);
     clearMessages();
     taskPanel.hidden = true;
@@ -611,6 +669,9 @@ export function initializeComrade() {
   }
 
   function loadSession(id, title) {
+    chatVersion++;
+    pendingCodingProject = null;
+    window.dispatchEvent(new Event('comrade:show-chat'));
     invoke('history_get', { sessionId: id }).then(function (msgs) {
       setSession(id);
       clearMessages();
@@ -696,6 +757,7 @@ export function initializeComrade() {
     }, 220);
   }
   function setBrowserPrimary(primary) {
+    if (browserPrimary !== !!primary) document.body.classList.remove('browser-sidebar-open');
     browserPrimary = !!primary;
     if (browserPrimary && !browserIsOpen) setBrowserOpen(true);
     chatRevealed = false;
@@ -752,6 +814,7 @@ export function initializeComrade() {
     browserExpandBtn.focus();
   });
   document.addEventListener('keydown', function (event) {
+    if (document.body.classList.contains('orch-open')) return;
     if (event.key === 'F11' && browserIsOpen) {
       event.preventDefault();
       if (!windowFullscreen) setBrowserPrimary(true);
@@ -1176,6 +1239,7 @@ export function initializeComrade() {
     if (browserMenu && browserMenu.open && !browserMenu.contains(event.target)) browserMenu.open = false;
   });
   document.addEventListener('keydown', function (event) {
+    if (document.body.classList.contains('orch-open')) return;
     if (event.key === 'Escape' && browserMenu && browserMenu.open) {
       event.preventDefault(); event.stopImmediatePropagation();
       browserMenu.open = false;
@@ -1219,6 +1283,7 @@ export function initializeComrade() {
   });
 
   document.addEventListener('keydown', function (event) {
+    if (document.body.classList.contains('orch-open')) return;
     if (!browserIsOpen || document.getElementById('settings').hidden === false) return;
     var modifier = event.ctrlKey || event.metaKey;
     if (modifier && event.key.toLowerCase() === 'l') {

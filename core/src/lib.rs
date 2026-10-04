@@ -6,6 +6,7 @@ pub mod intent;
 pub mod llm;
 pub mod logger;
 pub mod memory;
+pub mod orchestration;
 pub mod paths;
 pub mod permissions;
 pub mod prefs;

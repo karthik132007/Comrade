@@ -86,7 +86,10 @@
     function copy(value) { return JSON.parse(JSON.stringify(value)); }
     globalThis.document = document;
     globalThis.requestAnimationFrame = function () {};
+    var windowEvents = new Element('window');
     globalThis.window = {
+      addEventListener: windowEvents.addEventListener.bind(windowEvents),
+      dispatchEvent: function (event) { windowEvents.dispatch(event.type, event); return true; },
       localStorage: {
         getItem: function (k) { return Object.prototype.hasOwnProperty.call(store, k) ? store[k] : null; },
         setItem: function (k, v) { store[k] = String(v); },

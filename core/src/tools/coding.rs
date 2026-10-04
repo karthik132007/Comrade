@@ -1,16 +1,14 @@
 /**
- * Coding specialist router. CODING tasks go to the user's default enabled
+ * Local coding specialist router. CODING tasks go to the user's default enabled
  * coding agent (opencode, claude, codex, copilot, qwen, …) — picked in
  * onboarding/Settings, stored in comrade.conf. Enable-all is the default:
  * every detected agent is usable unless unchecked.
  */
 use std::future::Future;
-use std::path::Path;
 use std::pin::Pin;
-use std::time::Duration;
 
 use super::types::{Risk, Tool, ToolContext, ToolResult};
-use crate::prefs::{coding_agent_candidates, detect_coding_agents, CodingAgentInfo};
+use crate::prefs::{coding_agent_candidates, CodingAgentInfo};
 
 pub struct ResolvedAgent {
     pub id: String,
@@ -34,7 +32,9 @@ pub fn resolve_agent(
         enabled.to_vec()
     };
     let find = |id: &str| -> Option<&CodingAgentInfo> {
-        detected.iter().find(|d| d.id == id && enabled_set.iter().any(|e| e == id))
+        detected
+            .iter()
+            .find(|d| d.id == id && enabled_set.iter().any(|e| e == id))
     };
 
     if let Some(req) = requested.map(str::trim).filter(|s| !s.is_empty()) {
@@ -63,8 +63,7 @@ pub fn resolve_agent(
                     name: info.name.clone(),
                     bin: info.bin.clone(),
                 });
-            }
-            // unreachable: find above covers all shapes, but keep exhaustive clarity
+            } // unreachable: find above covers all shapes, but keep exhaustive clarity
         }
     }
 
@@ -94,88 +93,6 @@ pub fn resolve_agent(
     Err("No coding agents available: none installed, or all are disabled in Settings.".to_string())
 }
 
-fn build_argv(agent_id: &str, task: &str) -> Vec<String> {
-    match agent_id {
-        "claude" => vec!["-p".into(), task.into(), "--output-format".into(), "json".into()],
-        "codex" => vec!["exec".into(), task.into()],
-        "copilot" => vec!["-p".into(), task.into(), "-s".into()],
-        "qwen" => vec![task.into(), "-o".into(), "json".into()],
-        _ => vec!["run".into(), "--format".into(), "json".into(), task.into()], // opencode
-    }
-}
-
-/// Pull human-readable text out of the various JSON envelopes agents emit.
-fn extract_text(v: &serde_json::Value) -> Option<String> {
-    match v {
-        serde_json::Value::String(s) if !s.trim().is_empty() => Some(s.clone()),
-        serde_json::Value::Object(m) => {
-            for k in ["result", "response", "text", "output", "message"] {
-                if let Some(s) = m.get(k).and_then(extract_text) {
-                    return Some(s);
-                }
-            }
-            if let Some(arr) = m.get("content").and_then(|c| c.as_array()) {
-                let joined = arr.iter().filter_map(extract_text).collect::<Vec<_>>().join("\n");
-                if !joined.trim().is_empty() {
-                    return Some(joined);
-                }
-            }
-            None
-        }
-        serde_json::Value::Array(a) => {
-            let joined = a.iter().filter_map(extract_text).collect::<Vec<_>>().join("\n");
-            if joined.trim().is_empty() {
-                None
-            } else {
-                Some(joined)
-            }
-        }
-        _ => None,
-    }
-}
-
-fn parse_output(stdout: &str) -> String {
-    let trimmed = stdout.trim();
-    if trimmed.is_empty() {
-        return "(agent returned no output)".to_string();
-    }
-    if let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) {
-        if let Some(text) = extract_text(&json) {
-            return text.chars().take(50_000).collect();
-        }
-    }
-    trimmed.chars().take(50_000).collect()
-}
-
-pub async fn run_coding_task(
-    agent: &ResolvedAgent,
-    task: &str,
-    cwd: &Path,
-) -> Result<String, String> {
-    let argv = build_argv(&agent.id, task);
-    let out = tokio::time::timeout(
-        Duration::from_secs(600),
-        tokio::process::Command::new(&agent.bin)
-            .args(&argv)
-            .current_dir(cwd)
-            .stdin(std::process::Stdio::null())
-            .output(),
-    )
-    .await
-    .map_err(|_| format!("{} task timed out after 10 minutes.", agent.name))?
-    .map_err(|e| format!("Failed to spawn {}: {e}", agent.name))?;
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    if !out.status.success() {
-        let stderr: String = String::from_utf8_lossy(&out.stderr).chars().take(800).collect();
-        return Err(format!(
-            "{} exited with {}: {stderr}",
-            agent.name,
-            out.status.code().unwrap_or(-1)
-        ));
-    }
-    Ok(parse_output(&stdout))
-}
-
 pub struct CodingTool;
 
 impl Tool for CodingTool {
@@ -184,7 +101,7 @@ impl Tool for CodingTool {
     }
 
     fn description(&self) -> &'static str {
-        "Delegate a CODING task to the user's enabled coding agent (opencode, claude, codex, copilot, qwen — default picked in Settings). Pass a precise task description plus optional agent id. Requires user approval."
+        "Start a local coding agent in the selected project using its existing login and native permissions. Requires approval: edits affect the project directly. Returns a run id immediately; monitor with coding.runStatus. Use coding.startPlan for multiple agents/dependencies."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -193,7 +110,8 @@ impl Tool for CodingTool {
             "properties": {
                 "task": { "type": "string", "description": "Precise coding task for the agent" },
                 "workingDir": { "type": "string", "description": "Repo dir (default: agent cwd)" },
-                "agent": { "type": "string", "description": "Agent id override, e.g. claude (default: Settings default)" },
+                "agent": { "type": "string", "description": "Agent id override (default: Settings default)" },
+                "model": { "type": "string" },
             },
             "required": ["task"],
         })
@@ -209,30 +127,44 @@ impl Tool for CodingTool {
         ctx: &'a ToolContext,
     ) -> Pin<Box<dyn Future<Output = ToolResult> + Send + 'a>> {
         Box::pin(async move {
-            let task = args.get("task").and_then(|t| t.as_str()).unwrap_or("").trim();
+            let task = args
+                .get("task")
+                .and_then(|t| t.as_str())
+                .unwrap_or("")
+                .trim();
             if task.is_empty() {
                 return ToolResult::fail("EMPTY_TASK", "No coding task provided.");
             }
-            let prefs = crate::prefs::load();
-            let detected = detect_coding_agents();
-            let requested = args.get("agent").and_then(|a| a.as_str());
-            let agent = match resolve_agent(&prefs.coding.agents, &prefs.coding.default, &detected, requested) {
-                Ok(a) => a,
-                Err(e) => return ToolResult::fail("NO_CODING_AGENT", e),
+            let plan = crate::orchestration::Plan {
+                title: task.chars().take(100).collect(),
+                working_dir: args
+                    .get("workingDir")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| ctx.cwd.to_string_lossy().into_owned()),
+                tasks: vec![crate::orchestration::TaskSpec {
+                    id: "task-1".into(),
+                    task: task.into(),
+                    agent: args
+                        .get("agent")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .into(),
+                    model: args
+                        .get("model")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .into(),
+                    depends_on: vec![],
+                }],
+                max_parallel: 1,
+                timeout_secs: 600,
             };
-            let cwd = args
-                .get("workingDir")
-                .and_then(|w| w.as_str())
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| ctx.cwd.clone());
-            match run_coding_task(&agent, task, &cwd).await {
-                Ok(output) => ToolResult::ok(serde_json::json!({
-                    "task": task,
-                    "cwd": cwd.to_string_lossy(),
-                    "agent": agent.id,
-                    "output": output,
-                })),
-                Err(e) => ToolResult::fail("CODING_FAILED", e.to_string()),
+            match crate::orchestration::global().start(plan).await {
+                Ok(run) => ToolResult::ok(
+                    serde_json::json!({"run_id":run.id,"status":run.status,"message":"Local job queued. Monitor coding.runStatus or Comrade Orch."}),
+                ),
+                Err(e) => ToolResult::fail("CODING_FAILED", e),
             }
         })
     }
@@ -278,16 +210,5 @@ mod tests {
         assert!(resolve_agent(&[], "", &d, Some("antigravity")).is_err());
         assert!(resolve_agent(&[], "", &[], None).is_err()); // nothing installed
         assert!(resolve_agent(&["claude".into()], "", &d, None).is_err()); // enabled but absent
-    }
-
-    #[test]
-    fn output_parsing_covers_envelopes() {
-        assert_eq!(parse_output(r#"{"result": "done!"}"#), "done!");
-        assert_eq!(parse_output(r#"{"response": "hi"}"#), "hi");
-        assert_eq!(
-            parse_output(r#"{"content": [{"text": "a"}, {"text": "b"}]}"#),
-            "a\nb"
-        );
-        assert_eq!(parse_output("plain text"), "plain text");
     }
 }

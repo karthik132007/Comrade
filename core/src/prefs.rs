@@ -875,11 +875,19 @@ mod tests {
 
 // ---------- coding agent detection ----------
 
-fn find_on_path(name: &str) -> Option<PathBuf> {
+pub(crate) fn find_on_path(name: &str) -> Option<PathBuf> {
     for dir in std::env::split_paths(&std::env::var_os("PATH")?) {
         let candidate = dir.join(name);
         if candidate.is_file() {
-            return Some(candidate);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if candidate.metadata().ok()?.permissions().mode() & 0o111 == 0 {
+                    continue;
+                }
+            }
+            // Absolute argv paths remain valid after the worker changes directory.
+            return candidate.canonicalize().ok();
         }
     }
     None
@@ -912,6 +920,7 @@ pub fn coding_agent_candidates() -> Vec<AgentCandidate> {
         AgentCandidate { id: "codex", name: "Codex", bins: &["codex"], probe_version: true, exec_supported: true },
         AgentCandidate { id: "copilot", name: "Copilot CLI", bins: &["copilot"], probe_version: true, exec_supported: true },
         AgentCandidate { id: "qwen", name: "Qwen Code", bins: &["qwen"], probe_version: true, exec_supported: true },
+        AgentCandidate { id: "hermes", name: "Hermes", bins: &["hermes"], probe_version: true, exec_supported: true },
         AgentCandidate { id: "kimi", name: "Kimi", bins: &["kimi", "kimi-cli"], probe_version: true, exec_supported: false },
         AgentCandidate { id: "deepseek", name: "DeepSeek harness", bins: &["deepseek-cli", "dsk"], probe_version: true, exec_supported: false },
         AgentCandidate { id: "antigravity", name: "Antigravity", bins: &["antigravity"], probe_version: false, exec_supported: false },

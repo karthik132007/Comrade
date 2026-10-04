@@ -44,6 +44,7 @@ const ALWAYS_DANGEROUS_TOOLS: &[&str] = &[
     "filesystem.write",
     "filesystem.create",
     "coding.executeTask",
+    "coding.startPlan",
 ];
 
 pub fn tool_risk(tool_name: &str, args: &serde_json::Value) -> Risk {
@@ -58,13 +59,17 @@ pub fn tool_risk(tool_name: &str, args: &serde_json::Value) -> Risk {
 }
 
 pub fn describe_tool_call(tool_name: &str, args: &serde_json::Value) -> String {
+    if tool_name == "coding.startPlan" || tool_name == "coding.executeTask" {
+        return format!("Start local coding agents in this project. Agents may edit files directly using their existing logins and permissions.\n{}",
+            serde_json::to_string_pretty(args).unwrap_or_default());
+    }
     let arg_str = match args.as_object() {
         Some(map) => map
             .iter()
             .map(|(k, v)| {
                 let mut s = v.to_string();
-                if s.len() > 120 {
-                    s.truncate(120);
+                if s.chars().count() > 120 {
+                    s = s.chars().take(120).collect();
                 }
                 format!("{k}={s}")
             })

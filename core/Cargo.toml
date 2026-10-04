@@ -23,3 +23,6 @@ sha2 = "0.10"
 tar = "0.4"
 bzip2 = "0.4"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

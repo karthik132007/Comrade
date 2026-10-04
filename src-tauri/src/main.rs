@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use comrade_core::agent::{Agent, AgentCallbacks, AgentDeps};
+use comrade_core::agent::{Agent, AgentCallbacks, AgentDeps, TaskContext};
 use comrade_core::config;
 use comrade_core::llm::factory::{create_backends, embedding_dim};
 use comrade_core::llm::Embedder;
@@ -143,6 +143,10 @@ impl AgentCallbacks for Callbacks {
         emit(&self.app, serde_json::json!({ "type": "state", "state": state }));
     }
 
+    fn on_intent(&self, intent: &str) {
+        emit(&self.app, serde_json::json!({ "type": "intent", "intent": intent }));
+    }
+
     fn on_step(&self, label: &str, status: &str, detail: Option<&str>) {
         emit(
             &self.app,
@@ -175,6 +179,10 @@ struct VoiceAgentCallbacks {
 
 impl AgentCallbacks for VoiceAgentCallbacks {
     fn on_ui_state(&self, _state: &str) {}
+
+    fn on_intent(&self, intent: &str) {
+        emit(&self.app, serde_json::json!({ "type": "intent", "intent": intent }));
+    }
 
     fn on_step(&self, label: &str, status: &str, detail: Option<&str>) {
         emit(
@@ -219,7 +227,10 @@ impl AgentRunner for VoiceAgentRunner {
                 cancel: hooks.cancel.clone(),
             };
             let (task, new_sid) =
-                execute_task(&self.app, &self.shared, &transcript, sid, None, &cb).await;
+                match execute_task(&self.app, &self.shared, &transcript, sid, None, None, &cb).await {
+                    Ok(result) => result,
+                    Err(error) => return AgentOutcome { text: error, ok: false },
+                };
             *self.session.lock().unwrap() = Some(new_sid);
             let ok = task.status == TaskStatus::Done;
             let text = task
@@ -296,15 +307,6 @@ fn ensure_webkit_paths() {
 #[cfg(not(target_os = "linux"))]
 fn ensure_webkit_paths() {}
 
-fn create_session(shared: &Shared, text: &str) -> String {
-    shared
-        .history
-        .lock()
-        .ok()
-        .and_then(|h| h.create_session(&title_for(text)).ok())
-        .unwrap_or_else(|| format!("ses-fallback-{}", now_ms()))
-}
-
 async fn persist_turn(shared: &Shared, sid: &str, user_text: &str, task: &TaskState) {
     let Ok(h) = shared.history.lock() else {
         return;
@@ -360,23 +362,27 @@ async fn execute_task<C: AgentCallbacks>(
     text: &str,
     session_id: Option<String>,
     model: Option<String>,
+    project_dir: Option<String>,
     cb: &C,
-) -> (TaskState, String) {
+) -> Result<(TaskState, String), String> {
     log(Level::Info, "USER", &text.chars().take(300).collect::<String>(), None);
-    // Resolve the chat session, creating one for the first message.
-    let wanted = session_id.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-    let sid = match wanted {
-        Some(s) => {
-            let exists = shared.history.lock().map(|h| h.session_exists(&s)).unwrap_or(false);
-            if exists {
-                s
-            } else {
-                create_session(shared, text)
-            }
-        }
-        None => create_session(shared, text),
+    // Resolve and read this session before appending the current turn.
+    let project = project_dir.map(|p| {
+        let path = PathBuf::from(p.trim());
+        if !path.is_absolute() || !path.is_dir() { return Err("Choose an existing absolute project directory.".to_string()); }
+        path.canonicalize().map(|p| p.to_string_lossy().into_owned()).map_err(|e| e.to_string())
+    }).transpose()?;
+    let (sid, context) = {
+        let history = shared.history.lock().map_err(|_| "Chat history is unavailable.".to_string())?;
+        let wanted = session_id.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let sid = history.session_for_request(wanted, project.as_deref(), &title_for(text)).map_err(|e| format!("Cannot open this chat: {e}"))?;
+        let context = TaskContext {
+            conversation: history.conversation_context(&sid).map_err(|e| format!("Cannot read chat context: {e}"))?,
+            coding_project: history.project_directory(&sid).map(PathBuf::from),
+        };
+        (sid, context)
     };
-    let task = build_live_agent(shared, model).run_task(text, cb).await;
+    let task = build_live_agent(shared, model).run_task_with_context(text, &context, cb).await;
     emit(app, serde_json::json!({ "type": "state", "state": "idle" }));
     emit(
         app,
@@ -396,7 +402,7 @@ async fn execute_task<C: AgentCallbacks>(
         })),
     );
     persist_turn(shared, &sid, text, &task).await;
-    (task, sid)
+    Ok((task, sid))
 }
 
 #[derive(Serialize)]
@@ -414,6 +420,7 @@ async fn send_message(
     text: String,
     session_id: Option<String>,
     model: Option<String>,
+    project_dir: Option<String>,
 ) -> Result<TaskSummary, String> {
     let text = text.trim().to_string();
     if text.is_empty() {
@@ -426,7 +433,7 @@ async fn send_message(
         .map_err(|_| "A task is already running. Cancel it first.".to_string())?;
     shared.cancel.store(false, Ordering::SeqCst);
     let cb = Callbacks { app: app.clone(), shared: shared.clone() };
-    let (task, sid) = execute_task(&app, &shared, &text, session_id, model, &cb).await;
+    let (task, sid) = execute_task(&app, &shared, &text, session_id, model, project_dir, &cb).await?;
     Ok(TaskSummary {
         status: task.status.as_str().to_string(),
         result: task.result,
@@ -813,9 +820,53 @@ async fn server_models() -> Result<serde_json::Value, String> {
 /// Coding agents installed on this machine (for onboarding + Settings).
 #[tauri::command]
 async fn system_coding_agents() -> Result<Vec<comrade_core::prefs::CodingAgentInfo>, String> {
-    Ok(comrade_core::prefs::detect_coding_agents())
+    tokio::task::spawn_blocking(comrade_core::prefs::detect_coding_agents).await.map_err(|e| e.to_string())
 }
 
+#[derive(Serialize)]
+struct CodingProject {
+    path: String,
+}
+
+/// Select an existing project through the native desktop folder picker.
+#[tauri::command]
+async fn coding_pick_project(app: tauri::AppHandle, window: tauri::WebviewWindow, initial_dir: Option<String>) -> Result<Option<CodingProject>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let mut picker = app.dialog().file().set_title("Choose a project for Comrade Orch").set_parent(&window);
+    if let Some(dir) = initial_dir.filter(|p| std::path::Path::new(p).is_absolute() && std::path::Path::new(p).is_dir()) {
+        picker = picker.set_directory(dir);
+    }
+    picker.pick_folder(move |folder| { let _ = sender.send(folder); });
+    let Some(folder) = receiver.await.map_err(|_| "Project picker closed unexpectedly.".to_string())? else { return Ok(None); };
+    let path = folder.into_path().map_err(|e| e.to_string())?.canonicalize().map_err(|e| format!("Cannot open this project directory: {e}"))?;
+    if !path.is_dir() { return Err("Choose an existing project directory.".into()); }
+    Ok(Some(CodingProject { path: path.to_string_lossy().into_owned() }))
+}
+
+#[tauri::command]
+async fn coding_runtime() -> comrade_core::orchestration::RuntimeStatus {
+    comrade_core::orchestration::global().runtime().await
+}
+#[tauri::command]
+fn coding_runs() -> Vec<comrade_core::orchestration::Run> {
+    comrade_core::orchestration::global().list().into_iter().map(|mut r| {
+        for job in &mut r.jobs { job.log.clear(); }
+        r
+    }).collect()
+}
+#[tauri::command]
+fn coding_run(run_id: String) -> Result<comrade_core::orchestration::Run, String> {
+    comrade_core::orchestration::global().get(&run_id)
+}
+#[tauri::command]
+async fn coding_start(plan: comrade_core::orchestration::Plan) -> Result<comrade_core::orchestration::Run, String> {
+    comrade_core::orchestration::global().start(plan).await
+}
+#[tauri::command]
+async fn coding_cancel(run_id: String, job_id: Option<String>) -> Result<comrade_core::orchestration::Run, String> {
+    comrade_core::orchestration::global().cancel(&run_id, job_id.as_deref()).await
+}
 /// Navigate Comrade's own in-app browser (bundled Chromium) to a URL.
 /// Used by the in-app browser pane's address bar — same tab the agent drives.
 #[tauri::command]
@@ -1154,6 +1205,7 @@ async fn history_rename(
 fn main() {
     ensure_webkit_paths();
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let root = config::find_project_root();
             let cfg = config::load_config(&root);
@@ -1377,6 +1429,12 @@ fn main() {
             history_delete,
             history_rename,
             system_coding_agents,
+            coding_pick_project,
+            coding_runtime,
+            coding_runs,
+            coding_run,
+            coding_start,
+            coding_cancel,
             browser_open,
             browser_tabs,
             browser_tab_new,

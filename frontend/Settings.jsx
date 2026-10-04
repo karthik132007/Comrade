@@ -9,6 +9,9 @@ import {
   X,
   Check,
 } from "lucide-react";
+import mikuBackdrop from "./miku.jpg";
+
+export const MIKU_BG = mikuBackdrop;
 
 const tabs = [
   [
@@ -58,20 +61,117 @@ const themes = [
   { id: "mocha", name: "Mocha", description: "Cozy & dark" },
   { id: "frappe", name: "Frappé", description: "Soft & muted" },
   { id: "latte", name: "Latte", description: "Fresh & light" },
+  { id: "tokyo-night", name: "Tokyo Night", description: "Neon & dark" },
+  {
+    id: "high-contrast",
+    name: "High Contrast",
+    description: "Bold & clear",
+  },
+  { id: "github", name: "GitHub", description: "Clean & light" },
+  { id: "miku", name: "Miku", description: "Teal & electric" },
 ];
 export function getTheme() {
   try {
     const saved = localStorage.getItem("comrade-theme");
+    if (saved === "manga" || saved === "anime") return "miku";
     return themes.some((t) => t.id === saved) ? saved : "mocha";
   } catch {
     return "mocha";
   }
 }
 
+const BG_IMAGE_KEY = "comrade-bg-image";
+const BG_OPACITY_KEY = "comrade-bg-opacity";
+const BG_DEFAULT_OPACITY = 0.35;
+
+export function getBackgroundImage() {
+  try {
+    const saved = localStorage.getItem(BG_IMAGE_KEY);
+    return saved || null;
+  } catch {
+    return null;
+  }
+}
+
+export function getBackgroundOpacity() {
+  try {
+    const saved = parseFloat(localStorage.getItem(BG_OPACITY_KEY));
+    if (Number.isFinite(saved)) return Math.min(1, Math.max(0, saved));
+  } catch {
+    /* Storage can be unavailable. */
+  }
+  return BG_DEFAULT_OPACITY;
+}
+
+export function applyBackground(image, opacity) {
+  try {
+    const root = document.documentElement;
+    const value =
+      typeof opacity === "number" && Number.isFinite(opacity)
+        ? Math.min(1, Math.max(0, opacity))
+        : BG_DEFAULT_OPACITY;
+    if (image) {
+      const safe = String(image).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+      root.style.setProperty("--app-bg-image", `url("${safe}")`);
+      root.style.setProperty("--app-bg-opacity", String(value));
+      if (document.body) document.body.classList.add("has-custom-bg");
+    } else {
+      root.style.removeProperty("--app-bg-image");
+      root.style.removeProperty("--app-bg-opacity");
+      if (document.body) document.body.classList.remove("has-custom-bg");
+    }
+  } catch {
+    /* Background is decorative; never break startup. */
+  }
+}
+
+function readFileAsDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(new Error("read failed"));
+    reader.readAsDataURL(file);
+  });
+}
+
+function loadImage(src) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error("decode failed"));
+    img.src = src;
+  });
+}
+
+async function processImageFile(file) {
+  const raw = await readFileAsDataUrl(file);
+  if (typeof raw !== "string") throw new Error("unreadable");
+  if (raw.length < 2_000_000) return raw;
+  const img = await loadImage(raw);
+  const width = img.naturalWidth || img.width;
+  const height = img.naturalHeight || img.height;
+  const max = 1920;
+  const scale = Math.min(1, max / Math.max(width, height));
+  if (scale >= 1) return raw;
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.round(width * scale);
+  canvas.height = Math.round(height * scale);
+  const ctx = canvas.getContext("2d");
+  ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+  return canvas.toDataURL("image/jpeg", 0.82);
+}
+
 export default function Settings() {
   const [open, setOpen] = useState(false);
   const [tab, setTab] = useState("appearance");
   const [theme, setTheme] = useState(getTheme);
+  const [bgImage, setBgImage] = useState(getBackgroundImage);
+  const [bgOpacity, setBgOpacity] = useState(getBackgroundOpacity);
+  const [bgUrlDraft, setBgUrlDraft] = useState(() => {
+    const current = getBackgroundImage();
+    return current && !current.startsWith("data:") ? current : "";
+  });
+  const [bgError, setBgError] = useState("");
   const dialog = useRef(null);
   const previousFocus = useRef(null);
   useEffect(() => {
@@ -87,6 +187,16 @@ export default function Settings() {
       /* Storage can be unavailable. */
     }
   }, [theme]);
+  useEffect(() => {
+    applyBackground(bgImage || (theme === "miku" ? MIKU_BG : null), bgOpacity);
+    try {
+      if (bgImage) localStorage.setItem(BG_IMAGE_KEY, bgImage);
+      else localStorage.removeItem(BG_IMAGE_KEY);
+      localStorage.setItem(BG_OPACITY_KEY, String(bgOpacity));
+    } catch {
+      setBgError("Background applied, but it could not be saved.");
+    }
+  }, [bgImage, bgOpacity, theme]);
   useEffect(() => {
     if (!open) return;
     previousFocus.current = document.activeElement;
@@ -136,6 +246,41 @@ export default function Settings() {
     };
   }, [open]);
   const selected = tabs.find((t) => t[0] === tab);
+  const handleBgFile = async (event) => {
+    const file = event.target.files && event.target.files[0];
+    event.target.value = "";
+    if (!file) return;
+    if (!file.type.startsWith("image/")) {
+      setBgError("Please choose an image file.");
+      return;
+    }
+    if (file.size > 12_000_000) {
+      setBgError("That image is too large (max ~12MB).");
+      return;
+    }
+    try {
+      setBgError("");
+      setBgImage(await processImageFile(file));
+    } catch {
+      setBgError("Could not read that image.");
+    }
+  };
+  const handleBgUrlApply = () => {
+    const value = bgUrlDraft.trim();
+    if (!value) return;
+    if (!/^https?:\/\/.+/i.test(value) && !value.startsWith("data:image/")) {
+      setBgError("Use an http(s) image URL.");
+      return;
+    }
+    setBgError("");
+    setBgImage(value);
+  };
+  const clearBgImage = () => {
+    setBgImage(null);
+    setBgUrlDraft("");
+    setBgError("");
+  };
+  const effectiveBg = bgImage || (theme === "miku" ? MIKU_BG : null);
   return (
     <div
       id="settings"
@@ -223,9 +368,89 @@ export default function Settings() {
                   </button>
                 ))}
               </div>
+              <div className="setting-group bg-group">
+                <h4>Background image</h4>
+                <p className="muted">
+                  Add a personal backdrop behind the workspace. Opacity
+                  controls how visible it is.
+                </p>
+                <div className="bg-preview" aria-live="polite">
+                  {effectiveBg ? (
+                    <img src={effectiveBg} alt="Background preview" />
+                  ) : (
+                    <span>No background — theme color only.</span>
+                  )}
+                </div>
+                <div className="row">
+                  <label className="muted" htmlFor="bg-file">
+                    Image file
+                  </label>
+                  <input
+                    id="bg-file"
+                    type="file"
+                    accept="image/*"
+                    onChange={handleBgFile}
+                  />
+                  {bgImage && (
+                    <button type="button" onClick={clearBgImage}>
+                      Remove
+                    </button>
+                  )}
+                </div>
+                <div className="bg-url-row">
+                  <input
+                    id="bg-url"
+                    type="url"
+                    placeholder="Or paste an image URL, https://…"
+                    value={bgUrlDraft}
+                    onChange={(event) => setBgUrlDraft(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") {
+                        event.preventDefault();
+                        handleBgUrlApply();
+                      }
+                    }}
+                    autoComplete="off"
+                    spellCheck="false"
+                  />
+                  <button type="button" onClick={handleBgUrlApply}>
+                    Apply
+                  </button>
+                </div>
+                <div className="row">
+                  <label className="muted" htmlFor="bg-opacity">
+                    Opacity{" "}
+                    <span id="bg-opacity-val">
+                      {Math.round(bgOpacity * 100)}%
+                    </span>
+                  </label>
+                  <input
+                    id="bg-opacity"
+                    type="range"
+                    min="0"
+                    max="100"
+                    step="1"
+                    value={Math.round(bgOpacity * 100)}
+                    onChange={(event) =>
+                      setBgOpacity(Number(event.target.value) / 100)
+                    }
+                    disabled={!effectiveBg}
+                  />
+                </div>
+                {theme === "miku" && !bgImage && (
+                  <p className="muted">
+                    Miku brings her own backdrop — upload your own above to
+                    replace it.
+                  </p>
+                )}
+                {bgError && (
+                  <div className="muted" role="status">
+                    {bgError}
+                  </div>
+                )}
+              </div>
               <p className="setting-note">
-                Catppuccin colors. Theme changes are saved automatically on this
-                device.
+                Theme changes are saved automatically on this device.
               </p>
               <div className="info-card">
                 <Palette size={20} />

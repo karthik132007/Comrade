@@ -38,6 +38,7 @@ Windows:      %APPDATA%/comrade-agent
 
 comrade-agent/
   comrade.conf          preferences (in-app browser pane, voice, coding agents)
+  orchestration/       coding runs, task status and agent logs
   comrade-memory.db   SQLite vector memory (auto-moved from the old
                       ~/.local/share/com.comrade.desktop/ on first run)
   history.db          chat sessions + transcripts (☰ sidebar: browse, reopen, delete)
@@ -54,7 +55,7 @@ Flow: UI → `send_message`/`voice_input` → classify intent → agent loop
 (LLM → permission check → tool → verify) → streamed events → transcript saved
 to history, facts distilled to memory → optional TTS reply.
 
-Dangerous actions (writes, clicks, `sudo`/`rm -rf`/`git push`, OpenCode tasks)
+Dangerous actions (writes, clicks, `sudo`/`rm -rf`/`git push`, coding plans)
 raise a modal approval; deny-by-default on 30s timeout.
 
 ## Setup
@@ -114,9 +115,12 @@ Useful commands: `cargo check --workspace`, `cargo clippy --workspace`,
 - First launch shows onboarding: tick which coding agents Comrade may use
   (all enabled by default). Everything lives in `comrade.conf` and can be
   changed in Settings. The browser needs no setup — it is bundled.
-- Coding tasks route to your default enabled agent (`coding.executeTask`):
-  opencode, Claude Code, Codex, Copilot CLI, Qwen Code have real adapters;
-  others appear for tracking until their CLIs support non-interactive runs.
+- Comrade delegates coding tasks to installed OpenCode, Codex, Claude Code,
+  Copilot CLI, Qwen Code and Hermes agents. Open **Comrade Orch** below **New chat**
+  in the sidebar, add a project with the directory picker, then assign tasks,
+  set dependencies, monitor live output and stop jobs. Agents
+  use their existing logins and permissions, and edit the selected project
+  directly. No Docker setup is needed. See [coding orchestration](docs/ORCHESTRATION.md).
 - Voice is 100% local (sherpa-onnx runtime: streaming Zipformer-int8 STT,
   Silero VAD, Kokoro-82M-int8 TTS; cpal mic/speakers). Models download once to
   `<comrade-agent>/models/` (~185 MB), then work offline. Hold 🎙 to talk,

@@ -1,4 +1,4 @@
-import React, { useEffect } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import {
   PanelLeft,
   SquarePen,
@@ -28,6 +28,7 @@ import {
   Copy,
 } from "lucide-react";
 import Settings from "./Settings";
+import AgentBoard from "./AgentBoard";
 import { initializeComrade } from "./app";
 import logo from "./logo.png";
 
@@ -53,6 +54,27 @@ const prompts = [
 ];
 
 export default function App() {
+  const [orchOpen, setOrchOpen] = useState(false);
+  const wasOrchOpen = useRef(false);
+  useEffect(() => {
+    const showChat = () => {
+      setOrchOpen(false);
+    };
+    window.addEventListener("comrade:show-chat", showChat);
+    return () => window.removeEventListener("comrade:show-chat", showChat);
+  }, []);
+  useEffect(() => {
+    document.body.classList.toggle("orch-open", orchOpen);
+    if (orchOpen) {
+      const showSidebar = !window.matchMedia("(max-width: 900px)").matches;
+      document.getElementById("sidebar").hidden = !showSidebar;
+      document.body.classList.toggle("sidebar-open", showSidebar);
+    } else if (wasOrchOpen.current) {
+      document.getElementById("input")?.focus();
+    }
+    wasOrchOpen.current = orchOpen;
+    return () => document.body.classList.remove("orch-open");
+  }, [orchOpen]);
   useEffect(() => {
     initializeComrade();
   }, []);
@@ -74,6 +96,7 @@ export default function App() {
           <span>New chat</span>
           <kbd>⌘ N</kbd>
         </button>
+        <AgentBoard open={orchOpen} setOpen={setOrchOpen} />
         <div className="sidebar-label">Your conversations</div>
         <ul id="chat-list" />
         <div className="sidebar-footer">
@@ -98,7 +121,7 @@ export default function App() {
               <PanelLeft size={19} />
             </button>
             <span className="brand">
-              Comrade <span>Personal assistant</span>
+              Comrade <span>{orchOpen ? "Agent orchestration" : "Personal assistant"}</span>
             </span>
           </div>
           <div className="head-right">
@@ -126,7 +149,8 @@ export default function App() {
             </button>
           </div>
         </header>
-        <main id="workarea">
+        <div id="orch-workspace" hidden={!orchOpen} />
+        <main id="workarea" hidden={orchOpen}>
           <section id="chat-workspace" aria-label="Chat panel">
             <div className="chat-panel-bar">
               <span><MessageSquare size={16} /> Comrade</span>

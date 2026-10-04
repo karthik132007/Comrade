@@ -536,3 +536,192 @@ test('uBlock Origin Lite blocking defaults on and stays disabled when other brow
   await protection.check();
   await expect.poll(() => page.evaluate(() => window.ipcCalls.filter(c => c.command === 'save_prefs').at(-1)?.args.prefs.browser.adblock_enabled)).toBe(true);
 });
+
+async function mockCodingBoard(page, ready = true) {
+  await mockDesktop(page);
+  await page.addInitScript(({ ready }) => {
+    window.codingRuns = [];
+    window.projectPickerResults = [{path:"/projects/app"}];
+    const original = window.__TAURI__.core.invoke;
+    window.__TAURI__.core.invoke = async (command, args) => {
+      if (!command.startsWith("coding_")) return original(command, args);
+      window.ipcCalls.push({ command, args });
+      switch (command) {
+        case "coding_pick_project": { const result = window.projectPickerResults.shift(); if (result?.error) throw result.error; return result || null; }
+        case "coding_runtime": return { ready, message: ready ? "Installed agents use their existing logins and permissions." : "No enabled coding agents found.", agents: [
+          { id:"codex", name:"Codex", available:true, enabled:true }, { id:"opencode", name:"OpenCode", available:true, enabled:true }, { id:"hermes", name:"Hermes", available:false, enabled:true },
+        ] };
+        case "coding_runs": return structuredClone(window.codingRuns).map(r => ({...r,jobs:r.jobs.map(j => ({...j,log:""}))}));
+        case "coding_run": return structuredClone(window.codingRuns.find(r => r.id === args.runId));
+        case "coding_start": {
+          const run = {id:"run-test",plan:args.plan,created_at:Date.now(),status:"running",jobs:args.plan.tasks.map(spec=>({spec,status:"queued",log:"",error:null}))};
+          window.codingRuns.push(run); return structuredClone(run);
+        }
+        case "coding_cancel": {
+          const run=window.codingRuns.find(r=>r.id===args.runId); run.status="cancelled"; run.jobs.forEach(j => { if (!args.jobId || j.spec.id===args.jobId) j.status="cancelled"; }); return structuredClone(run);
+        }
+      }
+    };
+  }, { ready });
+}
+
+test("coding board starts multiple agents with explicit dependencies", async ({ page }) => {
+  await mockCodingBoard(page); await page.goto("/"); await page.getByRole("button", {name:"Comrade Orch",exact:true}).click();
+  const board=page.getByRole("region",{name:"Comrade Orch",exact:true});
+  await board.getByRole("button",{name:"Choose project directory",exact:true}).click();
+  await board.getByLabel("Goal",{exact:true}).fill("Build settings and verify"); await expect(board.getByLabel("Project directory")).toHaveValue("/projects/app");
+  await board.getByLabel("Task",{exact:true}).fill("Build the settings page"); await board.getByLabel("Agent",{exact:true}).selectOption("codex");
+  await board.getByRole("button",{name:"Add task",exact:true}).click(); const second=board.locator("fieldset").nth(1);
+  await second.getByLabel("Task",{exact:true}).fill("Review and test the settings page"); await second.getByLabel("Agent",{exact:true}).selectOption("opencode"); await second.getByLabel("task-1",{exact:true}).check();
+  await expect(board.getByText("Agents work directly in your project", {exact:false})).toBeVisible();
+  await page.screenshot({path:"/tmp/comrade-orchestration-board.png"});
+  await board.getByRole("button",{name:"Start run",exact:true}).click(); await expect(board.getByRole("heading",{name:"Build settings and verify"})).toBeVisible();
+  const call=await page.evaluate(()=>window.ipcCalls.find(c=>c.command==="coding_start"));
+  expect(call.args.plan).not.toHaveProperty("network"); expect(call.args.plan.tasks[1].depends_on).toEqual(["task-1"]); expect(call.args.plan.tasks.map(t=>t.agent)).toEqual(["codex","opencode"]);
+  await board.getByRole("button",{name:"Stop run",exact:true}).click(); await expect(board.locator(".agent-state.cancelled").first()).toBeVisible();
+  expect(await page.evaluate(()=>window.ipcCalls.some(c=>c.command==="coding_apply"))).toBe(false);
+});
+
+test("coding jobs stream logs, show completion and return to chat", async ({ page }) => {
+  await mockCodingBoard(page); await page.goto("/");
+  await page.evaluate(()=>window.codingRuns.push({id:"run-monitor",created_at:Date.now(),plan:{title:"Add feature",working_dir:"/projects/app",max_parallel:2,timeout_secs:600},status:"running",jobs:[{spec:{id:"task-1",agent:"codex",task:"Implement feature",model:"",depends_on:[]},status:"running",log:"Reading project"}]}));
+  await page.getByRole("button",{name:"Comrade Orch",exact:true}).click(); const board=page.getByRole("region",{name:"Comrade Orch",exact:true});
+  await board.getByRole("button",{name:/Add feature/}).click(); await board.locator("summary").click(); await expect(board.locator("pre")).toContainText("Reading project");
+  await page.evaluate(()=>{ const run=window.codingRuns[0]; run.status="succeeded"; Object.assign(run.jobs[0],{status:"succeeded",log:"Tests: 5 passed"}); });
+  await expect(board.locator("pre")).toContainText("Tests: 5 passed");
+  await expect(board.getByText("Agent finished. See output for checks and results.")).toBeVisible();
+  await expect(board.getByRole("button",{name:"Stop job",exact:true})).toHaveCount(0);
+  await page.screenshot({path:"/tmp/comrade-native-monitor.png"});
+  await page.keyboard.press("Escape"); await expect(board).toBeHidden(); await expect(page.getByRole("button",{name:"Comrade Orch",exact:true})).toBeFocused();
+});
+
+test("coding board detects missing local agents and can hand planning to Comrade", async ({ page }) => {
+  await mockCodingBoard(page,false); await page.goto("/"); await page.getByRole("button",{name:"Comrade Orch",exact:true}).click(); const board=page.getByRole("region",{name:"Comrade Orch",exact:true});
+  await board.getByRole("button",{name:"Choose project directory",exact:true}).click();
+  await expect(board.getByRole("status")).toContainText("No enabled coding agents found"); await expect(board.getByRole("button",{name:"Start run",exact:true})).toBeDisabled();
+  await board.getByLabel("Goal",{exact:true}).fill("Build auth"); await expect(board.getByLabel("Project directory")).toHaveValue("/projects/app");
+  await board.getByRole("button",{name:"Let Comrade plan",exact:true}).click();
+  await expect(board).toBeHidden();
+  await expect.poll(() => page.evaluate(() => window.ipcCalls.filter(c => c.command === "send_message").length)).toBe(1);
+  const handoff = await page.evaluate(() => window.ipcCalls.find(c => c.command === "send_message"));
+  expect(handoff.args.text).toBe("Build auth"); expect(handoff.args.projectDir).toBe("/projects/app");
+  await expect(page.locator("#messages")).toContainText("Build auth");
+  await expect(page.locator("#messages")).not.toContainText("coding.startPlan");
+  await page.locator("#input").fill("yes"); await page.getByRole("button",{name:"Send message",exact:true}).click();
+  const followup = await page.evaluate(() => window.ipcCalls.filter(c => c.command === "send_message").at(-1));
+  expect(followup.args.sessionId).toBe("test-session"); expect(followup.args.text).toBe("yes");
+  expect(followup.args.projectDir).toBeNull();
+  expect(await page.evaluate(()=>window.ipcCalls.some(c=>c.command==="coding_start"))).toBe(false);
+});
+
+test("Comrade Orch sits below New chat and remembers selected project directories", async ({ page }) => {
+  await mockCodingBoard(page); await page.goto("/");
+  const sidebar = page.locator("#sidebar");
+  const newChat = await sidebar.getByRole("button", { name: /New chat/ }).boundingBox();
+  const orch = await sidebar.getByRole("button", { name: "Comrade Orch", exact: true }).boundingBox();
+  expect(orch.y).toBeGreaterThan(newChat.y + newChat.height);
+  expect(await page.locator(".head-right").getByRole("button", { name: "Comrade Orch", exact: true }).count()).toBe(0);
+  await sidebar.getByRole("button", { name: "Add project", exact: true }).click();
+  const workspace = page.getByRole("region", { name: "Comrade Orch", exact: true });
+  await expect(workspace).toBeVisible(); await expect(page.locator("#workarea")).toBeHidden();
+  await expect(workspace.getByLabel("Project directory")).toHaveValue("/projects/app");
+  await expect(sidebar.getByRole("button", { name: "Open project app", exact: true })).toBeVisible();
+  expect(await page.evaluate(() => window.ipcCalls.find(c => c.command === "coding_pick_project").args)).toEqual({ initialDir: null });
+  await page.reload();
+  await sidebar.getByRole("button", { name: "Open project app", exact: true }).click();
+  await expect(workspace.getByLabel("Project directory")).toHaveValue("/projects/app");
+  await sidebar.getByRole("button", { name: /New chat/ }).click();
+  await expect(workspace).toBeHidden(); await expect(page.locator("#workarea")).toBeVisible();
+  await expect(page.locator("#input")).toBeFocused();
+});
+
+test("project switching scopes run history and picker cancellation preserves the selection", async ({ page }) => {
+  await mockCodingBoard(page); await page.goto("/");
+  await page.getByRole("button", { name: "Add project", exact: true }).click();
+  const workspace = page.getByRole("region", { name: "Comrade Orch", exact: true });
+  await workspace.getByLabel("Goal", { exact: true }).fill("App changes");
+  await workspace.getByLabel("Task", { exact: true }).fill("Implement app change");
+  await workspace.getByRole("button", { name: "Start run", exact: true }).click();
+  await expect(workspace.getByRole("heading", { name: "App changes", exact: true })).toBeVisible();
+  await page.evaluate(() => window.projectPickerResults.push({path:"/projects/service"}));
+  await page.getByRole("button", { name: "Add project", exact: true }).click();
+  await expect(workspace.getByLabel("Project directory")).toHaveValue("/projects/service");
+  await expect(workspace.getByLabel("Goal", { exact: true })).toHaveValue("");
+  await expect(workspace.getByRole("button", { name: /App changes/ })).toHaveCount(0);
+  await workspace.getByRole("button", { name: "Change directory", exact: true }).click();
+  await expect(workspace.getByLabel("Project directory")).toHaveValue("/projects/service");
+  expect(await page.evaluate(() => window.ipcCalls.filter(c => c.command === "coding_pick_project").at(-1).args)).toEqual({ initialDir:"/projects/service" });
+  expect(await page.evaluate(() => window.ipcCalls.some(c => c.command === "coding_cancel"))).toBe(false);
+  await page.getByRole("button", { name: "Open project app", exact: true }).click();
+  await expect(workspace.getByRole("button", { name: /App changes/ })).toBeVisible();
+  await workspace.getByRole("button", { name: /App changes/ }).click();
+  await expect(workspace.getByRole("button", { name: "Stop run", exact: true })).toBeVisible();
+  await page.screenshot({path:"/tmp/comrade-orch-project-workspace.png"});
+});
+
+test("cancelled and failed directory selection never starts work", async ({ page }) => {
+  await mockCodingBoard(page); await page.goto("/");
+  await page.evaluate(() => { window.projectPickerResults = [null, {error:"Directory access unavailable"}]; });
+  await page.getByRole("button", { name: "Add project", exact: true }).click();
+  const workspace = page.getByRole("region", { name: "Comrade Orch", exact: true });
+  await expect(workspace.getByRole("heading", { name:"Start with your project" })).toBeVisible();
+  await expect(workspace.getByRole("button", { name:"Start run", exact:true })).toHaveCount(0);
+  await workspace.getByRole("button", {name:"Choose project directory",exact:true}).click();
+  await expect(workspace.getByRole("alert")).toContainText("Directory access unavailable");
+  expect(await page.evaluate(() => window.ipcCalls.some(c => c.command === "coding_start"))).toBe(false);
+});
+
+test("orchestration stays accessible from browser view and New chat shortcut returns to chat", async ({ page }) => {
+  await mockCodingBoard(page); await page.goto("/");
+  await page.getByRole("button",{name:"Toggle in-app browser",exact:true}).click();
+  await page.getByRole("button",{name:"Make browser the main view",exact:true}).click();
+  await expect(page.locator("#sidebar")).toBeHidden();
+  await page.getByRole("button",{name:"Toggle chat sidebar",exact:true}).click();
+  await page.getByRole("button",{name:"Add project",exact:true}).click();
+  const workspace = page.getByRole("region",{name:"Comrade Orch",exact:true});
+  await expect(workspace.getByLabel("Project directory")).toHaveValue("/projects/app");
+  await workspace.getByLabel("Goal",{exact:true}).focus(); await page.keyboard.press("Control+l");
+  await expect(workspace.getByLabel("Goal",{exact:true})).toBeFocused();
+  await page.keyboard.press("Control+n");
+  await expect(workspace).toBeHidden(); await expect(page.locator("#input")).toBeFocused();
+});
+
+test("project workspace fits a small window and sidebar selection remains reachable", async ({ page }) => {
+  await page.setViewportSize({width:390,height:844}); await mockCodingBoard(page); await page.goto("/");
+  await page.getByRole("button",{name:"Add project",exact:true}).click();
+  const workspace = page.getByRole("region",{name:"Comrade Orch",exact:true});
+  await expect(page.locator("#sidebar")).toBeHidden();
+  await expect(workspace.getByLabel("Project directory")).toHaveValue("/projects/app");
+  const bounds = await workspace.boundingBox(); expect(bounds.x).toBeGreaterThanOrEqual(0); expect(bounds.width).toBeLessThanOrEqual(390);
+  await expect(workspace.getByRole("button",{name:"Change directory",exact:true})).toBeVisible();
+  await page.getByRole("button",{name:"Toggle chat sidebar",exact:true}).click();
+  await expect(page.getByRole("button",{name:"Open project app",exact:true})).toBeVisible();
+  await page.getByRole("button",{name:"Open project app",exact:true}).click();
+  await expect(page.locator("#sidebar")).toBeHidden();
+  await page.screenshot({path:"/tmp/comrade-orch-small-window.png"});
+});
+
+test("a late orchestration reply cannot restore its session after New chat", async ({ page }) => {
+  await mockCodingBoard(page);
+  await page.addInitScript(() => {
+    const original = window.__TAURI__.core.invoke;
+    window.__TAURI__.core.invoke = (command, args) => {
+      if (command === "send_message" && args.projectDir) {
+        window.ipcCalls.push({command,args});
+        return new Promise(resolve => { window.finishOldHandoff = () => resolve({status:"done",session_id:"old-project-session"}); });
+      }
+      return original(command,args);
+    };
+  });
+  await page.goto("/"); await page.getByRole("button",{name:"Add project",exact:true}).click();
+  const board=page.getByRole("region",{name:"Comrade Orch",exact:true});
+  await board.getByLabel("Goal",{exact:true}).fill("Add paper and ink theme");
+  await board.getByRole("button",{name:"Let Comrade plan",exact:true}).click();
+  await expect.poll(() => page.evaluate(() => typeof window.finishOldHandoff)).toBe("function");
+  await page.getByRole("button",{name:/New chat/}).click();
+  await page.evaluate(() => window.finishOldHandoff());
+  await expect.poll(() => page.evaluate(() => window.localStorage.getItem("comrade-session"))).toBeNull();
+  await page.locator("#input").fill("Hello"); await page.getByRole("button",{name:"Send message",exact:true}).click();
+  const latest = await page.evaluate(() => window.ipcCalls.filter(c=>c.command==="send_message").at(-1));
+  expect(latest.args.sessionId).toBeNull(); expect(latest.args.projectDir).toBeNull();
+});
