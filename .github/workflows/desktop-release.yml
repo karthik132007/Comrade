@@ -63,6 +63,10 @@ jobs:
           workspaces: . -> target
           key: desktop-${{ matrix.target }}
           cache-on-failure: true
+      - name: Refresh native voice build metadata
+        # sherpa's cached build output points outside target/ to vendor files
+        # in the previous runner's user cache. Regenerate just this dependency.
+        run: cargo clean -p sherpa-rs-sys --release --target ${{ matrix.target }}
       - name: Install frontend dependencies
         run: npm ci
       - name: Build, bundle and verify native installer
