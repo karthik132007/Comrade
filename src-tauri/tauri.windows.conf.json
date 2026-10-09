@@ -1,0 +1,15 @@
+{
+  "build": {
+    "beforeBundleCommand": "node scripts/release-desktop.mjs --stage"
+  },
+  "bundle": {
+    "targets": ["nsis"],
+    "icon": ["icons/icon.ico"],
+    "shortDescription": "Comrade AI desktop agent",
+    "windows": {
+      "bundleVCRuntime": true,
+      "webviewInstallMode": {"type": "downloadBootstrapper", "silent": true},
+      "nsis": {"installMode": "currentUser", "compression": "lzma"}
+    }
+  }
+}

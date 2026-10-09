@@ -8,6 +8,7 @@
     "preview": "vite preview --config vite.config.mjs",
     "tauri": "tauri",
     "release:linux": "node scripts/release-linux.mjs",
+    "release:desktop": "node scripts/release-desktop.mjs",
     "test": "node frontend/browser-preferences.test.js && node frontend/browser-stream.test.cjs && node frontend/browser-input.test.cjs",
     "test:ui": "playwright test"
   },

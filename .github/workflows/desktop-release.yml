@@ -1,0 +1,160 @@
+name: Desktop installers
+
+on:
+  push:
+    branches: [codex/desktop-downloads]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64
+            runner: windows-2022
+            target: x86_64-pc-windows-msvc
+          - name: macOS Apple Silicon
+            runner: macos-15
+            target: aarch64-apple-darwin
+          - name: macOS Intel
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+      - name: Install Rust
+        run: rustup toolchain install 1.99.0 --profile minimal --target ${{ matrix.target }}
+      - name: Select Rust
+        run: rustup default 1.99.0
+      - name: Locate native bindgen library
+        shell: bash
+        run: |
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          import path from 'node:path';
+          import {execFileSync} from 'node:child_process';
+          const candidates = process.platform === 'win32'
+            ? [path.join(process.env.ProgramFiles || 'C:/Program Files', 'LLVM', 'bin')]
+            : [path.join(path.dirname(path.dirname(execFileSync('xcrun', ['--find', 'clang'], {encoding:'utf8'}).trim())), 'lib')];
+          const name = process.platform === 'win32' ? 'libclang.dll' : 'libclang.dylib';
+          const found = candidates.find(candidate => fs.existsSync(path.join(candidate, name)));
+          if (!found) throw new Error('Native libclang for bindgen was not found');
+          fs.appendFileSync(process.env.GITHUB_ENV, `LIBCLANG_PATH=${found}\n`);
+          NODE
+      - uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: . -> target
+          key: desktop-${{ matrix.target }}
+      - name: Install frontend dependencies
+        run: npm ci
+      - name: Build, bundle and verify native installer
+        shell: bash
+        run: |
+          set -o pipefail
+          npm run release:desktop -- --target ${{ matrix.target }} --smoke 2>&1 | tee build-native.log
+      - name: Verify native terminal behavior and permissions
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test -p comrade-core --locked --release --target ${{ matrix.target }} --lib terminal 2>&1 | tee -a build-native.log
+          cargo test -p comrade-core --locked --release --target ${{ matrix.target }} --lib permissions 2>&1 | tee -a build-native.log
+      - name: Attach actionable build diagnostics
+        if: failure()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const fs = require('node:fs');
+            if (fs.existsSync('build-native.log')) {
+              const tail = fs.readFileSync('build-native.log', 'utf8').slice(-14000);
+              core.error(tail);
+              await core.summary.addHeading('Native build diagnostics').addCodeBlock(tail).write();
+            }
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: desktop-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/distributions/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish verified internal release
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: desktop-*
+          path: release-input
+      - name: Set immutable release tag
+        run: |
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          const version = JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json', 'utf8')).version;
+          if (!/^\d+\.\d+\.\d+$/.test(version)) throw new Error('Expected a stable semantic package version');
+          fs.appendFileSync(process.env.GITHUB_ENV, `RELEASE_TAG=v${version}-internal.${process.env.GITHUB_RUN_NUMBER}\n`);
+          NODE
+      - name: Assemble verified downloads and checksums
+        run: node scripts/assemble-desktop-release.mjs
+      - name: Publish assets atomically through a draft release
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const fs = require('node:fs');
+            const path = require('node:path');
+            const crypto = require('node:crypto');
+            const tag = process.env.RELEASE_TAG;
+            const manifest = JSON.parse(fs.readFileSync('release-output/release-manifest.json', 'utf8'));
+            if (manifest.tag !== tag || manifest.downloads.length !== 5) throw new Error('Invalid release manifest');
+            const existing = await github.rest.repos.getReleaseByTag({...context.repo, tag}).catch(error => {
+              if (error.status !== 404) throw error;
+              return null;
+            });
+            if (existing && !existing.data.draft) throw new Error('Published releases are immutable; start a new workflow run');
+            const release = existing || await github.rest.repos.createRelease({
+              ...context.repo, tag_name: tag, target_commitish: context.sha,
+              name: `Comrade ${manifest.version} — internal testing`, draft: true, prerelease: true,
+              body: 'Windows x64, macOS Apple Silicon/Intel, and Linux x64 installers. An account is required; internal testing usage is unlimited.\n\nThese are internal testing builds: Windows is unsigned; macOS uses ad-hoc signing and is not notarized. Operating-system security prompts may appear. Linux needs system WebKitGTK 4.1/GTK/ALSA. See SHA256SUMS and release-manifest.json for exact files and hashes.\n\nNative build, bundle/dependency checks and startup smoke checks passed. Full end-user workflows on physical Windows/Mac devices still need testing.'
+            });
+            const files = [...manifest.downloads.map(item => item.name), 'SHA256SUMS', 'release-manifest.json'];
+            const uploaded = await github.rest.repos.listReleaseAssets({...context.repo, release_id: release.data.id});
+            for (const name of files) {
+              const bytes = fs.readFileSync(path.join('release-output', name));
+              const expected = manifest.downloads.find(item => item.name === name);
+              if (expected && crypto.createHash('sha256').update(bytes).digest('hex') !== expected.sha256) throw new Error(`Digest mismatch: ${name}`);
+              const previous = uploaded.data.find(asset => asset.name === name);
+              if (previous) await github.rest.repos.deleteReleaseAsset({...context.repo, asset_id: previous.id});
+              await github.rest.repos.uploadReleaseAsset({
+                ...context.repo, release_id: release.data.id, name, data: bytes,
+                headers: {'content-type': 'application/octet-stream', 'content-length': bytes.length}
+              });
+            }
+            const finalAssets = await github.rest.repos.listReleaseAssets({...context.repo, release_id: release.data.id});
+            for (const name of files) {
+              if (!finalAssets.data.some(asset => asset.name === name && asset.size === fs.statSync(path.join('release-output', name)).size)) throw new Error(`Missing asset: ${name}`);
+            }
+            await github.rest.repos.updateRelease({...context.repo, release_id: release.data.id, draft: false, make_latest: 'false'});
+            core.summary.addHeading('Verified Comrade installers').addLink('Download release', release.data.html_url).write();

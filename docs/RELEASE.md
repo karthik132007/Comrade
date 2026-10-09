@@ -92,3 +92,46 @@ After a manually completed Tauri build with the correct Cargo flags, run
 `node scripts/release-linux.mjs --collect` to restage and verify existing
 outputs. This mode refuses executables with absolute development runtime
 paths. Do not use it to relabel an old binary as a new release.
+
+## Windows and macOS native builds
+
+Use a Windows x64 MSVC host for the Windows installer and a matching macOS
+host for each Mac architecture. Install Node/npm, the Rust target, CMake,
+and LLVM/libclang for sherpa's native bindings. GitHub-hosted Windows and
+macOS runners provide the remaining platform SDKs. After `npm ci`, run:
+
+```sh
+npm run release:desktop -- --target x86_64-pc-windows-msvc
+npm run release:desktop -- --target aarch64-apple-darwin
+npm run release:desktop -- --target x86_64-apple-darwin
+```
+
+Run only the command matching the runner. The script first builds the native
+executable, then stages the voice libraries and license notices before
+bundling. This order ensures generated native resources exist before Tauri
+consumes the final resource map. Windows packages the voice DLLs beside the
+application, includes the Visual C++ runtime, and installs WebView2 through
+its bootstrapper when necessary. macOS packages dylibs under
+`Contents/Frameworks` with relative loader paths, checks the declared minimum
+OS against native dependencies, and preserves microphone permission metadata.
+
+Outputs under `target/<Rust-target>/release/distributions` are named
+`Comrade-<version>-windows-x86_64-setup.exe`,
+`Comrade-<version>-macos-arm64.dmg`, or
+`Comrade-<version>-macos-x86_64.dmg`. Each job produces a distinct
+`SHA256SUMS-<platform>-<architecture>.txt` and build report so parallel
+release uploads cannot overwrite another platform's checksum file.
+
+On disposable GitHub Actions runners, append `--smoke` to install the Windows
+package or mount/copy the Mac package and check native dependencies,
+architecture, and a 12-second startup with isolated account/configuration
+directories. It also checks that browser/model downloads do not start before
+sign in. A successful startup check does not prove live authenticated flows.
+
+Current Windows installers are unsigned, and Mac applications are ad-hoc
+signed for internal testing without Apple notarization. Windows SmartScreen
+and macOS Gatekeeper may require user approval. Developer ID signing and
+notarization remain prerequisites for a frictionless public Mac distribution.
+See Tauri's [Windows installer](https://v2.tauri.app/distribute/windows-installer/)
+and [macOS packaging](https://v2.tauri.app/distribute/macos-application-bundle/)
+documentation for the platform packaging and signing behavior.

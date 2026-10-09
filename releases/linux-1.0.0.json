@@ -1,0 +1,23 @@
+{
+  "version": "1.0.0",
+  "downloads": [
+    {
+      "name": "Comrade-1.0.0-linux-x86_64.deb",
+      "url": "https://akdqlmsktfkxzhvttgpi.supabase.co/storage/v1/object/public/comrade-releases/1.0.0/Comrade-1.0.0-linux-x86_64.deb",
+      "sha256": "e536c9dbfdda53e73823d23d1743b0c82c386fae921ae8240e20fc1c2c2cb2f2",
+      "size": 30505164,
+      "platform": "linux",
+      "architecture": "x86_64",
+      "sourceCommit": "7ba6cfe7183cd88ffc9da13dd5ef654bf9e28be8"
+    },
+    {
+      "name": "Comrade-1.0.0-linux-x86_64.tar.gz",
+      "url": "https://akdqlmsktfkxzhvttgpi.supabase.co/storage/v1/object/public/comrade-releases/1.0.0/Comrade-1.0.0-linux-x86_64.tar.gz",
+      "sha256": "842f7921fc4824bebb9209f1ff8ab5d2fc285de119b2c636af1ed92bd40f7db2",
+      "size": 28804443,
+      "platform": "linux",
+      "architecture": "x86_64",
+      "sourceCommit": "7ba6cfe7183cd88ffc9da13dd5ef654bf9e28be8"
+    }
+  ]
+}

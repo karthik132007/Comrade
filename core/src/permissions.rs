@@ -18,6 +18,8 @@ const DANGEROUS_COMMAND_FRAGMENTS: &[&str] = &[
 
 const DANGEROUS_SEND_FRAGMENTS: &[&str] = &["send email", "purchase", "submit form"];
 
+const DANGEROUS_WINDOWS_COMMANDS: &[&str] = &["del", "erase", "format", "diskpart"];
+
 pub fn terminal_risk(command: &str) -> Risk {
     let c = command.to_lowercase();
     if c == "sudo" || c.starts_with("sudo ") {
@@ -25,6 +27,29 @@ pub fn terminal_risk(command: &str) -> Risk {
     }
     if DANGEROUS_COMMAND_FRAGMENTS.iter().any(|p| c.contains(p)) {
         return Risk::Dangerous;
+    }
+    // Keep the existing Unix policy, and cover cmd's built-in destructive
+    // aliases regardless of option order or extra spaces.
+    let separated = c.replace('&', " & ").replace('|', " | ");
+    let words: Vec<_> = separated.split_ascii_whitespace().collect();
+    for (index, word) in words.iter().enumerate() {
+        let command = word.trim_matches(|c| matches!(c, '"' | '(' | ')'));
+        let command = command.rsplit(['\\', '/']).next().unwrap_or(command);
+        let command = command
+            .strip_suffix(".exe")
+            .or_else(|| command.strip_suffix(".com"))
+            .unwrap_or(command);
+        if DANGEROUS_WINDOWS_COMMANDS.contains(&command) {
+            return Risk::Dangerous;
+        }
+        if matches!(command, "rd" | "rmdir")
+            && words[index + 1..]
+                .iter()
+                .take_while(|word| !matches!(**word, "&" | "&&" | "|" | "||"))
+                .any(|option| option.eq_ignore_ascii_case("/s"))
+        {
+            return Risk::Dangerous;
+        }
     }
     if DANGEROUS_SEND_FRAGMENTS.iter().any(|p| c.contains(p)) {
         return Risk::Dangerous;
@@ -88,15 +113,58 @@ mod tests {
     #[test]
     fn flags_destructive_commands() {
         assert!(matches!(terminal_risk("rm -rf / tmp"), Risk::Dangerous));
-        assert!(matches!(terminal_risk("sudo apt install x"), Risk::Dangerous));
-        assert!(matches!(terminal_risk("git push origin main"), Risk::Dangerous));
+        assert!(matches!(
+            terminal_risk("sudo apt install x"),
+            Risk::Dangerous
+        ));
+        assert!(matches!(
+            terminal_risk("git push origin main"),
+            Risk::Dangerous
+        ));
         assert!(matches!(terminal_risk("ls -la"), Risk::Safe));
     }
 
     #[test]
+    fn flags_destructive_windows_cmd_aliases() {
+        for command in [
+            r#"rmdir /s "C:\work folder""#,
+            r#"RD /Q /S "C:\work folder""#,
+            r#"rd   "C:\work folder"   /s"#,
+            "del /f /q file.txt",
+            "erase file.txt",
+            "FORMAT D:",
+            "diskpart /s commands.txt",
+            "del",
+            "echo ready & del file.txt",
+            "echo ready&del file.txt",
+            r#""C:\Windows\System32\format.com" D:"#,
+        ] {
+            assert!(
+                matches!(terminal_risk(command), Risk::Dangerous),
+                "{command}"
+            );
+        }
+        for command in [
+            "dir",
+            "echo hello",
+            "type notes.txt",
+            "rmdir empty-folder",
+            "git status",
+        ] {
+            assert!(matches!(terminal_risk(command), Risk::Safe), "{command}");
+        }
+    }
+
+    #[test]
     fn tool_policy_matches_spec() {
-        assert!(matches!(tool_risk("filesystem.write", &json!({})), Risk::Dangerous));
-        assert!(matches!(tool_risk("filesystem.read", &json!({})), Risk::Safe));
+        assert!(matches!(
+            tool_risk("filesystem.write", &json!({})),
+            Risk::Dangerous
+        ));
+        assert!(matches!(
+            tool_risk("filesystem.read", &json!({})),
+            Risk::Safe
+        ));
         assert!(matches!(
             tool_risk("terminal.execute", &json!({"command": "rm -rf x"})),
             Risk::Dangerous
