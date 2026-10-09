@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const linuxOrigin = 'https://akdqlmsktfkxzhvttgpi.supabase.co';
-const linuxSourceCommit = '7ba6cfe7183cd88ffc9da13dd5ef654bf9e28be8';
+const linuxSourceCommit = 'aa5ef7446205d7ab565a15ecdf3f7fa56f38e714';
 const maxArtifactSize = 1024 * 1024 * 1024;
 const platforms = [
   { platform: 'windows', architecture: 'x86_64', suffix: '-setup.exe' },
@@ -91,7 +91,7 @@ function linuxItems(catalog, version) {
   return catalog.downloads.map(item => {
     validateFilename(item.name);
     if (!expected.delete(item.name)) fail('Unexpected or duplicate Linux artifact.');
-    const url = `${linuxOrigin}/storage/v1/object/public/comrade-releases/${version}/${item.name}`;
+    const url = `${linuxOrigin}/storage/v1/object/public/comrade-releases/${version}-aa5ef7446205/${item.name}`;
     if (item.url !== url) fail('Linux download URL must exactly match the pinned Supabase object.');
     if (!/^[a-f0-9]{64}$/.test(item.sha256) || !Number.isSafeInteger(item.size) || item.size < 1 || item.size > maxArtifactSize) fail('Invalid pinned Linux digest or size.');
     if (item.platform !== 'linux' || item.architecture !== 'x86_64' || item.sourceCommit !== linuxSourceCommit) fail('Invalid Linux provenance.');

@@ -10,7 +10,7 @@ import { assembleRelease } from './assemble-desktop-release.mjs';
 const version = '1.0.0';
 const tag = 'v1.0.0-internal.42';
 const commit = '1234567890123456789012345678901234567890';
-const linuxCommit = '7ba6cfe7183cd88ffc9da13dd5ef654bf9e28be8';
+const linuxCommit = 'aa5ef7446205d7ab565a15ecdf3f7fa56f38e714';
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 const nativeSpecs = [
   ['windows', 'x86_64', '-setup.exe'],
@@ -45,7 +45,7 @@ async function fixture(t) {
     [`Comrade-${version}-linux-x86_64.tar.gz`, gzipSync(Buffer.from('fixture-portable-tar'))],
   ]);
   const linuxCatalog = { version, downloads: [...linuxBytes].map(([name, bytes]) => ({
-    name, url: `https://akdqlmsktfkxzhvttgpi.supabase.co/storage/v1/object/public/comrade-releases/${version}/${name}`,
+    name, url: `https://akdqlmsktfkxzhvttgpi.supabase.co/storage/v1/object/public/comrade-releases/${version}-aa5ef7446205/${name}`,
     sha256: hash(bytes), size: bytes.length, platform: 'linux', architecture: 'x86_64', sourceCommit: linuxCommit,
   })) };
   const requests = [];
@@ -162,7 +162,10 @@ test('release version/tag/commit, unsafe URLs and provenance fail before filesys
     f => { f.sourceCommit = 'main'; }, f => { f.linuxCatalog.downloads[0].name = '../secret'; },
     f => { f.linuxCatalog.downloads[0].url += '?token=private'; },
     f => { f.linuxCatalog.downloads[0].url = 'https://foreign.invalid/pkg.deb'; },
+    f => { f.linuxCatalog.downloads[0].url = f.linuxCatalog.downloads[0].url.replace('1.0.0-aa5ef7446205/', '1.0.0/'); },
+    f => { f.linuxCatalog.downloads[0].url = f.linuxCatalog.downloads[0].url.replace('aa5ef7446205', '7ba6cfe7183c'); },
     f => { f.linuxCatalog.downloads[0].sourceCommit = commit; },
+    f => { f.linuxCatalog.downloads[0].sourceCommit = '7ba6cfe7183cd88ffc9da13dd5ef654bf9e28be8'; },
     f => { f.linuxCatalog.downloads[0].size = -1; },
   ];
   for (const change of cases) { const f = await fixture(t); change(f); await assert.rejects(assembleRelease(f)); assert.equal(f.requests.length, 0); await absent(f.outputDir); }
@@ -178,8 +181,11 @@ test('committed catalog retains the independently verified Linux SHA-256 and byt
   const catalog = JSON.parse(await readFile(new URL('../releases/linux-1.0.0.json', import.meta.url), 'utf8'));
   assert.equal(catalog.version, version);
   assert.deepEqual(catalog.downloads.map(item => [item.name, item.sha256, item.size]), [
-    ['Comrade-1.0.0-linux-x86_64.deb', 'e536c9dbfdda53e73823d23d1743b0c82c386fae921ae8240e20fc1c2c2cb2f2', 30505164],
-    ['Comrade-1.0.0-linux-x86_64.tar.gz', '842f7921fc4824bebb9209f1ff8ab5d2fc285de119b2c636af1ed92bd40f7db2', 28804443],
+    ['Comrade-1.0.0-linux-x86_64.deb', 'eabb57246b3d06f72a33d21dce032104f7cf261cf6f1da26f3a10d5f0b2c13fc', 30525572],
+    ['Comrade-1.0.0-linux-x86_64.tar.gz', 'f98d7b41c92f39294e7bb5bc76cf8f9bc9dbe96603a687c55c467c9f59defd85', 28821517],
   ]);
-  for (const item of catalog.downloads) assert.equal(item.sourceCommit, linuxCommit);
+  for (const item of catalog.downloads) {
+    assert.equal(item.sourceCommit, linuxCommit);
+    assert.equal(item.url, `https://akdqlmsktfkxzhvttgpi.supabase.co/storage/v1/object/public/comrade-releases/1.0.0-aa5ef7446205/${item.name}`);
+  }
 });
