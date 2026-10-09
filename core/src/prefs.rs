@@ -876,21 +876,215 @@ mod tests {
 // ---------- coding agent detection ----------
 
 pub(crate) fn find_on_path(name: &str) -> Option<PathBuf> {
-    for dir in std::env::split_paths(&std::env::var_os("PATH")?) {
-        let candidate = dir.join(name);
-        if candidate.is_file() {
+    let directories: Vec<_> = std::env::split_paths(&std::env::var_os("PATH")?).collect();
+    #[cfg(windows)]
+    {
+        let extensions = windows_path_extensions(std::env::var_os("PATHEXT").as_deref());
+        find_in_path(name, &directories, Some(&extensions))
+    }
+    #[cfg(not(windows))]
+    find_in_path(name, &directories, None)
+}
+
+#[cfg(any(windows, test))]
+fn windows_path_extensions(pathext: Option<&std::ffi::OsStr>) -> Vec<String> {
+    let value = pathext
+        .map(|value| value.to_string_lossy())
+        .unwrap_or_default();
+    let mut extensions = Vec::new();
+    for extension in value.split(';').map(str::trim) {
+        let Some(suffix) = extension.strip_prefix('.') else {
+            continue;
+        };
+        if suffix.is_empty() || !suffix.chars().all(|c| c.is_ascii_alphanumeric()) {
+            continue;
+        }
+        let extension = extension.to_ascii_lowercase();
+        if !extensions.contains(&extension) {
+            extensions.push(extension);
+        }
+    }
+    if extensions.is_empty() {
+        extensions = [".com", ".exe", ".bat", ".cmd"].map(String::from).to_vec();
+    }
+    extensions
+}
+
+// Explicit inputs keep discovery tests independent of process-wide PATH changes.
+fn find_in_path(
+    name: &str,
+    directories: &[PathBuf],
+    windows_extensions: Option<&[String]>,
+) -> Option<PathBuf> {
+    if name.is_empty() {
+        return None;
+    }
+    let names = match windows_extensions {
+        Some(extensions) if Path::new(name).extension().is_none() => {
+            // npm installs an extensionless Unix shim beside its .cmd shim.
+            // Windows must select a PATHEXT executable instead of that shell file.
+            extensions
+                .iter()
+                .map(|extension| format!("{name}{extension}"))
+                .collect()
+        }
+        _ => vec![name.to_string()],
+    };
+    for dir in directories {
+        for name in &names {
+            let candidate = dir.join(name);
+            let metadata = match candidate.metadata() {
+                Ok(metadata) if metadata.is_file() => metadata,
+                _ => continue,
+            };
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                if candidate.metadata().ok()?.permissions().mode() & 0o111 == 0 {
+                if windows_extensions.is_none() && metadata.permissions().mode() & 0o111 == 0 {
                     continue;
                 }
             }
-            // Absolute argv paths remain valid after the worker changes directory.
-            return candidate.canonicalize().ok();
+            #[cfg(not(unix))]
+            let _ = metadata;
+            // Absolute argv paths survive changing to the worker's project dir.
+            if let Ok(absolute) = candidate.canonicalize() {
+                return Some(absolute);
+            }
         }
     }
     None
+}
+
+#[cfg(test)]
+mod path_lookup_tests {
+    use super::*;
+    use std::ffi::OsStr;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    struct Directory(PathBuf);
+    impl Directory {
+        fn new(base: &Path) -> Self {
+            let dir = base.join(format!(
+                "comrade path lookup {} {}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&dir).unwrap();
+            Self(dir)
+        }
+        fn file(&self, name: &str) -> PathBuf {
+            let file = self.0.join(name);
+            std::fs::write(&file, "fixture").unwrap();
+            file
+        }
+    }
+    impl Drop for Directory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn windows_default_extensions_find_exe_and_npm_cmd_instead_of_unix_shim() {
+        let dir = Directory::new(&std::env::temp_dir());
+        let exe = dir.file("opencode.exe");
+        let cmd = dir.file("codex.cmd");
+        dir.file("codex");
+        let extensions = windows_path_extensions(None);
+        assert_eq!(extensions, [".com", ".exe", ".bat", ".cmd"]);
+        assert_eq!(
+            find_in_path("opencode", &[dir.0.clone()], Some(&extensions)),
+            Some(exe.canonicalize().unwrap())
+        );
+        assert_eq!(
+            find_in_path("codex", &[dir.0.clone()], Some(&extensions)),
+            Some(cmd.canonicalize().unwrap())
+        );
+        assert_eq!(
+            find_in_path("missing", &[dir.0.clone()], Some(&extensions)),
+            None
+        );
+    }
+
+    #[test]
+    fn windows_custom_pathext_order_and_path_directory_order_are_preserved() {
+        let first = Directory::new(&std::env::temp_dir());
+        let second = Directory::new(&std::env::temp_dir());
+        let cmd = first.file("agent.cmd");
+        let exe = first.file("agent.exe");
+        second.file("agent.com");
+        let extensions = windows_path_extensions(Some(OsStr::new(" .CMD ; .EXE ;.cmd;../bad;;")));
+        assert_eq!(extensions, [".cmd", ".exe"]);
+        let paths = [first.0.clone(), second.0.clone()];
+        assert_eq!(
+            find_in_path("agent", &paths, Some(&extensions)),
+            Some(cmd.canonicalize().unwrap())
+        );
+        let extensions = windows_path_extensions(Some(OsStr::new(".EXE;.CMD")));
+        assert_eq!(
+            find_in_path("agent", &paths, Some(&extensions)),
+            Some(exe.canonicalize().unwrap())
+        );
+        let defaults = windows_path_extensions(None);
+        assert_eq!(
+            find_in_path("agent", &paths, Some(&defaults)),
+            Some(exe.canonicalize().unwrap())
+        );
+        let extensions = windows_path_extensions(Some(OsStr::new(".BAT")));
+        assert_eq!(find_in_path("agent", &paths, Some(&extensions)), None);
+    }
+
+    #[test]
+    fn explicit_extensions_are_not_appended_and_directories_are_not_executables() {
+        let dir = Directory::new(&std::env::temp_dir());
+        let cmd = dir.file("codex.cmd");
+        std::fs::create_dir(dir.0.join("opencode.exe")).unwrap();
+        let extensions = windows_path_extensions(Some(OsStr::new(".EXE")));
+        assert_eq!(
+            find_in_path("codex.cmd", &[dir.0.clone()], Some(&extensions)),
+            Some(cmd.canonicalize().unwrap())
+        );
+        assert_eq!(
+            find_in_path("opencode", &[dir.0.clone()], Some(&extensions)),
+            None
+        );
+        assert_eq!(
+            windows_path_extensions(Some(OsStr::new(" ;invalid;..;"))),
+            windows_path_extensions(None)
+        );
+    }
+
+    #[test]
+    fn relative_path_directory_returns_an_absolute_worker_safe_path() {
+        let cwd = std::env::current_dir().unwrap();
+        let dir = Directory::new(&cwd);
+        let cmd = dir.file("codex.cmd");
+        let relative = dir.0.strip_prefix(&cwd).unwrap().to_path_buf();
+        let extensions = windows_path_extensions(None);
+        let found = find_in_path("codex", &[relative], Some(&extensions)).unwrap();
+        assert!(found.is_absolute());
+        assert_eq!(found, cmd.canonicalize().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_requires_execute_permission_without_windows_extension_fallback() {
+        use std::os::unix::fs::PermissionsExt;
+        let first = Directory::new(&std::env::temp_dir());
+        let second = Directory::new(&std::env::temp_dir());
+        let not_executable = first.file("codex");
+        std::fs::set_permissions(not_executable, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let executable = second.file("codex");
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let exe = first.file("opencode.exe");
+        std::fs::set_permissions(exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            find_in_path("codex", &[first.0.clone(), second.0.clone()], None),
+            Some(executable.canonicalize().unwrap())
+        );
+        assert_eq!(find_in_path("opencode", &[first.0.clone()], None), None);
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]

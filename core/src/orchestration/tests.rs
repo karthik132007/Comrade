@@ -340,3 +340,72 @@ async fn deadline_terminates_the_worker_and_output_capture_is_bounded() {
     assert!(error.contains("output budget exceeded"));
     assert!(manager.get("deadline").unwrap().jobs[0].log.len() <= MAX_LOG);
 }
+
+#[test]
+fn batch_task_encoding_preserves_multiline_text_in_one_regular_argument() {
+    let original = "first line\r\nsecond line\nUnicode café 🧪 \"quotes\" %PATH% !variable! & | < > ^ $(touch /host) `command`";
+    let encoded = adapters::task_argument(original, true).unwrap();
+    assert!(!encoded.contains('\r'));
+    assert!(!encoded.contains('\n'));
+    let json = encoded
+        .strip_prefix("Decode this JSON string as the task text, preserving escaped newlines: ")
+        .unwrap();
+    assert_eq!(serde_json::from_str::<String>(json).unwrap(), original);
+    assert_eq!(adapters::task_argument(original, false).unwrap(), original);
+    for adapter in adapters::adapters() {
+        let args = adapters::argv(adapter.id, &encoded, "model/name").unwrap();
+        assert_eq!(args.iter().filter(|arg| arg.as_str() == encoded).count(), 1);
+        assert!(!args
+            .iter()
+            .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox"));
+    }
+}
+
+#[test]
+fn native_executable_task_arguments_remain_unchanged() {
+    let original = "first\nsecond\r\n%PATH% & text";
+    for binary in [Path::new("agent.exe"), Path::new("agent")] {
+        let args = adapters::argv_for_binary("opencode", original, "", binary).unwrap();
+        assert_eq!(args.last().unwrap(), original);
+    }
+    #[cfg(not(windows))]
+    assert_eq!(
+        adapters::argv_for_binary("opencode", original, "", Path::new("agent.cmd"))
+            .unwrap()
+            .last()
+            .unwrap(),
+        original
+    );
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_batch_node_fixture_receives_encoded_task_without_shell_expansion() {
+    let _node = crate::prefs::find_on_path("node")
+        .expect("Node is required for the Windows batch fixture (provided by CI setup-node)");
+    let dir = fixture();
+    let result = async {
+        let script = dir.join("receive argv.js");
+        std::fs::write(&script, "process.stdout.write(JSON.stringify(process.argv.slice(2)));").unwrap();
+        let batch = dir.join("fixture agent.CmD");
+        std::fs::write(&batch, format!("@echo off\r\nnode.exe \"{}\" %*\r\n", script.display())).unwrap();
+        let work = dir.join("other project");
+        std::fs::create_dir(&work).unwrap();
+        let original = "First line\r\nSecond line\n\"quotes\" %PATH% !EXPAND_ME! & echo UNEXPECTED | > injected.txt < nul ^ Unicode café 🧪";
+        let binary = batch.canonicalize().unwrap();
+        let args = adapters::argv_for_binary("opencode", original, "model/name", &binary).unwrap();
+        let output = tokio::time::timeout(
+            Duration::from_secs(15),
+            Command::new(&binary).args(&args[1..]).current_dir(&work).output(),
+        ).await.unwrap().unwrap();
+        assert!(output.status.success(), "batch failed: {}", String::from_utf8_lossy(&output.stderr));
+        let received: Vec<String> = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(received, args[1..]);
+        let task = received.last().unwrap();
+        let json = task.strip_prefix("Decode this JSON string as the task text, preserving escaped newlines: ").unwrap();
+        assert_eq!(serde_json::from_str::<String>(json).unwrap(), original);
+        assert!(!work.join("injected.txt").exists());
+    }.await;
+    let _ = std::fs::remove_dir_all(dir);
+    result
+}

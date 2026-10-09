@@ -91,10 +91,15 @@ fn debug_port_from_cmd(cmd: &str) -> Option<u16> {
 /// bundled browser on our own profile. None otherwise (stale lock, or
 /// something we must never touch).
 fn holder_is_ours(exe_key: &str, profile: &std::path::Path) -> Option<u32> {
+    #[cfg(windows)]
+    return windows_managed_processes(exe_key, &profile.to_string_lossy(), false).first().map(|process| process.pid);
+    #[cfg(not(windows))]
+    {
     let pid = lock_holder_pid(profile)?;
     let cmd = process_command(pid);
     let profile_arg = format!("--user-data-dir={}", profile.to_string_lossy());
     (cmd.contains(exe_key) && cmd.contains(&profile_arg)).then_some(pid)
+    }
 }
 
 /// An adopted (not launched) instance is reusable while its process is still
@@ -230,7 +235,7 @@ async fn ensure_process() -> Result<u16, String> {
     // Fast path for the common restart case: our previous browser is still
     // alive and holding the profile (healthy orphan). Adopt it instead of
     // spawning into a locked profile and fighting over it.
-    if lock_held(&profile) {
+    if cfg!(windows) || lock_held(&profile) {
         if let Some(port) = adopt_orphan(&exe_key, &profile).await {
             guard.browser = Some(ManagedBrowser { child: None, exe: exe_key, port, page_id: None, page: None, checked_at: Instant::now() });
             return Ok(port);
@@ -244,7 +249,8 @@ async fn ensure_process() -> Result<u16, String> {
             Ok(port)
         }
         Err(code) => {
-            let locked_exit = code.starts_with("EXITED:21") || lock_held(&profile);
+            let locked_exit = code.starts_with("EXITED:21") || lock_held(&profile)
+                || (cfg!(windows) && holder_is_ours(&exe_key, &profile).is_some());
             let hung = code.starts_with("NO_DEVTOOLS");
             if locked_exit || hung {
                 // Prefer adoption again (holder may have appeared since):
@@ -253,7 +259,7 @@ async fn ensure_process() -> Result<u16, String> {
                     guard.browser = Some(ManagedBrowser { child: None, exe: exe_key, port, page_id: None, page: None, checked_at: Instant::now() });
                     return Ok(port);
                 }
-                kill_stale_profile_holders(&profile_key).await;
+                kill_stale_profile_holders(&exe_key, &profile_key).await;
                 if lock_holder_pid(&profile).is_none() {
                     clear_stale_locks(&profile);
                 }
@@ -389,17 +395,120 @@ fn lock_holder_pid(profile: &std::path::Path) -> Option<u32> {
 }
 
 fn process_command(pid: u32) -> String {
+    #[cfg(windows)]
+    {
+        return windows_powershell()
+            .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
+                "$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.UTF8Encoding]::new(); $p=Get-CimInstance Win32_Process -Filter ('ProcessId=' + $env:COMRADE_QUERY_PID); ConvertTo-Json -Compress -InputObject ([string]$p.CommandLine)"])
+            .env("COMRADE_QUERY_PID", pid.to_string())
+            .output().ok().filter(|output| output.status.success())
+            .and_then(|output| serde_json::from_slice::<String>(&output.stdout).ok())
+            .unwrap_or_default();
+    }
     #[cfg(target_os = "linux")]
     if let Ok(command) = std::fs::read_to_string(format!("/proc/{pid}/cmdline")) {
         return command.replace('\0', " ");
     }
 
-    std::process::Command::new("ps")
+    #[cfg(not(windows))]
+    { std::process::Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "command="])
         .output()
         .ok()
         .filter(|output| output.status.success())
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .unwrap_or_default() }
+}
+
+#[cfg(windows)]
+fn windows_powershell() -> std::process::Command {
+    let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+    std::process::Command::new(std::path::PathBuf::from(root).join("System32/WindowsPowerShell/v1.0/powershell.exe"))
+}
+
+#[cfg(windows)]
+#[derive(serde::Deserialize)]
+struct WindowsManagedProcess {
+    pid: u32,
+}
+
+/// Windows Chromium uses a named mutex rather than Unix SingletonLock
+/// symlinks. Read native process identities instead; never match a substring
+/// of an executable or profile (e.g. browser-profile-other).
+#[cfg(windows)]
+fn windows_managed_processes(exe: &str, profile: &str, terminate: bool) -> Vec<WindowsManagedProcess> {
+    const SCRIPT: &str = r#"
+$ErrorActionPreference='Stop'
+[Console]::OutputEncoding=[Text.UTF8Encoding]::new()
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class ComradeCommandLine {
+    [DllImport("shell32.dll", SetLastError=true)]
+    static extern IntPtr CommandLineToArgvW([MarshalAs(UnmanagedType.LPWStr)] string line, out int count);
+    [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr memory);
+    public static string[] Args(string line) {
+        int count; IntPtr memory=CommandLineToArgvW(line, out count);
+        if(memory==IntPtr.Zero) return new string[0];
+        try {
+            string[] args=new string[count];
+            for(int i=0;i<count;i++) args[i]=Marshal.PtrToStringUni(Marshal.ReadIntPtr(memory,i*IntPtr.Size));
+            return args;
+        } finally { LocalFree(memory); }
+    }
+}
+'@
+function ExecutableIdentity([string]$path) {
+    # Canonical Rust paths may use the extended-length representation while
+    # CIM returns the ordinary representation. Strip only a real drive/UNC
+    # prefix, never arbitrary device namespaces or substrings of a path.
+    if($path.StartsWith('\\?\UNC\',[StringComparison]::OrdinalIgnoreCase)) {
+        $path='\\'+$path.Substring(8)
+    } elseif($path.Length -ge 7 -and $path.StartsWith('\\?\',[StringComparison]::Ordinal) -and
+        [char]::IsLetter($path[4]) -and $path[5] -eq ':' -and $path[6] -eq '\') {
+        $path=$path.Substring(4)
+    }
+    return [IO.Path]::GetFullPath($path)
+}
+function IsManaged($p) {
+    if(-not $p.ExecutablePath -or -not $p.CommandLine) { return $false }
+    $actualExe=ExecutableIdentity $p.ExecutablePath
+    $expectedExe=ExecutableIdentity $env:COMRADE_QUERY_EXE
+    if(-not [string]::Equals($actualExe,$expectedExe,[StringComparison]::OrdinalIgnoreCase)) { return $false }
+    $argv=[ComradeCommandLine]::Args($p.CommandLine)
+    $found=$false
+    for($i=1;$i -lt $argv.Length;$i++) {
+        $value=$null
+        if($argv[$i].StartsWith('--user-data-dir=',[StringComparison]::Ordinal)) { $value=$argv[$i].Substring(16) }
+        elseif($argv[$i] -ceq '--user-data-dir' -and ($i+1) -lt $argv.Length) { $i++; $value=$argv[$i] }
+        if($null -ne $value) {
+            if(-not [string]::Equals($value,$env:COMRADE_QUERY_PROFILE,[StringComparison]::OrdinalIgnoreCase)) { return $false }
+            $found=$true
+        }
+    }
+    return $found
+}
+$ownedProcesses=@(Get-CimInstance Win32_Process | Where-Object { IsManaged $_ })
+if($env:COMRADE_QUERY_TERMINATE -eq '1') {
+    foreach($p in $ownedProcesses) {
+        # Recheck identity and creation time before termination to reject a
+        # reused PID; the native CIM method targets this process instance.
+        $live=Get-CimInstance Win32_Process -Filter ('ProcessId='+$p.ProcessId)
+        if($live -and $p.CreationDate -and $live.CreationDate -eq $p.CreationDate -and (IsManaged $live)) {
+            $null=Invoke-CimMethod -InputObject $live -MethodName Terminate
+        }
+    }
+}
+ConvertTo-Json -Compress -InputObject @($ownedProcesses | ForEach-Object { @{pid=[uint32]$_.ProcessId} })
+"#;
+    windows_powershell()
+        .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", SCRIPT])
+        // Values travel as environment data, never interpolated PowerShell.
+        .env("COMRADE_QUERY_EXE", exe)
+        .env("COMRADE_QUERY_PROFILE", profile)
+        .env("COMRADE_QUERY_TERMINATE", if terminate { "1" } else { "0" })
+        .output().ok().filter(|output| output.status.success())
+        .and_then(|output| serde_json::from_slice(&output.stdout).ok())
         .unwrap_or_default()
 }
 
@@ -413,16 +522,24 @@ fn clear_stale_locks(profile: &std::path::Path) {
 
 /// Kill leftover processes launched against the ISOLATED profile only.
 /// Scoped to our `--user-data-dir=<profile>` so nothing else is touched.
-async fn kill_stale_profile_holders(profile_key: &str) {
+async fn kill_stale_profile_holders(_exe_key: &str, profile_key: &str) {
+    #[cfg(windows)]
+    {
+        windows_managed_processes(_exe_key, profile_key, true);
+    }
     // pkill -f matches the full command line; scoped to our profile dir.
+    #[cfg(not(windows))]
     let _ = tokio::process::Command::new("pkill")
         .args(["-f", &format!("--user-data-dir={profile_key}")])
         .output()
         .await;
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(10) {
+        #[cfg(windows)]
+        let locked = holder_running(_exe_key, profile_key).await;
+        #[cfg(not(windows))]
         let locked = std::path::Path::new(profile_key).join("SingletonSocket").exists()
-            && holder_running(profile_key).await;
+            && holder_running(_exe_key, profile_key).await;
         if !locked {
             break;
         }
@@ -432,13 +549,18 @@ async fn kill_stale_profile_holders(profile_key: &str) {
 }
 
 /// True when a live process still carries our profile dir in its cmdline.
-async fn holder_running(profile_key: &str) -> bool {
+async fn holder_running(_exe_key: &str, profile_key: &str) -> bool {
+    #[cfg(windows)]
+    return !windows_managed_processes(_exe_key, profile_key, false).is_empty();
+    #[cfg(not(windows))]
+    {
     tokio::process::Command::new("pgrep")
         .args(["-f", &format!("--user-data-dir={profile_key}")])
         .output()
         .await
         .map(|o| o.status.success())
         .unwrap_or(false)
+    }
 }
 
 /// Outcome of stopping the managed browser.
@@ -1201,6 +1323,60 @@ pub async fn reload_interactive(port: u16) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_profile_cleanup_fixture() {
+        if std::env::var_os("COMRADE_PROCESS_FIXTURE").is_some() {
+            std::thread::sleep(Duration::from_secs(90));
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_profile_cleanup_verifies_executable_and_exact_profile() {
+        struct Fixture(std::process::Child);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let exe = std::env::current_exe().unwrap();
+        let exe_key = exe.to_string_lossy().to_string();
+        let profile = std::env::temp_dir().join(format!("comrade profile ' {}", std::process::id()));
+        let profile_key = profile.to_string_lossy().to_string();
+        let spawn = |profiles: &[String]| {
+            let mut command = std::process::Command::new(&exe);
+            command.args(["--exact", "tools::browser_driver::tests::windows_profile_cleanup_fixture", "--nocapture"]);
+            // libtest accepts arbitrary --skip values, allowing a benign
+            // disposable fixture to carry Chromium-shaped arguments.
+            for profile in profiles {
+                command.args(["--skip", &format!("--user-data-dir={profile}")]);
+            }
+            Fixture(command.env("COMRADE_PROCESS_FIXTURE", "1")
+                .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null()).spawn().unwrap())
+        };
+        let mut owned = spawn(&[profile_key.clone()]);
+        let mut sibling = spawn(&[format!("{profile_key}-other")]);
+        let mut conflicting = spawn(&[profile_key.clone(), format!("{profile_key}-other")]);
+        let expected = owned.0.id();
+        let matches = windows_managed_processes(&exe_key, &profile_key, false);
+        assert_eq!(matches.iter().map(|p| p.pid).collect::<Vec<_>>(), vec![expected]);
+        let extended_exe = std::fs::canonicalize(&exe).unwrap().to_string_lossy().to_string();
+        assert_eq!(windows_managed_processes(&extended_exe, &profile_key, false)
+            .iter().map(|p| p.pid).collect::<Vec<_>>(), vec![expected],
+            "extended and ordinary executable paths identify the same process");
+        assert_eq!(holder_is_ours(&exe_key, &profile), Some(expected));
+        assert!(!process_command(expected).is_empty());
+        assert!(windows_managed_processes("C:\\not-comrade\\chrome.exe", &profile_key, false).is_empty());
+        kill_stale_profile_holders(&exe_key, &profile_key).await;
+        assert!(owned.0.try_wait().unwrap().is_some(), "managed stale process must exit");
+        assert!(sibling.0.try_wait().unwrap().is_none(), "different profile must survive");
+        assert!(conflicting.0.try_wait().unwrap().is_none(), "ambiguous profile must survive");
+        assert!(!holder_running(&exe_key, &profile_key).await);
+    }
 
     #[tokio::test]
     async fn bundled_exe_honors_override() {

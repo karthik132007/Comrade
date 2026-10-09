@@ -62,6 +62,7 @@ jobs:
         with:
           workspaces: . -> target
           key: desktop-${{ matrix.target }}
+          cache-on-failure: true
       - name: Install frontend dependencies
         run: npm ci
       - name: Build, bundle and verify native installer
@@ -73,8 +74,9 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          cargo test -p comrade-core --locked --release --target ${{ matrix.target }} --lib terminal 2>&1 | tee -a build-native.log
-          cargo test -p comrade-core --locked --release --target ${{ matrix.target }} --lib permissions 2>&1 | tee -a build-native.log
+          for module in terminal permissions computer::tests windows_profile_cleanup prefs orchestration; do
+            cargo test -p comrade-core --locked --release --target ${{ matrix.target }} --lib "$module" 2>&1 | tee -a build-native.log
+          done
       - name: Attach actionable build diagnostics
         if: failure()
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
@@ -83,7 +85,11 @@ jobs:
             const fs = require('node:fs');
             if (fs.existsSync('build-native.log')) {
               const tail = fs.readFileSync('build-native.log', 'utf8').slice(-14000);
-              core.error(tail);
+              // An annotation is capped at 4096 characters. Keep the end of
+              // long compiler failures accessible through the public API.
+              for (let offset = 0; offset < tail.length; offset += 3500) {
+                core.error(tail.slice(offset, offset + 3500));
+              }
               await core.summary.addHeading('Native build diagnostics').addCodeBlock(tail).write();
             }
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

@@ -1,5 +1,7 @@
 //! Fixed adapters: neither prompts nor model ids can add runner options.
 use serde::Serialize;
+use std::borrow::Cow;
+use std::path::Path;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Adapter {
@@ -101,6 +103,35 @@ pub fn argv(id: &str, task: &str, model: &str) -> Result<Vec<String>, String> {
         args.push(task.into());
     }
     Ok(args)
+}
+
+/// Batch shims cannot carry CR/LF through Rust's Windows argument encoder.
+/// Keep the task as one regular argument; never interpolate it into shell code.
+pub(super) fn task_argument(task: &str, windows_batch: bool) -> Result<Cow<'_, str>, String> {
+    if !windows_batch {
+        return Ok(Cow::Borrowed(task));
+    }
+    let encoded = serde_json::to_string(task).map_err(|e| format!("Cannot encode task: {e}"))?;
+    Ok(Cow::Owned(format!(
+        "Decode this JSON string as the task text, preserving escaped newlines: {encoded}"
+    )))
+}
+
+pub fn argv_for_binary(
+    id: &str,
+    task: &str,
+    model: &str,
+    binary: &Path,
+) -> Result<Vec<String>, String> {
+    let windows_batch = cfg!(windows)
+        && binary
+            .extension()
+            .and_then(|s| s.to_str())
+            .is_some_and(|extension| {
+                extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat")
+            });
+    let task = task_argument(task, windows_batch)?;
+    argv(id, &task, model)
 }
 
 pub fn redact(mut text: String, secrets: &[String]) -> String {

@@ -549,7 +549,7 @@ impl Orchestrator {
             .collect::<Vec<_>>()
             .join("\n");
         let prompt = format!("Task: {}\n\nWork in the current project directory. Completed dependency edits are already present. {context}\n\nReport checks actually run and any limitations.", spec.task);
-        let args = adapters::argv(&spec.agent, &prompt, &spec.model)?;
+        let args = adapters::argv_for_binary(&spec.agent, &prompt, &spec.model, &binary)?;
         let secrets: Vec<_> = adapters::adapters()
             .iter()
             .flat_map(|a| a.credentials.iter())

@@ -9,6 +9,16 @@ use std::process::Stdio;
 use super::types::{Risk, Tool, ToolContext, ToolResult};
 
 fn binaries_for(target: &str) -> Vec<&'static str> {
+    #[cfg(windows)]
+    return match target {
+        "brave" => vec!["brave.exe"],
+        "chrome" => vec!["chrome.exe", "chromium.exe"],
+        "firefox" => vec!["firefox.exe"],
+        "vs code" | "vscode" | "code" => vec!["code.exe", "code.cmd"],
+        "terminal" => vec!["wt.exe", "cmd.exe"],
+        _ => vec![],
+    };
+    #[cfg(not(windows))]
     match target {
         "brave" => vec!["brave", "brave-browser"],
         "chrome" => vec!["google-chrome", "chromium"],
@@ -41,15 +51,65 @@ fn spawn_detached(program: &str, args: &[&str]) -> bool {
 }
 
 async fn on_path(bin: &str) -> bool {
-    tokio::process::Command::new("sh")
+    #[cfg(windows)]
+    let mut command = {
+        // An absolute system executable avoids both Git Bash and PATH spoofing
+        // of the lookup utility. No shell interprets the requested name.
+        let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+        let mut command = tokio::process::Command::new(std::path::PathBuf::from(root).join("System32/where.exe"));
+        command.arg(bin);
+        command
+    };
+    #[cfg(not(windows))]
+    let mut command = {
+        let mut command = tokio::process::Command::new("sh");
+        command
         .arg("-c")
         .arg("command -v -- \"$1\"")
         .arg("sh")
-        .arg(bin)
+        .arg(bin);
+        command
+    };
+    command
+        .kill_on_drop(true)
         .output()
         .await
         .map(|o| o.status.success() && !o.stdout.is_empty())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn native_path_lookup_finds_executable_and_rejects_shell_source() {
+        #[cfg(windows)]
+        let executable = "cmd.exe";
+        #[cfg(not(windows))]
+        let executable = "sh";
+        assert!(on_path(executable).await);
+        assert!(!on_path("comrade-nonexistent-app-960d24").await);
+        assert!(!on_path("cmd.exe & echo injected").await);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_application_aliases_use_native_binaries() {
+        assert!(binaries_for("chrome").contains(&"chrome.exe"));
+        assert!(binaries_for("terminal").contains(&"cmd.exe"));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_path_lookup_supports_spaces_in_executable_path() {
+        let dir = std::env::temp_dir().join(format!("comrade app lookup {}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let executable = dir.join("application with spaces.exe");
+        std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+        assert!(on_path(&executable.to_string_lossy()).await);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
 
 async fn launch_app(name: &str) -> Option<String> {
