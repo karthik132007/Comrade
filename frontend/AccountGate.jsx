@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import { ArrowUpRight, LoaderCircle, ShieldCheck, LogIn } from "lucide-react";
-import App from "./App";
+import App from "./App.jsx";
 import logo from "./logo.png";
 
 const accountPage = "https://www.roviumlabs.me/products/comrade";

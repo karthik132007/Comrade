@@ -1,4 +1,6 @@
-# Linux desktop release
+# Desktop releases
+
+## Linux build
 
 Build the native desktop release with:
 
@@ -135,3 +137,26 @@ notarization remain prerequisites for a frictionless public Mac distribution.
 See Tauri's [Windows installer](https://v2.tauri.app/distribute/windows-installer/)
 and [macOS packaging](https://v2.tauri.app/distribute/macos-application-bundle/)
 documentation for the platform packaging and signing behavior.
+
+## Hosted internal releases
+
+The `Desktop installers` GitHub Actions workflow builds Windows x64 and both
+Mac architectures on native runners. Each build must pass installer extraction,
+native dependency checks, isolated startup, and terminal/permission tests.
+The publish job checks all native installer hashes and retrieves the existing
+Linux packages using the pinned catalog in `releases/linux-1.0.0.json`. That
+catalog records their separate source commit; the Linux files are not rebuilt
+or presented as containing later platform changes.
+
+`scripts/assemble-desktop-release.mjs` produces five installers, `SHA256SUMS`,
+and `release-manifest.json`. Publishing uploads them to a draft prerelease and
+only exposes the release after all asset sizes and installer hashes match.
+Tags use `v<version>-internal.<workflow-run-number>` and published tags are
+immutable. The workflow runs when this packaging branch is pushed and can also
+be dispatched manually once present on the default branch.
+
+After a successful release, update the Rovium Labs website's
+`lib/comrade-downloads.json` with the verified release URLs, version, and byte
+counts from the manifest, then build and deploy the website. An unavailable
+installer must retain a null URL; the page displays its build status without
+offering a broken download.
