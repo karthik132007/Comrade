@@ -522,15 +522,36 @@ fn clear_stale_locks(profile: &std::path::Path) {
 
 /// Kill leftover processes launched against the ISOLATED profile only.
 /// Scoped to our `--user-data-dir=<profile>` so nothing else is touched.
+#[cfg(not(windows))]
+fn unix_profile_process_pattern(exe: &str, profile: &str) -> String {
+    fn escape_ere(value: &str) -> String {
+        let mut escaped = String::with_capacity(value.len());
+        for c in value.chars() {
+            if matches!(c, '.' | '^' | '$' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\') {
+                escaped.push('\\');
+            }
+            escaped.push(c);
+        }
+        escaped
+    }
+    // argv[0] must be our exact bundled executable, and Comrade always
+    // follows the profile switch with another --switch (or ends argv).
+    // Requiring that boundary also rejects a sibling profile with a space
+    // suffix rather than treating the suffix as a separate argument.
+    format!("^{}[[:space:]]+(.*[[:space:]])?--user-data-dir={}([[:space:]]--|$)",
+        escape_ere(exe), escape_ere(profile))
+}
+
 async fn kill_stale_profile_holders(_exe_key: &str, profile_key: &str) {
     #[cfg(windows)]
     {
         windows_managed_processes(_exe_key, profile_key, true);
     }
-    // pkill -f matches the full command line; scoped to our profile dir.
+    // pkill/pgrep use EREs; escape both identities and terminate options
+    // explicitly so a profile switch is never parsed as a tool option.
     #[cfg(not(windows))]
     let _ = tokio::process::Command::new("pkill")
-        .args(["-f", &format!("--user-data-dir={profile_key}")])
+        .args(["-f", "--", &unix_profile_process_pattern(_exe_key, profile_key)])
         .output()
         .await;
     let start = Instant::now();
@@ -555,7 +576,7 @@ async fn holder_running(_exe_key: &str, profile_key: &str) -> bool {
     #[cfg(not(windows))]
     {
     tokio::process::Command::new("pgrep")
-        .args(["-f", &format!("--user-data-dir={profile_key}")])
+        .args(["-f", "--", &unix_profile_process_pattern(_exe_key, profile_key)])
         .output()
         .await
         .map(|o| o.status.success())
@@ -1323,6 +1344,56 @@ pub async fn reload_interactive(port: u16) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_profile_cleanup_fixture() {
+        if std::env::var_os("COMRADE_PROCESS_FIXTURE").is_some() {
+            std::thread::sleep(Duration::from_secs(90));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_profile_cleanup_scopes_literal_executable_and_profile() {
+        struct Fixture(std::process::Child);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("comrade cleanup +[x] {}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("fixture.chrome+[x](1)");
+        let sibling_exe = dir.join("fixture.chrome+[x](1)-other");
+        std::fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
+        std::fs::copy(&exe, &sibling_exe).unwrap();
+        let profile_key = dir.join("browser.profile+[x](1)").to_string_lossy().to_string();
+        let exe_key = exe.to_string_lossy().to_string();
+        let spawn = |exe: &std::path::Path, profile: &str| {
+            Fixture(std::process::Command::new(exe)
+                .args(["--exact", "tools::browser_driver::tests::unix_profile_cleanup_fixture",
+                    "--skip", &format!("--user-data-dir={profile}"), "--nocapture"])
+                .env("COMRADE_PROCESS_FIXTURE", "1")
+                .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null()).spawn().unwrap())
+        };
+        let mut owned = spawn(&exe, &profile_key);
+        let mut sibling_profile = spawn(&exe, &format!("{profile_key}-other"));
+        let mut spaced_profile = spawn(&exe, &format!("{profile_key} other"));
+        let mut sibling_binary = spawn(&sibling_exe, &profile_key);
+        assert!(holder_running(&exe_key, &profile_key).await, "fixture must be discoverable");
+        assert!(!holder_running(&exe_key, &format!("{profile_key}-missing")).await);
+        kill_stale_profile_holders(&exe_key, &profile_key).await;
+        assert!(owned.0.try_wait().unwrap().is_some(), "owned stale process must exit");
+        assert!(sibling_profile.0.try_wait().unwrap().is_none(), "sibling profile must survive");
+        assert!(spaced_profile.0.try_wait().unwrap().is_none(), "space suffix profile must survive");
+        assert!(sibling_binary.0.try_wait().unwrap().is_none(), "different executable must survive");
+        assert!(!holder_running(&exe_key, &profile_key).await);
+        drop((owned, sibling_profile, spaced_profile, sibling_binary));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[cfg(windows)]
     #[test]

@@ -1531,6 +1531,9 @@ fn main() {
                 eprintln!("Comrade: failed to create main window: {e}");
             }
             tauri::async_runtime::spawn(async move {
+                if comrade_core::account::require_user().await.is_err() {
+                    return;
+                }
                 let detected = comrade_core::prefs::detect_coding_agents();
                 let ids: Vec<&str> = detected.iter().map(|d| d.id.as_str()).collect();
                 let default = coding::resolve_agent(&coding_prefs.agents, &coding_prefs.default, &detected, None)
@@ -1543,9 +1546,12 @@ fn main() {
                     Some(&serde_json::json!({ "detected": ids, "default": default })),
                 );
             });
-            // The browser is a core feature: start its one-time self-install
-            // in the background so it is ready before first use.
+            // Warm the browser only for an authenticated account. New users
+            // provision it on their first authenticated browser action.
             tauri::async_runtime::spawn(async move {
+                if comrade_core::account::require_user().await.is_err() {
+                    return;
+                }
                 match comrade_core::tools::provision::ensure_provisioned().await {
                     Ok(exe) => log(
                         Level::Info,

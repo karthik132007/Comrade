@@ -74,7 +74,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          for module in terminal permissions computer::tests windows_profile_cleanup prefs orchestration; do
+          for module in terminal permissions computer::tests windows_profile_cleanup unix_profile_cleanup prefs orchestration; do
             cargo test -p comrade-core --locked --release --target ${{ matrix.target }} --lib "$module" 2>&1 | tee -a build-native.log
           done
       - name: Attach actionable build diagnostics
@@ -124,7 +124,14 @@ jobs:
           fs.appendFileSync(process.env.GITHUB_ENV, `RELEASE_TAG=v${version}-internal.${process.env.GITHUB_RUN_NUMBER}\n`);
           NODE
       - name: Assemble verified downloads and checksums
-        run: node scripts/assemble-desktop-release.mjs
+        run: |
+          node scripts/assemble-desktop-release.mjs
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          for (const name of ['THIRD_PARTY_NOTICES.md', 'ESPEAK-NG-COPYING']) {
+            fs.copyFileSync(`licenses/${name}`, `release-output/${name}`);
+          }
+          NODE
       - name: Publish assets atomically through a draft release
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
@@ -143,9 +150,9 @@ jobs:
             const release = existing || await github.rest.repos.createRelease({
               ...context.repo, tag_name: tag, target_commitish: context.sha,
               name: `Comrade ${manifest.version} — internal testing`, draft: true, prerelease: true,
-              body: 'Windows x64, macOS Apple Silicon/Intel, and Linux x64 installers. An account is required; internal testing usage is unlimited.\n\nThese are internal testing builds: Windows is unsigned; macOS uses ad-hoc signing and is not notarized. Operating-system security prompts may appear. Linux needs system WebKitGTK 4.1/GTK/ALSA. See SHA256SUMS and release-manifest.json for exact files and hashes.\n\nNative build, bundle/dependency checks and startup smoke checks passed. Full end-user workflows on physical Windows/Mac devices still need testing.'
+              body: 'Windows x64, macOS Apple Silicon/Intel, and Linux x64 installers. An account is required; internal testing usage is unlimited.\n\nThese are internal testing builds: Windows is unsigned; macOS uses ad-hoc signing and is not notarized. Operating-system security prompts may appear. Linux needs system WebKitGTK 4.1/GTK/ALSA. See SHA256SUMS and release-manifest.json for exact files and hashes. Bundled voice libraries include eSpeak NG (GPLv3-or-later); attached THIRD_PARTY_NOTICES.md provides licenses and corresponding source locations, also included in the installers.\n\nNative build, bundle/dependency checks and startup smoke checks passed. Full end-user workflows on physical Windows/Mac devices still need testing.'
             });
-            const files = [...manifest.downloads.map(item => item.name), 'SHA256SUMS', 'release-manifest.json'];
+            const files = [...manifest.downloads.map(item => item.name), 'SHA256SUMS', 'release-manifest.json', 'THIRD_PARTY_NOTICES.md', 'ESPEAK-NG-COPYING'];
             const uploaded = await github.rest.repos.listReleaseAssets({...context.repo, release_id: release.data.id});
             for (const name of files) {
               const bytes = fs.readFileSync(path.join('release-output', name));
@@ -162,5 +169,5 @@ jobs:
             for (const name of files) {
               if (!finalAssets.data.some(asset => asset.name === name && asset.size === fs.statSync(path.join('release-output', name)).size)) throw new Error(`Missing asset: ${name}`);
             }
-            await github.rest.repos.updateRelease({...context.repo, release_id: release.data.id, draft: false, make_latest: 'false'});
-            core.summary.addHeading('Verified Comrade installers').addLink('Download release', release.data.html_url).write();
+            const published = await github.rest.repos.updateRelease({...context.repo, release_id: release.data.id, draft: false, make_latest: 'false'});
+            await core.summary.addHeading('Verified Comrade installers').addLink('Download release', published.data.html_url).write();

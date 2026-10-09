@@ -70,6 +70,9 @@ function fetchNotices() {
     fail('Missing or unexpected sherpa-onnx license in Cargo registry.');
   }
   copyFileSync(sherpaLicense, join(licenses, 'SHERPA-ONNX-LICENSE'));
+  for (const name of ['ESPEAK-NG-COPYING', 'THIRD_PARTY_NOTICES.md']) {
+    copyFileSync(join(root, 'licenses', name), join(licenses, name));
+  }
 }
 
 function stageRuntime() {

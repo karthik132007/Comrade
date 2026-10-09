@@ -24,7 +24,9 @@
           "/usr/share/doc/comrade/RELEASE.md": "../docs/RELEASE.md",
           "/usr/share/doc/comrade/third-party/SHERPA-ONNX-LICENSE": "../target/release/runtime/linux/licenses/SHERPA-ONNX-LICENSE",
           "/usr/share/doc/comrade/third-party/ONNXRUNTIME-LICENSE": "../target/release/runtime/linux/licenses/ONNXRUNTIME-LICENSE",
-          "/usr/share/doc/comrade/third-party/ONNXRUNTIME-ThirdPartyNotices.txt": "../target/release/runtime/linux/licenses/ONNXRUNTIME-ThirdPartyNotices.txt"
+          "/usr/share/doc/comrade/third-party/ONNXRUNTIME-ThirdPartyNotices.txt": "../target/release/runtime/linux/licenses/ONNXRUNTIME-ThirdPartyNotices.txt",
+          "/usr/share/doc/comrade/third-party/ESPEAK-NG-COPYING": "../target/release/runtime/linux/licenses/ESPEAK-NG-COPYING",
+          "/usr/share/doc/comrade/third-party/THIRD_PARTY_NOTICES.md": "../target/release/runtime/linux/licenses/THIRD_PARTY_NOTICES.md"
         }
       }
     }

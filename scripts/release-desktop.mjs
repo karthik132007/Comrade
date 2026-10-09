@@ -66,7 +66,7 @@ function dylibDependencies(path) {
 function assertArchitecture(path) {
   if (spec.platform === 'win32') peArchitecture(path);
   else {
-    run('lipo', ['-verify_arch', spec.arch, path]);
+    run('lipo', [path, '-verify_arch', spec.arch]);
     const info = run('otool', ['-arch', spec.arch, '-l', path]);
     const required = [...info.matchAll(/cmd LC_(?:BUILD_VERSION|VERSION_MIN_MACOSX)[\s\S]*?(?:minos|version)\s+([0-9.]+)/g)].map(match => match[1]);
     const configured = JSON.parse(readFileSync(join(root, 'src-tauri', 'tauri.macos.conf.json'), 'utf8')).bundle.macOS.minimumSystemVersion;
@@ -140,6 +140,9 @@ function stageLicenses() {
   const license = readdirSync(registry).map(directory => join(registry, directory, 'sherpa-rs-sys-0.6.8', 'sherpa-onnx', 'LICENSE')).find(existsSync);
   if (!license || digest(license) !== 'cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30') fail('Missing or unexpected sherpa-onnx license.');
   copyFileSync(license, join(licenses, 'SHERPA-ONNX-LICENSE'));
+  for (const name of ['ESPEAK-NG-COPYING', 'THIRD_PARTY_NOTICES.md']) {
+    copyFileSync(join(root, 'licenses', name), join(licenses, name));
+  }
   copyFileSync(join(root, 'LICENSE'), join(licenses, 'COMRADE-LICENSE'));
   copyFileSync(join(root, 'docs', 'RELEASE.md'), join(licenses, 'RELEASE.md'));
 }
@@ -235,7 +238,8 @@ async function smoke(installer) {
   let executable;
   if (spec.platform === 'win32') {
     const install = join(temp, 'installed');
-    run(installer, ['/S', `/D=${install}`], { timeout: 120000 });
+    // NSIS consumes the final /D= value without quotes, including spaces.
+    run(installer, ['/S', `/D=${install}`], { timeout: 120000, windowsVerbatimArguments: true });
     executable = join(install, 'comrade-desktop.exe');
     if (!existsSync(executable)) fail('NSIS installer did not create the expected executable.');
     assertArchitecture(executable);
