@@ -53,7 +53,7 @@ const prompts = [
   ],
 ];
 
-export default function App() {
+export default function App({ account, onSignOut, signingOut, accountError }) {
   const [orchOpen, setOrchOpen] = useState(false);
   const wasOrchOpen = useRef(false);
   useEffect(() => {
@@ -102,10 +102,11 @@ export default function App() {
         <div className="sidebar-footer">
           <div className="workspace-avatar">C</div>
           <div>
-            <strong>Personal workspace</strong>
-            <span>Local-first. Yours.</span>
+            <strong title={account?.email}>{account?.email || "Personal workspace"}</strong>
+            <span>Internal testing · Unlimited</span>
           </div>
-          <CircleHelp size={16} aria-hidden="true" />
+          <button type="button" className="account-signout" disabled={signingOut} onClick={onSignOut}>{signingOut ? "Signing out…" : "Sign out"}</button>
+          {accountError && <span role="alert">{accountError}</span>}
         </div>
       </aside>
       <div id="app">

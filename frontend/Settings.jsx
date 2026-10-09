@@ -644,16 +644,15 @@ export default function Settings() {
             </section>
             <section hidden={tab !== "service"} aria-label="Connections">
               <div className="setting-group">
-                <h4>Service backend (optional)</h4>
+                <h4>Comrade service</h4>
                 <p className="muted">
-                  Connect an OpenAI-compatible service for chat, embeddings, and
-                  voice. Changes apply when you save; changing embedding
-                  dimensions requires a restart.
+                  Your signed-in account connects chat, memory, and server voice.
+                  Changing the server requires signing in again. Changing
+                  embedding dimensions requires a restart.
                 </p>
                 <div className="row checks">
                   <label className="check">
-                    <input id="srv-enabled" type="checkbox" /> Use service
-                    server
+                    <input id="srv-enabled" type="checkbox" defaultChecked disabled /> Account service enabled
                   </label>
                   <button id="srv-test" type="button">
                     Test
@@ -670,14 +669,11 @@ export default function Settings() {
                   autoComplete="off"
                   spellCheck="false"
                 />
-                <label className="muted" htmlFor="srv-key">
-                  API key (optional)
-                </label>
                 <input
                   id="srv-key"
-                  type="password"
-                  placeholder="bearer key, if your server needs one"
-                  autoComplete="off"
+                  type="hidden"
+                  value=""
+                  readOnly
                 />
                 <div className="row vgrid">
                   <label className="muted">

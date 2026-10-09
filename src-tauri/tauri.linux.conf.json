@@ -1,0 +1,32 @@
+{
+  "build": {
+    "beforeBundleCommand": "node scripts/release-linux.mjs --stage"
+  },
+  "bundle": {
+    "targets": ["deb"],
+    "shortDescription": "Comrade AI desktop agent",
+    "longDescription": "A desktop workspace for Comrade chat, browser, voice and coding agents. An account and an internet connection are required for hosted services.",
+    "linux": {
+      "deb": {
+        "depends": [
+          "libwebkit2gtk-4.1-0",
+          "libgtk-3-0",
+          "libasound2 | libasound2t64",
+          "libstdc++6",
+          "libgcc-s1",
+          "libc6 (>= 2.34)"
+        ],
+        "section": "utils",
+        "files": {
+          "/usr/lib/comrade-desktop/libsherpa-onnx-c-api.so": "../target/release/runtime/linux/libsherpa-onnx-c-api.so",
+          "/usr/lib/comrade-desktop/libonnxruntime.so": "../target/release/runtime/linux/libonnxruntime.so",
+          "/usr/share/doc/comrade/LICENSE": "../LICENSE",
+          "/usr/share/doc/comrade/RELEASE.md": "../docs/RELEASE.md",
+          "/usr/share/doc/comrade/third-party/SHERPA-ONNX-LICENSE": "../target/release/runtime/linux/licenses/SHERPA-ONNX-LICENSE",
+          "/usr/share/doc/comrade/third-party/ONNXRUNTIME-LICENSE": "../target/release/runtime/linux/licenses/ONNXRUNTIME-LICENSE",
+          "/usr/share/doc/comrade/third-party/ONNXRUNTIME-ThirdPartyNotices.txt": "../target/release/runtime/linux/licenses/ONNXRUNTIME-ThirdPartyNotices.txt"
+        }
+      }
+    }
+  }
+}

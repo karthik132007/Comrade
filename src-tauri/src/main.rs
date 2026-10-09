@@ -326,7 +326,8 @@ async fn persist_turn(shared: &Shared, sid: &str, user_text: &str, task: &TaskSt
 /// only the LLM + embedder backends rebind.
 fn build_live_agent(shared: &Shared, model_override: Option<String>) -> Agent<AnyLlm, AnyEmbedder> {
     let root = config::find_project_root();
-    let live = config::load_config(&root);
+    let mut live = config::load_config(&root);
+    live.server_enabled = true;
     let (llm_backend, embed_backend) = create_backends(&live);
     // Per-message model pick (composer dropdown): exact allowlist id, and
     // only in service mode — direct mode keeps its configured model.
@@ -731,7 +732,8 @@ async fn app_info(state: State<'_, Shared>) -> Result<AppInfo, String> {
     // Live config so the Brain line reflects Settings immediately.
     // The built-in backend URL is never exposed to the UI: server_url is
     // only populated when a custom URL was explicitly configured.
-    let live = config::load_config(&config::find_project_root());
+    let mut live = config::load_config(&config::find_project_root());
+    live.server_enabled = true;
     let custom_url = live.server_url.trim().trim_end_matches('/')
         != comrade_core::service::COMRADE_DEFAULT_SERVER_URL.trim_end_matches('/');
     let (provider, model, embedding_model, backend, server_url) = if live.use_service() {
@@ -1202,13 +1204,168 @@ async fn history_rename(
         .map_err(|e| truncate_err(format!("History locked: {e}"), 200))
 }
 
+// Cleanup commands stay reachable when a session expires. Every other app
+// command is admitted by the native account gate before its handler runs.
+fn account_command_is_public(command: &str) -> bool {
+    matches!(command,
+        "account_status" | "account_start_login" | "account_poll_login" |
+        "account_sign_in" | "account_cancel_login" | "account_open_login" |
+        "account_open_page" | "account_logout" | "cancel_task" |
+        "cancel_voice_input" | "browser_stream_stop" | "browser_close")
+}
+
+static LOGIN_PAGE: std::sync::OnceLock<std::sync::Mutex<Option<String>>> = std::sync::OnceLock::new();
+
+fn open_account_browser(url: &str) -> Result<(), String> {
+    let url = url.to_string();
+    #[cfg(target_os = "linux")]
+    let result = std::process::Command::new("xdg-open").arg(url).spawn();
+    #[cfg(target_os = "macos")]
+    let result = std::process::Command::new("open").arg(url).spawn();
+    #[cfg(target_os = "windows")]
+    let result = std::process::Command::new("rundll32")
+        .args(["url.dll,FileProtocolHandler", &url]).spawn();
+    result.map(|_| ()).map_err(|_| "Could not open the account page. Try email sign-in here.".into())
+}
+
+#[tauri::command]
+async fn account_status() -> Result<comrade_core::account::AccountStatus, String> {
+    comrade_core::account::status().await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn account_start_login() -> Result<comrade_core::account::DeviceLogin, String> {
+    let login = comrade_core::account::start_login().await.map_err(|e| e.to_string())?;
+    // The native shell opens only the configured account page, never an
+    // arbitrary URL supplied over IPC or returned by a compromised gateway.
+    let trusted = comrade_core::account::account_url();
+    let (page, query) = login.verification_uri_complete.split_once('?')
+        .ok_or_else(|| "The account server returned an invalid sign-in link.".to_string())?;
+    if page.trim_end_matches('/') != trusted.trim_end_matches('/') ||
+        query != format!("user_code={}", login.user_code) {
+        comrade_core::account::cancel_login().await.map_err(|e| e.to_string())?;
+        return Err("The account server returned an unexpected sign-in page.".into());
+    }
+    *LOGIN_PAGE.get_or_init(|| std::sync::Mutex::new(None)).lock().map_err(|_| "Sign-in state unavailable.")? = Some(login.verification_uri_complete.clone());
+    Ok(login)
+}
+
+#[tauri::command]
+async fn account_poll_login() -> Result<comrade_core::account::AccountStatus, String> {
+    comrade_core::account::poll_login().await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn account_sign_in(email: String, password: String) -> Result<comrade_core::account::AccountStatus, String> {
+    if email.len() > 254 || password.len() > 4096 { return Err("Invalid email or password.".into()); }
+    comrade_core::account::sign_in(&email, &password).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn account_cancel_login() -> Result<(), String> {
+    *LOGIN_PAGE.get_or_init(|| std::sync::Mutex::new(None)).lock().map_err(|_| "Sign-in state unavailable.")? = None;
+    comrade_core::account::cancel_login().await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn account_open_login() -> Result<(), String> {
+    let page = LOGIN_PAGE.get_or_init(|| std::sync::Mutex::new(None)).lock()
+        .map_err(|_| "Sign-in state unavailable.")?.clone().ok_or("Start a new sign-in request first.")?;
+    open_account_browser(&page)
+}
+
+#[tauri::command]
+fn account_open_page() -> Result<(), String> {
+    open_account_browser(&comrade_core::account::account_url())
+}
+
+#[tauri::command]
+async fn account_logout(app: AppHandle, state: State<'_, Shared>) -> Result<(), String> {
+    let shared = state.inner();
+    shared.cancel.store(true, Ordering::SeqCst);
+    shared.pending.lock().await.clear();
+    let controller = shared.voice_session.lock().map_err(|_| "Voice state unavailable.")?.clone();
+    if let Some(controller) = controller { controller.cancel_session().await; }
+    for run in comrade_core::orchestration::global().list() {
+        if matches!(run.status, comrade_core::orchestration::Status::Running | comrade_core::orchestration::Status::Queued) {
+            let _ = comrade_core::orchestration::global().cancel(&run.id, None).await;
+        }
+    }
+    let _ = comrade_core::tools::browser_driver::close_chromium().await;
+    comrade_core::account::logout().await.map_err(|e| e.to_string())?;
+    *LOGIN_PAGE.get_or_init(|| std::sync::Mutex::new(None)).lock().map_err(|_| "Sign-in state unavailable.")? = None;
+    let _ = app.emit("account-event", serde_json::json!({ "type": "signed_out" }));
+    Ok(())
+}
+
 fn main() {
     ensure_webkit_paths();
+    let commands: Arc<dyn Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sync> = Arc::new(tauri::generate_handler![
+            account_status, account_start_login, account_poll_login,
+            account_sign_in, account_cancel_login, account_open_login,
+            account_open_page, account_logout,
+
+            send_message,
+            start_voice_input,
+            stop_voice_input,
+            cancel_voice_input,
+            set_microphone_device,
+            get_audio_devices,
+            voice_models_status,
+            voice_download_models,
+            cancel_task,
+            permission_response,
+            app_info,
+            server_status,
+            server_models,
+            memory_add,
+            memory_import_chatgpt,
+            memory_list,
+            memory_search,
+            memory_delete,
+            history_list,
+            history_get,
+            history_delete,
+            history_rename,
+            system_coding_agents,
+            coding_pick_project,
+            coding_runtime,
+            coding_runs,
+            coding_run,
+            coding_start,
+            coding_cancel,
+            browser_open,
+            browser_tabs,
+            browser_tab_new,
+            browser_tab_select,
+            browser_tab_close,
+            browser_state,
+            browser_ensure,
+            browser_provision_status,
+            browser_screenshot,
+            browser_frame,
+            browser_stream::browser_stream_start,
+            browser_stream::browser_stream_stop,
+            browser_stream::browser_stream_ack,
+            browser_stream::browser_stream_resize,
+            browser_pointer,
+            browser_click_at,
+            browser_type_text,
+            browser_press_key,
+            browser_scroll,
+            browser_close,
+            browser_back,
+            browser_forward,
+            browser_reload,
+            get_prefs,
+            save_prefs
+        ]);
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let root = config::find_project_root();
-            let cfg = config::load_config(&root);
+            let mut cfg = config::load_config(&root);
+            cfg.server_enabled = true;
             log(
                 Level::Info,
                 "BOOT",
@@ -1405,62 +1562,26 @@ fn main() {
             });
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![
-            send_message,
-            start_voice_input,
-            stop_voice_input,
-            cancel_voice_input,
-            set_microphone_device,
-            get_audio_devices,
-            voice_models_status,
-            voice_download_models,
-            cancel_task,
-            permission_response,
-            app_info,
-            server_status,
-            server_models,
-            memory_add,
-            memory_import_chatgpt,
-            memory_list,
-            memory_search,
-            memory_delete,
-            history_list,
-            history_get,
-            history_delete,
-            history_rename,
-            system_coding_agents,
-            coding_pick_project,
-            coding_runtime,
-            coding_runs,
-            coding_run,
-            coding_start,
-            coding_cancel,
-            browser_open,
-            browser_tabs,
-            browser_tab_new,
-            browser_tab_select,
-            browser_tab_close,
-            browser_state,
-            browser_ensure,
-            browser_provision_status,
-            browser_screenshot,
-            browser_frame,
-            browser_stream::browser_stream_start,
-            browser_stream::browser_stream_stop,
-            browser_stream::browser_stream_ack,
-            browser_stream::browser_stream_resize,
-            browser_pointer,
-            browser_click_at,
-            browser_type_text,
-            browser_press_key,
-            browser_scroll,
-            browser_close,
-            browser_back,
-            browser_forward,
-            browser_reload,
-            get_prefs,
-            save_prefs
-        ])
+        .invoke_handler(move |invoke| {
+            if account_command_is_public(invoke.message.command()) {
+                return commands(invoke);
+            }
+            let commands = commands.clone();
+            let app = invoke.message.webview().app_handle().clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(error) = comrade_core::account::require_user().await {
+                    let message = error.to_string();
+                    if message.starts_with("ACCOUNT_LOGIN_REQUIRED") {
+                        let _ = app.emit("account-event", serde_json::json!({ "type": "signed_out" }));
+                    }
+                    invoke.resolver.reject(message);
+                    return;
+                }
+                let resolver = invoke.resolver.clone();
+                if !commands(invoke) { resolver.reject("Unknown command"); }
+            });
+            true
+        })
         .run(tauri::generate_context!())
         .expect("failed to run Comrade");
 }

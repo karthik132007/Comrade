@@ -1641,9 +1641,9 @@ export function initializeComrade() {
 
   function fillServerSettings(s) {
     s = s || {};
-    if (srvEnabled) srvEnabled.checked = s.enabled === true;
+    if (srvEnabled) srvEnabled.checked = true;
     if (srvUrl) srvUrl.value = s.base_url || '';
-    if (srvKey) srvKey.value = s.api_key || '';
+    if (srvKey) srvKey.value = '';
     if (srvLlm) srvLlm.value = normSrvLlm(s.llm_model);
     if (srvEmb) srvEmb.value = s.embedding_model || 'comrade-embed';
     if (srvDim) srvDim.value = s.embedding_dim || 1536;
@@ -1654,9 +1654,9 @@ export function initializeComrade() {
 
   function serverPrefsForSave() {
     return {
-      enabled: !!(srvEnabled && srvEnabled.checked),
+      enabled: true,
       base_url: (srvUrl && srvUrl.value.trim()) || '',
-      api_key: (srvKey && srvKey.value) || '',
+      api_key: '',
       llm_model: normSrvLlm(srvLlm && srvLlm.value),
       embedding_model: (srvEmb && srvEmb.value.trim()) || 'comrade-embed',
       embedding_dim: parseInt(srvDim && srvDim.value, 10) || 1536,

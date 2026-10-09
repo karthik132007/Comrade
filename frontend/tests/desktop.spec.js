@@ -33,6 +33,8 @@ async function mockDesktop(page) {
         invoke: async (command, args) => {
           window.ipcCalls.push({ command, args });
           switch (command) {
+            case "account_status":
+              return { authenticated: true, user: { id: "test-user", email: "tester@example.com" }, pending: false, usage_mode: "unlimited" };
             case "app_info":
               return {
                 onboarded: true,
@@ -257,7 +259,8 @@ test("web preview explains desktop requirements without a fake transcript", asyn
   page,
 }) => {
   await page.goto("/");
-  await expect(page.locator("#hint")).toContainText("Browser preview");
+  await expect(page.locator(".account-preview")).toContainText("Browser preview");
+  await expect(page.getByRole("heading", { name: "Sign in to Comrade" })).toBeVisible();
   await expect(page.locator(".msg")).toHaveCount(0);
 });
 

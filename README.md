@@ -8,8 +8,12 @@ Local-first personal AI desktop agent. Pure Rust backend (`core` library +
 Tauri shell), React + Vite frontend. Node.js is used for development and builds;
 the shipped app uses the native Tauri webview, with no Electron or Node runtime.
 
-Brain: DeepSeek-direct (`deepseek-flash`, reasoning model). Voice STT/TTS and
-memory embeddings ride on OpenRouter (DeepSeek has no audio/embedding APIs).
+Create a Rovium Labs account at [Comrade](https://www.roviumlabs.me/products/comrade),
+confirm your email, then sign in to the desktop with the same email and password.
+The app requires an account before opening chat, browser, voice or coding tools.
+Internal testing has unlimited usage. Hosted model requests use the authenticated
+Comrade gateway; provider credentials stay on the server.
+See [account setup](docs/ACCOUNTS.md) and [Linux release packaging](docs/RELEASE.md).
 
 Two stores, two jobs:
 - `history.db` — verbatim chat sessions, browsed from the ☰ sidebar.
@@ -38,6 +42,7 @@ Windows:      %APPDATA%/comrade-agent
 
 comrade-agent/
   comrade.conf          preferences (in-app browser pane, voice, coding agents)
+  auth-session.json     native account session (private file; removed on sign-out)
   orchestration/       coding runs, task status and agent logs
   comrade-memory.db   SQLite vector memory (auto-moved from the old
                       ~/.local/share/com.comrade.desktop/ on first run)
@@ -77,7 +82,7 @@ On Linux, install WebKitGTK and the native audio/build dependencies through the
 setup script, then build and run:
 
 ```bash
-cp .env.example .env   # DEEPSEEK_API_KEY + OPENROUTER_API_KEY (memory embeddings)
+cp .env.example .env   # optional development overrides; no provider key needed for desktop
 ./scripts/setup-linux.sh   # apt/dnf/pacman; rootless WebKit fallback on Arch
 cargo test -p comrade-core
 npm install
@@ -95,7 +100,7 @@ Frontend development: `npm run dev` opens a browser preview at
 `http://localhost:1420`. Chat, voice, memory, and browser tools require the
 Tauri desktop shell (`npm run tauri dev`). Run `npm run build` before a direct
 `cargo run -p comrade-desktop`; Tauri CLI builds the frontend automatically.
-Create a desktop bundle with `npm run tauri build`.
+Create the verified Linux bundles with `npm run release:linux`.
 
 The interface includes a collapsible chat sidebar, a multiline composer
 (Enter to send, Shift+Enter for a new line), and a settings dialog with sidebar
@@ -112,7 +117,7 @@ Useful commands: `cargo check --workspace`, `cargo clippy --workspace`,
 
 ## Notes
 
-- First launch shows onboarding: tick which coding agents Comrade may use
+- First sign-in shows onboarding: tick which coding agents Comrade may use
   (all enabled by default). Everything lives in `comrade.conf` and can be
   changed in Settings. The browser needs no setup — it is bundled.
 - Comrade delegates coding tasks to installed OpenCode, Codex, Claude Code,
@@ -123,7 +128,8 @@ Useful commands: `cargo check --workspace`, `cargo clippy --workspace`,
   directly. No Docker setup is needed. See [coding orchestration](docs/ORCHESTRATION.md).
 - Voice is 100% local (sherpa-onnx runtime: streaming Zipformer-int8 STT,
   Silero VAD, Kokoro-82M-int8 TTS; cpal mic/speakers). Models download once to
-  `<comrade-agent>/models/` (~185 MB), then work offline. Hold 🎙 to talk,
+  `<comrade-agent>/models/` (~185 MB). Model inference runs locally; account
+  validation and hosted chat still need a connection. Hold 🎙 to talk,
   ⟳ for hands-free conversation, talk over Comrade to interrupt. See
   `docs/VOICE.md` for architecture, models, tests, and troubleshooting.
 - DeepSeek validates function names strictly (`^[a-zA-Z0-9_-]+$`), so dotted

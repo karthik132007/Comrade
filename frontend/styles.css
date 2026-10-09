@@ -2124,3 +2124,28 @@ body.browser-primary.browser-sidebar-open #app, body.browser-primary.orch-open.s
 body.orch-open #workarea { display: none; }
 @media (max-width: 760px) { .orch-page .agent-content { padding: 20px; } .orch-directory { flex-direction: column; align-items: stretch; } }
 @media (max-width: 900px) { body.browser-primary.browser-sidebar-open #app, body.browser-primary.orch-open.sidebar-open #app { margin-left: 0; } }
+/* Account gate mounts before any privileged desktop controller. */
+.account-gate { min-height: 100dvh; display: grid; place-items: center; padding: 32px 20px; overflow: auto; background: var(--base, #1e1e2e); color: var(--text, #cdd6f4); }
+.account-card { width: min(100%, 460px); display: flex; flex-direction: column; gap: 16px; text-align: center; }
+.account-logo { width: 72px; height: 72px; object-fit: contain; align-self: center; margin-bottom: 10px; }
+.account-card h1 { font-size: clamp(27px, 5vw, 36px); line-height: 1.2; letter-spacing: -.04em; margin: 0; }
+.account-card p { margin: 0; color: var(--subtext0, #a6adc8); line-height: 1.65; font-size: 14px; }
+.account-testing { font-size: 12px; display: flex; align-items: center; justify-content: center; gap: 8px; color: var(--green, #a6e3a1); padding: 10px; }
+.account-primary { display: flex; align-items: center; justify-content: center; gap: 10px; padding: 14px 18px; border: 0; border-radius: 12px; background: var(--mauve, #cba6f7); color: var(--base, #1e1e2e); font: inherit; font-weight: 600; text-decoration: none; cursor: pointer; }
+.account-primary:disabled { opacity: .65; cursor: wait; }
+.account-secondary { display: flex; align-items: center; justify-content: center; gap: 7px; border: 0; background: none; color: var(--subtext1, #bac2de); font: inherit; font-size: 13px; padding: 7px; cursor: pointer; }
+.account-form { display: flex; flex-direction: column; gap: 16px; text-align: left; padding: 20px; border: 1px solid var(--surface1, #45475a); border-radius: 16px; }
+.account-form label { display: flex; flex-direction: column; gap: 8px; font-size: 13px; }
+.account-form input { width: 100%; padding: 12px; border: 1px solid var(--surface1, #45475a); border-radius: 8px; font: inherit; color: inherit; background: var(--mantle, #181825); }
+.account-pairing { border: 1px solid var(--surface1, #45475a); padding: 16px; border-radius: 14px; }
+.account-pairing > span { font-size: 12px; color: var(--subtext0, #a6adc8); }
+.account-pairing strong { display: block; padding: 14px; font-family: monospace; letter-spacing: .16em; font-size: 25px; }
+.account-pairing button { background: none; border: 0; color: var(--mauve, #cba6f7); cursor: pointer; padding: 10px; }
+.account-card .account-error { color: var(--red, #f38ba8); padding: 12px; border-radius: 10px; background: var(--mantle, #181825); }
+.account-card .account-note { font-size: 11px; padding: 10px 24px; }
+.account-spinner { align-self: center; animation: account-spin 1s linear infinite; }
+.account-signout { border: 0; background: none; color: var(--subtext0, #a6adc8); font-size: 11px; cursor: pointer; white-space: nowrap; }
+.sidebar-footer > div:nth-child(2) { min-width: 0; }
+.sidebar-footer strong { display: block; text-overflow: ellipsis; overflow: hidden; white-space: nowrap; }
+@keyframes account-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .account-spinner { animation: none; } }

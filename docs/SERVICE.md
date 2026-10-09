@@ -1,16 +1,15 @@
 # Comrade Service API (server contract)
 
-The desktop app can run against your own server instead of calling cloud
-APIs directly. Enable it in **Settings → Service backend** (or
-`COMRADE_SERVER_URL` in `.env`): chat, memory embeddings, STT, and TTS all
-go to the server. Local on-device models stay optional — pick them per
-feature from Settings.
+The desktop app requires the authenticated Comrade gateway for chat and
+memory embeddings. Set its URL in **Settings → Service backend** or
+`COMRADE_SERVER_URL`. Server voice also uses the gateway; local voice remains
+available. An account is required in both cases. See [accounts](ACCOUNTS.md).
 
 ## Modes
 
 | Setting | Effect |
 |---|---|
-| `[server] enabled = true` + `base_url` | Brain (chat) + memory embeddings via server. Applies immediately. |
+| `base_url` | Brain (chat) + memory embeddings via server. Desktop always enables the gateway. Changing its URL requires signing in again. |
 | `[voice] backend = server` (default) | STT + TTS via server (energy VAD on-device, **no model download**). Applies on next voice session. |
 | `[voice] backend = local` | On-device sherpa-onnx STT/VAD/TTS (one-time ~185 MB download), even when the brain uses the server. |
 
@@ -28,8 +27,10 @@ POST {base}/v1/audio/transcriptions
 POST {base}/v1/audio/speech
 ```
 
-Auth: `Authorization: Bearer <api_key>` when a key is set
-(`COMRADE_SERVER_KEY` / Settings). Absent = no header.
+Auth: `Authorization: Bearer <Supabase user access token>` on every `/v1/*`
+model request. The native account manager refreshes tokens before use.
+Shared server API keys do not grant access. `/healthz` and `/readyz` are public.
+`GET /v1/auth/me` reports the verified account and unlimited testing mode.
 
 ### Chat — `POST /v1/chat/completions`
 
@@ -118,9 +119,7 @@ as a fallback.
 `.env` / environment (win over Settings):
 
 ```bash
-COMRADE_SERVER_ENABLED=true
-COMRADE_SERVER_URL=http://localhost:8000
-COMRADE_SERVER_KEY=
+COMRADE_SERVER_URL=https://comradeserver.vercel.app
 COMRADE_SERVER_LLM_MODEL=comrade-default
 COMRADE_SERVER_EMBEDDING_MODEL=comrade-embed
 COMRADE_SERVER_EMBEDDING_DIM=1536
@@ -129,6 +128,6 @@ COMRADE_SERVER_TTS_VOICE=default
 COMRADE_VOICE_BACKEND=local   # local | server
 ```
 
-`comrade.conf` mirrors: `[server]` (`enabled, base_url, api_key,
+`comrade.conf` mirrors: `[server]` (`base_url,
 llm_model, embedding_model, embedding_dim, stt_model, tts_voice`) and
 `[voice] backend`.

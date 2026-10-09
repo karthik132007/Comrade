@@ -114,19 +114,23 @@ pub struct ServiceClient {
 
 impl ServiceClient {
     pub fn new(cfg: ServiceConfig) -> Self {
-        Self { cfg, client: reqwest::Client::new() }
+        Self {
+            cfg,
+            client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("failed to initialize service client"),
+        }
     }
 
     pub fn config(&self) -> &ServiceConfig {
         &self.cfg
     }
 
-    fn auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        if self.cfg.api_key.trim().is_empty() {
-            req
-        } else {
-            req.header("Authorization", format!("Bearer {}", self.cfg.api_key.trim()))
-        }
+    async fn auth(&self, req: reqwest::RequestBuilder) -> anyhow::Result<reqwest::RequestBuilder> {
+        // Refresh credentials natively and never forward them to a different server.
+        let token = crate::account::bearer_for(&self.cfg.base_url).await?;
+        Ok(req.bearer_auth(token))
     }
 
     fn wire_messages(messages: &[ChatMessage]) -> Vec<serde_json::Value> {
@@ -208,7 +212,7 @@ impl ServiceClient {
         }
         let res = tokio::time::timeout(
             std::time::Duration::from_secs(self.cfg.timeout_secs),
-            self.auth(self.client.post(self.cfg.url("/v1/chat/completions")))
+            self.auth(self.client.post(self.cfg.url("/v1/chat/completions"))).await?
                 .json(&self.chat_body(messages, opts, false))
                 .send(),
         )
@@ -241,7 +245,7 @@ impl ServiceClient {
             anyhow::bail!("SERVICE_UNAVAILABLE: server base_url is not configured (Settings → Service).");
         }
         let res = self
-            .auth(self.client.post(self.cfg.url("/v1/chat/completions")))
+            .auth(self.client.post(self.cfg.url("/v1/chat/completions"))).await?
             .json(&self.chat_body(messages, opts, true))
             .send()
             .await?;
@@ -330,7 +334,7 @@ impl ServiceClient {
         for path in ["/healthz", "/readyz", "/v1/models"] {
             let res = tokio::time::timeout(
                 std::time::Duration::from_secs(10),
-                self.auth(self.client.get(self.cfg.url(path))).send(),
+                self.auth(self.client.get(self.cfg.url(path))).await?.send(),
             )
             .await;
             if let Ok(Ok(res)) = res {
@@ -352,7 +356,7 @@ impl ServiceClient {
         }
         let res = tokio::time::timeout(
             std::time::Duration::from_secs(15),
-            self.auth(self.client.get(self.cfg.url("/v1/models"))).send(),
+            self.auth(self.client.get(self.cfg.url("/v1/models"))).await?.send(),
         )
         .await
         .map_err(|_| anyhow::anyhow!("SERVICE_TIMEOUT: /v1/models timed out."))??;
@@ -373,7 +377,7 @@ impl ServiceClient {
         }
         let res = tokio::time::timeout(
             std::time::Duration::from_secs(60),
-            self.auth(self.client.post(self.cfg.url("/v1/embeddings")))
+            self.auth(self.client.post(self.cfg.url("/v1/embeddings"))).await?
                 .json(&json!({ "model": self.cfg.embedding_model, "input": non_empty }))
                 .send(),
         )
@@ -431,7 +435,7 @@ impl ServiceClient {
         }
         let res = tokio::time::timeout(
             std::time::Duration::from_secs(60),
-            self.auth(self.client.post(self.cfg.url("/v1/audio/transcriptions"))).multipart(form).send(),
+            self.auth(self.client.post(self.cfg.url("/v1/audio/transcriptions"))).await?.multipart(form).send(),
         )
         .await
         .map_err(|_| anyhow::anyhow!("STT_FAILED: request timed out."))??;
@@ -464,7 +468,7 @@ impl ServiceClient {
         }
         let res = tokio::time::timeout(
             std::time::Duration::from_secs(60),
-            self.auth(self.client.post(self.cfg.url("/v1/audio/speech"))).json(&json!({
+            self.auth(self.client.post(self.cfg.url("/v1/audio/speech"))).await?.json(&json!({
                 "model": "comrade-tts",
                 "input": text,
                 "voice": voice,
